@@ -87,7 +87,6 @@ None. Only Python standard library modules are used.
 ## Quick Start
 
 ### 1. Load ps5debug
-
 Start the [`ps5debug-NG`](https://github.com/OpenSourcereR-dev/ps5debug-NG) payload on your PS5.
 
 ### 2. Run the Tool
@@ -100,17 +99,11 @@ python3 RDX-CHEATMAKER-UI.py
 
 Enter the IP address displayed on your console.
 
-Example:
-
-```text
-192.168.1.120
-```
-
 ### 4. Select the Game Process
 
-Choose the game process from the list.
+Choose the game process from the list. You can type to filter processes.
 
-You can type to filter processes.
+<img width="1632" height="744" alt="image" src="https://github.com/user-attachments/assets/8d7b35a5-0861-4bca-a601-f99be4e040f8" />
 
 ### 5. Perform a First Scan
 

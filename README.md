@@ -4,7 +4,7 @@
 
 A lightweight terminal-based PS5 memory scanner and cheat creator built for Linux and macOS.
 
-PS5 Cheat Maker connects to a PS5 running the `ps5debug` payload and allows you to:
+PS5 Cheat Maker connects to a PS5 running the [`ps5debug-NG`](https://github.com/OpenSourcereR-dev/ps5debug-NG) payload and allows you to:
 
 - Scan game memory for values
 - Refine scans to locate dynamic addresses

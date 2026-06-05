@@ -80,19 +80,7 @@ Generate GoldHEN-compatible JSON cheat files.
 
 ### Python Dependencies
 
-None.
-
-Only Python standard library modules are used.
-
----
-
-## Installation
-
-Run:
-
-```bash
-python3 RDX-CHEATMAKER-UI.py
-```
+None. Only Python standard library modules are used.
 
 ---
 
@@ -100,7 +88,7 @@ python3 RDX-CHEATMAKER-UI.py
 
 ### 1. Load ps5debug
 
-Start the ps5debug payload on your PS5.
+Start the [`ps5debug-NG`](https://github.com/OpenSourcereR-dev/ps5debug-NG) payload on your PS5.
 
 ### 2. Run the Tool
 

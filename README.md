@@ -1,16 +1,16 @@
 <img width="1612" height="334" alt="image" src="https://github.com/user-attachments/assets/db4bede8-e81d-495e-b739-c35302c3a5d0" />
 
-# PS5 Cheat Maker (Terminal UI)
+# PS5/PS4 Python Cheat Maker (Terminal UI)
+Memory inspection and modification tool for research and homebrew development.
 
-A lightweight terminal-based PS5 memory scanner and cheat creator built for Linux and macOS.
-
-PS5 Cheat Maker connects to a PS5 running the [`ps5debug-NG`](https://github.com/OpenSourcereR-dev/ps5debug-NG) payload and allows you to:
+A lightweight terminal-based PS5 memory scanner and cheat creator built for Linux, Windows, and macOS.
+Connects to a PS5 running the [`ps5debug-NG`](https://github.com/OpenSourcereR-dev/ps5debug-NG) payload and allows you to:
 
 - Scan game memory for values
 - Refine scans to locate dynamic addresses
 - Create freeze/write cheats
 - Edit memory directly
-- Export GoldHEN-compatible cheat files
+- Export GoldHEN-compatible & Cheatrunner files
 - Freeze values in real-time
 
 The project is designed to be fast, dependency-free, and easy to use entirely from a terminal.

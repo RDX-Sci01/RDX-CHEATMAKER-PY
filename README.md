@@ -1,3 +1,5 @@
+<img width="1608" height="322" alt="image" src="https://github.com/user-attachments/assets/19bf0baf-e3bb-4825-be94-cf76ae71b8f6" />
+
 # PS5 Cheat Maker (Terminal UI)
 
 A lightweight terminal-based PS5 memory scanner and cheat creator built for Linux and macOS.
@@ -350,39 +352,6 @@ The application includes several safeguards:
 
 ---
 
-## Known Limitations
-
-Current limitations include:
-
-- Exact value scans only
-- Unsigned integer scans only
-- No pointer scanning
-- No pointer chain resolution
-- No AOB scanning
-- No float scanning
-- No double scanning
-- No value increase/decrease scans
-- No cheat project save/load
-- No Windows support
-
----
-
-## Planned Features
-
-- Pointer scanner
-- Pointer chain resolver
-- Float scans
-- Double scans
-- AOB scanner
-- Value increase/decrease scans
-- Multi-address freeze engine
-- Cheat project save/load
-- Automatic game detection
-- Cheat database integration
-- Improved networking performance
-
----
-
 ## Troubleshooting
 
 ### Cannot Connect
@@ -412,32 +381,6 @@ Verify:
 - Correct address
 - Address is not dynamic
 - Cheat exported to the correct GoldHEN folder
-
----
-
-## GoldHEN Installation
-
-After exporting:
-
-```text
-/data/GoldHEN/cheats/<TITLE_ID>/
-```
-
-Example:
-
-```text
-/data/GoldHEN/cheats/PPSA01234/
-```
-
-Copy the generated JSON file into that directory.
-
-Activate through:
-
-```text
-GoldHEN Menu
-  → Cheats
-  → Enable Cheat
-```
 
 ---
 

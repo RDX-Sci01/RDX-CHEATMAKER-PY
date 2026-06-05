@@ -74,8 +74,6 @@ Generate GoldHEN-compatible JSON cheat files.
 
 ### Computer
 
-- Linux
-- macOS
 - Python 3.10 or newer
 
 ### Python Dependencies
@@ -88,17 +86,10 @@ Only Python standard library modules are used.
 
 ## Installation
 
-Clone the repository:
-
-```bash
-git clone https://github.com/YOUR_USERNAME/ps5-cheat-maker.git
-cd ps5-cheat-maker
-```
-
 Run:
 
 ```bash
-python3 ps5cheats_tui.py
+python3 RDX-CHEATMAKER-UI.py
 ```
 
 ---
@@ -112,7 +103,7 @@ Start the ps5debug payload on your PS5.
 ### 2. Run the Tool
 
 ```bash
-python3 ps5cheats_tui.py
+python3 RDX-CHEATMAKER-UI.py
 ```
 
 ### 3. Connect to Your PS5

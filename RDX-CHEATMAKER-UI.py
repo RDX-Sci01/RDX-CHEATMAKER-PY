@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """
 Python Cheat Maker with Terminal UI
 curses is built into Python on Win/Linux/macOS; no extra packages
@@ -686,7 +687,15 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
                 and (not require_write or (r['prot'] & PROT_WRITE))
                 and not (r['prot'] == PROT_EXEC)]
 
-    scannable   = _scannable(maps, require_write=writable_only)
+    rw_regions  = _scannable(maps, require_write=True)
+    if writable_only:
+        scannable = rw_regions
+    else:
+        ro_regions = _scannable(maps, require_write=False)
+        rw_set     = {(r['start'], r['end']) for r in rw_regions}
+        ro_only    = [r for r in ro_regions
+                      if (r['start'], r['end']) not in rw_set]
+        scannable  = rw_regions + ro_only
     total_bytes = max(sum(r['end'] - r['start'] for r in scannable), 1)
 
     work: list = []
@@ -855,7 +864,16 @@ def scan_next_relational(ip: str, pid: int, width: int,
     new_values = _make_addr_array()
 
     # Build a fast addr→prev_value lookup dict from the parallel arrays.
-    prev_map = {prev_addrs[i]: prev_values[i] for i in range(len(prev_addrs))}
+    # Build addr→prev_value lookup.  Duplicate addresses (which should not
+    # occur after the deduplication in scan_first_unknown, but can appear if
+    # the snapshot was truncated mid-chunk) are resolved by keeping the first
+    # occurrence — consistent with array order — rather than silently
+    # overwriting with the last, which would compare against a stale baseline.
+    prev_map: dict = {}
+    for i in range(len(prev_addrs)):
+        addr_i = prev_addrs[i]
+        if addr_i not in prev_map:   # first-wins: preserves snapshot order
+            prev_map[addr_i] = prev_values[i]
 
     for addr, data in raw_results:
         if data is None:
@@ -1884,7 +1902,7 @@ def do_write(stdscr) -> None:
         val  = int(val_s, 0)
         if val < 0 or val > WIDTH_MAX[width]:
             raise ValueError(f"Value out of range for {WIDTH_LABEL[width]}")
-        # Verify address is inside a writable mapped region (fail-open on error)
+        # Verify address is inside a writable mapped region (fail-CLOSED: surfaces error to user)
         map_err = _validate_addr_in_maps(state["ip"], state["pid"], addr, width)
         if map_err:
             if not confirm_box(stdscr, f"{map_err}\nWrite anyway?", "Unmapped Address"):
@@ -2087,7 +2105,7 @@ def do_freeze(stdscr) -> None:
         message_box(stdscr, [f"Bad input: {exc}"], "Error", C_ERR)
         return
 
-    # Verify address is inside a writable mapped region (fail-open on error)
+    # Verify address is inside a writable mapped region (fail-CLOSED: surfaces error to user)
     map_err = _validate_addr_in_maps(state["ip"], state["pid"], addr, width)
     if map_err:
         if not confirm_box(stdscr, f"{map_err}\nFreeze anyway?", "Unmapped Address"):

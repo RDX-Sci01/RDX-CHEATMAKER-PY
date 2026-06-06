@@ -281,24 +281,6 @@ Example exported cheat:
 }
 ```
 
----
-
-## Memory Usage
-
-The scanner uses compact 64-bit arrays for storing scan results.
-
-Approximate memory consumption:
-
-| Results | RAM Usage |
-|----------|------------|
-| 100,000 | ~0.8 MB |
-| 250,000 | ~2 MB |
-| 500,000 | ~4 MB |
-
-A configurable scan cap prevents excessive memory usage.
-
----
-
 ## Supported Data Types
 
 | Type | Size |
@@ -307,16 +289,6 @@ A configurable scan cap prevents excessive memory usage.
 | uint16 | 2 bytes |
 | uint32 | 4 bytes |
 | uint64 | 8 bytes |
-
----
-
-## Supported Platforms
-
-| Platform | Status |
-|------------|----------|
-| Linux | Supported |
-| macOS | Supported |
-| Windows | Not Supported |
 
 ---
 

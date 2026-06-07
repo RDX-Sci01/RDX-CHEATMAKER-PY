@@ -1746,8 +1746,8 @@ def screen_main(stdscr):
             col = i // split if col2 else 0
             row = i % split
             unavail = (
-                (label == "Next Scan"    and not state["scan_results"]) or
-                (label == "Results"      and not state["scan_results"]) or
+                (label == "Next Scan"    and len(state["scan_results"]) == 0) or
+                (label == "Results"      and len(state["scan_results"]) == 0) or
                 (label == "Export .json" and not state["cheats"])
             )
             attr = (color(C_SEL) | curses.A_BOLD if i == sel
@@ -1984,7 +1984,7 @@ def do_scan_first(stdscr) -> None:
         message_box(stdscr, [f"Error: {progress['error']}"], "Scan Failed", C_ERR)
         return
 
-    results = progress["results"] or _make_addr_array()
+    results = progress["results"] if progress["results"] is not None else _make_addr_array()
     # Free old arrays before the new assignment to avoid holding two full
     # arrays in RAM simultaneously (old + new) during the reassignment.
     state["scan_results"]  = _make_addr_array()
@@ -2029,7 +2029,7 @@ def do_scan_first(stdscr) -> None:
 
 
 def do_scan_next(stdscr) -> None:
-    if not state["scan_results"]:
+    if len(state["scan_results"]) == 0:
         message_box(stdscr,
             ["No previous scan results.", "Run First Scan (S) first."], "Error", C_ERR)
         return
@@ -2110,8 +2110,8 @@ def do_scan_next(stdscr) -> None:
             message_box(stdscr, [f"Error: {progress['error']}"], "Scan Error", C_ERR)
             return
 
-        new_addrs  = progress["results"] or _make_addr_array()
-        new_values = progress["values"]  or np.empty(0, dtype=_NP_VALUE_DTYPE[width])
+        new_addrs  = progress["results"] if progress["results"] is not None else _make_addr_array()
+        new_values = progress["values"]  if progress["values"]  is not None else np.empty(0, dtype=_NP_VALUE_DTYPE[width])
 
         # Delta undo — store only removed addresses/values, not a full copy.
         # prev_addrs is sorted; new_addrs may not be (batch order) → sort for
@@ -2185,7 +2185,7 @@ def do_scan_next(stdscr) -> None:
             message_box(stdscr, [f"Error: {progress['error']}"], "Scan Error", C_ERR)
             return
 
-        results = progress["results"] or _make_addr_array()
+        results = progress["results"] if progress["results"] is not None else _make_addr_array()
 
         # Delta undo — same searchsorted approach as relational path.
         new_sorted   = np.sort(results)
@@ -2265,9 +2265,7 @@ def _refresh_visible_locked(ip: str, pid: int, addrs: list, width: int,
 
 def do_show_results(stdscr) -> None:
     results = state["scan_results"]
-    if not results:
-        message_box(stdscr,
-            ["No scan results yet.", "Run First Scan (S) first."], "Results", C_WARN)
+    if len(results) == 0:
         return
     if state.get("scan_pid") not in (None, state["pid"]):
         message_box(stdscr,
@@ -2387,7 +2385,7 @@ def do_show_results(stdscr) -> None:
                 state["scan_dropped"].add(dropped)
                 with cache_lock:
                     val_cache.pop(dropped, None)
-                if not results:
+                if len(results) == 0:
                     break
                 sel = min(sel, len(results) - 1)
             elif key in (ord('u'), ord('U')):

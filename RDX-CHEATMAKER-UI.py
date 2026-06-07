@@ -2831,7 +2831,7 @@ def main(stdscr) -> None:
     # some curses implementations.
     try:
         curses.halfdelay(1)   # 100 ms tick — lets resize events surface quickly
-        curses.nobreak()      # cancel halfdelay; we use it only to prime resize
+        curses.nocbreak()      # cancel halfdelay; we use it only to prime resize
     except curses.error:
         pass
 

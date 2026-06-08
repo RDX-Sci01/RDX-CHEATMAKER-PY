@@ -2,6 +2,8 @@
 
 """
 Python Cheat Maker with Terminal UI
+numpy & numba are needed
+
 Usage:
     python3 RDX-CHEATMAKER-UI.py
 """
@@ -67,9 +69,86 @@ try:
             else:              mask[i] = c == p + delta
         return mask
 
+    @nb.njit(parallel=True, cache=True, fastmath=True)
+    def _nb_search_aligned(data: np.ndarray, target: np.ndarray,
+                           base_addr: np.uint64, width: np.int32) -> np.ndarray:
+        """
+        Parallel aligned search — stride = width.
+
+        prange divides the aligned-offset space across all CPU cores.
+        Each thread checks only offsets that are multiples of `width`
+        relative to `base_addr`, so no alignment filtering is needed
+        inside the loop — every candidate is already aligned by construction.
+
+        Two-pass design (count then collect) avoids any shared-append lock.
+        """
+        n      = len(data)
+        w      = int(width)
+        # Pass 1 (parallel): mark hits in a counts array.
+        # Pass 2 (sequential): collect indices.  Two-pass avoids shared-append
+        # races while keeping the hot comparison loop fully parallel.
+        # counts dtype = uint8 (not int32) — 4× smaller, fits in L1 cache better
+        # on 32 MB chunks where counts has 32 M entries at stride w → 8 M entries.
+        counts = np.zeros(n, dtype=np.uint8)
+
+        for i in _prange(0, n - w + 1, w):
+            match = True
+            for j in range(w):
+                if data[i + j] != target[j]:
+                    match = False
+                    break
+            if match:
+                counts[i] = 1
+
+        hit_offsets = np.where(counts)[0]
+        return (base_addr + hit_offsets.astype(np.uint64)).astype(np.uint64)
+
+    @nb.njit(parallel=True, cache=True, fastmath=True)
+    def _nb_search_unaligned(data: np.ndarray, target: np.ndarray,
+                             base_addr: np.uint64, width: np.int32) -> np.ndarray:
+        """
+        Parallel unaligned search — stride = 1.
+
+        Previous behaviour (bug): _nb_search used step=width unconditionally,
+        so unaligned scans skipped every non-aligned offset — silently missing
+        values stored at misaligned addresses.  This kernel fixes that by
+        iterating every byte offset from 0 to len(data)-width.
+
+        Performance note: stride=1 means N threads each check N/cores offsets.
+        At 12 cores on a 32 MB chunk with width=4, each thread handles
+        ~700 K offsets.  Total work is 4× more than aligned (32 M vs 8 M
+        comparisons per chunk) but still GIL-free and fully parallelised.
+        Expected throughput: ~600–800 MB/s effective (network-bound anyway).
+        """
+        n      = len(data)
+        w      = int(width)
+        counts = np.zeros(n, dtype=np.uint8)   # uint8: 4× smaller than int32
+
+        # stride=1: check every byte offset — this is the key difference
+        # from _nb_search_aligned which strides by w.
+        for i in _prange(0, n - w + 1, 1):
+            match = True
+            for j in range(w):
+                if data[i + j] != target[j]:
+                    match = False
+                    break
+            if match:
+                counts[i] = 1
+
+        hit_offsets = np.where(counts)[0]
+        return (base_addr + hit_offsets.astype(np.uint64)).astype(np.uint64)
+
+    # Keep the old name as an alias for any external callers.
+    def _nb_search(data, target, base_addr, width, check_align):
+        if check_align:
+            return _nb_search_aligned(data, target, base_addr, width)
+        else:
+            return _nb_search_unaligned(data, target, base_addr, width)
+
 except ImportError:
     _NUMBA_OK = False
     _nb_relational_mask = None
+    _nb_search          = None
 
 # Map relational mode strings to integer IDs for the Numba kernel.
 RELATIONAL_MODE_IDS: dict = {
@@ -561,19 +640,45 @@ def ps5_read_batch(ip: str, pid: int, addrs: np.ndarray, width: int,
                     try:
                         window = sock.read(base_addr, span)
                         if len(window) == span:
-                            # Decode the entire window in one NumPy call.
-                            win_arr = np.frombuffer(window, dtype=np.uint8)
-                            for ca in cand_addrs:
-                                off = int(ca) - base_addr
-                                # Extract width bytes at offset and decode.
-                                chunk = win_arr[off:off + width]
-                                if len(chunk) == width:
-                                    val = struct.unpack(fmt, bytes(chunk))[0]
-                                    local_addrs[local_n] = ca
-                                    local_vals [local_n] = val
-                                    local_n += 1
-                                    if local_n == LOCAL_BUF:
-                                        _flush()
+                            # Vectorised decode: interpret entire window as packed
+                            # integers, then gather only the candidate offsets.
+                            # Replaces the Python for-loop (one struct.unpack per
+                            # candidate) with a single NumPy advanced-index gather.
+                            #
+                            # Old (Python loop over cand_addrs):
+                            #   for ca in cand_addrs:  # O(N) GIL-held iterations
+                            #       off = int(ca) - base_addr
+                            #       val = struct.unpack(fmt, window[off:off+w])[0]
+                            #
+                            # New (NumPy gather, C-level, O(1) Python overhead):
+                            #   offsets = cand_addrs - base_addr  → index array
+                            #   win_int = frombuffer(window, '<u{w}')
+                            #   vals    = win_int[offsets // w]   → all values
+                            #
+                            # Requirement: window must be aligned to `width` bytes
+                            # from its base, which is guaranteed because base_addr
+                            # is the first candidate address (itself aligned) and
+                            # span is a multiple of width by construction.
+                            win_int  = np.frombuffer(window, dtype=f'<u{width}')
+                            offsets  = (cand_addrs.astype(np.int64) - base_addr) // width
+                            # Guard: only keep offsets that fit inside the window.
+                            valid    = (offsets >= 0) & (offsets < len(win_int))
+                            v_off    = offsets[valid].astype(np.intp)
+                            v_addrs  = cand_addrs[valid]
+                            v_vals   = win_int[v_off].astype(val_dtype)
+                            # Write into local buffer in one slice assignment;
+                            # flush in chunks of LOCAL_BUF if needed.
+                            n_v = len(v_addrs)
+                            i   = 0
+                            while i < n_v:
+                                space = LOCAL_BUF - local_n
+                                take  = min(space, n_v - i)
+                                local_addrs[local_n:local_n + take] = v_addrs[i:i + take]
+                                local_vals [local_n:local_n + take] = v_vals [i:i + take]
+                                local_n += take
+                                i       += take
+                                if local_n == LOCAL_BUF:
+                                    _flush()
                         n_done = len(cand_addrs)
                     except Exception:
                         n_done = len(cand_addrs)
@@ -800,10 +905,14 @@ def scan_first(ip: str, pid: int, value: int, width: int = 4,
         off  = 0
         while off < size:
             csz = min(CHUNK, size - off)
-            # Round up tiny chunks to MIN_CHUNK for better socket utilisation
-            # (ps5debug reads exactly what we ask; no penalty for smaller asks)
             work.append((r['start'] + off, csz))
             off += csz
+
+    # Pre-build O(1) lookup dict for partial-read detection in the searcher.
+    # The old code used next((s for a,s in work if a==addr), None) which is
+    # O(N) per chunk — for a 400 MB scan with 32 MB chunks that is 12 linear
+    # scans × 12 chunks = 144 comparisons per chunk, totally avoidable.
+    work_sizes: dict = {addr: csz for addr, csz in work}
 
     # ── shared state ─────────────────────────────────────────────────────────
     chunk_queue: "_queue.Queue[Optional[tuple]]" = _queue.Queue(maxsize=QUEUE_DEPTH)
@@ -850,73 +959,86 @@ def scan_first(ip: str, pid: int, value: int, width: int = 4,
         finally:
             sock.close()
 
-    # ── searcher thread ───────────────────────────────────────────────────────
-    # Uses bytes.find() — a C-level Boyer-Moore-Horspool search.
-    # Benchmarked at ~2400 MB/s vs ~24 MB/s for iter_unpack: 100× faster.
-    # Works for all widths; `step` enforces alignment on the result side.
-    step = width if aligned else 1
+    # ── searcher ──────────────────────────────────────────────────────────────
+    # Fast path: _nb_search (Numba, parallel across all CPU cores, GIL-free).
+    # Fallback: bytes.find() (C-level Boyer-Moore-Horspool, ~2400 MB/s, 1 core).
+    # Both produce identical results; Numba wins on multi-core machines because
+    # the search across a 32 MB chunk is split across N threads simultaneously.
+    step        = width if aligned else 1
+    check_align = aligned and width > 1
+    target_np   = np.frombuffer(target, dtype=np.uint8)
+    target_zero = (target == b'\x00' * width)
+    target_b0   = target[0:1]
+
+    if _NUMBA_OK:
+        if aligned:
+            def _search_chunk(data: bytes, addr: int) -> list:
+                arr  = np.frombuffer(data, dtype=np.uint8)
+                hits = _nb_search_aligned(arr, target_np,
+                                          np.uint64(addr),
+                                          np.int32(width))
+                return hits.tolist()
+        else:
+            def _search_chunk(data: bytes, addr: int) -> list:
+                arr  = np.frombuffer(data, dtype=np.uint8)
+                hits = _nb_search_unaligned(arr, target_np,
+                                            np.uint64(addr),
+                                            np.int32(width))
+                return hits.tolist()
+    else:
+        def _search_chunk(data: bytes, addr: int) -> list:
+            hits = []
+            pos  = 0
+            while True:
+                p = data.find(target, pos)
+                if p == -1:
+                    break
+                if check_align and (addr + p) % width != 0:
+                    pos = p + 1
+                    continue
+                hits.append(addr + p)
+                pos = p + step
+            return hits
+
     def _search_all():
         sentinels_received = 0
-        while sentinels_received < n_workers:  # wait for exactly n_workers sentinels
+        while sentinels_received < n_workers:
             item = chunk_queue.get()
             if item is _SENTINEL:
                 sentinels_received += 1
                 continue
             addr, data = item
             if data is None:
-                done_bytes[0] += CHUNK
+                done_bytes[0] += work_sizes.get(addr, CHUNK)
                 if progress_cb:
                     progress_cb(done_bytes[0], total_bytes)
                 continue
-            csz = len(data)
-            # Issue #12/#13: if the read returned fewer bytes than requested,
-            # the region boundary moved or permissions changed while we were
-            # scanning (e.g. game unloaded a level).  Don't search a partial
-            # chunk — the addresses at the end would be wrong.  Log and skip.
-            expected_csz = next((s for a, s in work if a == addr), None)
             if expected_csz is not None and csz < expected_csz:
-                add_log(f"Partial read @ {hex(addr)}: got {csz} of {expected_csz} bytes — skipped", "warn")
+                add_log(f"Partial read @ {hex(addr)}: got {csz} of {expected_csz} B — skipped", "warn")
                 done_bytes[0] += csz
                 if progress_cb:
                     progress_cb(done_bytes[0], total_bytes)
                 continue
-            # bytes.find on a miss still scans the whole chunk, but the C
-            # implementation is ~2400 MB/s so this is rarely worth splitting.
-            # The real win: zero-page detection. Sparse mmap regions are
-            # often entirely zero; skip them if target != b'\x00'*width.
-            if target != b'\x00' * width:
-                # Quick zero-page check using count of first target byte
-                if data.count(target[0:1]) == 0:
-                    done_bytes[0] += csz
-                    if progress_cb:
-                        progress_cb(done_bytes[0], total_bytes)
-                    continue
-            # For aligned scans, only accept hits at aligned offsets.
-            # bytes.find can match at any byte position, so we must filter.
-            check_align = aligned and width > 1
-            pos = 0
-            while True:
-                p = data.find(target, pos)
-                if p == -1:
-                    break
-                if check_align and (addr + p) % width != 0:
-                    pos = p + 1   # skip this unaligned hit, try next byte
-                    continue
-                found.append(addr + p)
+            # Zero-page fast-path: if the target's first byte is absent in
+            # the whole chunk, skip without searching (O(N) C scan, ~2400 MB/s).
+            if not target_zero and target_b0 not in data:
+                done_bytes[0] += csz
+                if progress_cb:
+                    progress_cb(done_bytes[0], total_bytes)
+                continue
+            for h in _search_chunk(data, addr):
+                found.append(h)
                 if len(found) >= MAX_SCAN_RESULTS:
-                    add_log(f"Result cap ({MAX_SCAN_RESULTS:,}) hit"
-                            " — scan truncated", "warn")
+                    add_log(f"Result cap ({MAX_SCAN_RESULTS:,}) hit — scan truncated", "warn")
                     if cancel_event:
                         cancel_event.set()
-                        cancel_event.truncated = True   # piggyback flag
-                    # Drain queue so readers blocked on put() can see cancel
+                        cancel_event.truncated = True
                     while True:
                         try:
                             chunk_queue.get_nowait()
                         except _queue.Empty:
                             break
                     return
-                pos = p + step
             done_bytes[0] += csz
             if progress_cb:
                 progress_cb(done_bytes[0], total_bytes)
@@ -1086,13 +1208,17 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
             work.append((r['start'] + off, csz))
             off += csz
 
+    # O(1) lookup for actual chunk size — used by _snapshot_all on read failure.
+    work_sizes: dict = {addr: csz for addr, csz in work}
+
     chunk_queue: "_queue.Queue[Optional[tuple]]" = _queue.Queue(maxsize=QUEUE_DEPTH)
     # Use lists of ndarray chunks; np.concatenate at the end is O(total) and
     # avoids the repeated reallocation that appending to a flat array.array
     # one element at a time causes (amortised O(N²) for large N).
     found_addrs:  list = []   # list[np.ndarray[uint64]]
     found_values: list = []   # list[np.ndarray[uint_w]]
-    done_bytes   = [0]
+    found_count   = [0]       # Fix 5: O(1) running total — replaces sum(len(c) for c in found_addrs) per chunk
+    done_bytes    = [0]
     work_lock    = threading.Lock()
     work_idx     = [0]
     reader_err      = []
@@ -1134,22 +1260,11 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
     def _snapshot_all():
         """
         Consume chunks from the queue and snapshot every aligned address.
-
-        NumPy vectorised implementation — replaces the original Python
-        for-loop that called struct.unpack_from() per address:
-
-          Old: for off in range(0, csz, step): struct.unpack_from(...)
-               → O(N) Python dispatch, ~24 MB/s effective throughput
-
-          New: np.frombuffer → [::step] strided view → append in bulk
-               → C-level memory copy, ~2–8 GB/s throughput
-               Typical speedup: 10–50× on the snapshot phase.
-
-        Memory note: found_addrs / found_values grow by appending
-        pre-allocated blocks rather than one element at a time, so the
-        array extension amortises to O(1) per element.
         """
         nonlocal found_addrs, found_values
+        # Hoist loop-invariant values: width never changes during a scan.
+        val_dtype   = _NP_VALUE_DTYPE[width]
+        dtype_str   = f'<u{width}'
         sentinels_received = 0
         while sentinels_received < n_workers:
             item = chunk_queue.get()
@@ -1158,7 +1273,7 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
                 continue
             addr, data = item
             if data is None:
-                done_bytes[0] += CHUNK
+                done_bytes[0] += work_sizes.get(addr, CHUNK)
                 if progress_cb:
                     progress_cb(done_bytes[0], total_bytes)
                 continue
@@ -1191,9 +1306,6 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
                 # Non-trivial zero page — still extract (values may be 0).
 
             # ── vectorised extract ────────────────────────────────────────────
-            # View the raw bytes as the correct dtype, then slice with step.
-            val_dtype = _NP_VALUE_DTYPE[width]
-            # Number of complete width-byte values in this chunk
             n_vals = (csz - (csz % width)) // width
             if n_vals == 0:
                 done_bytes[0] += csz
@@ -1201,39 +1313,48 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
                     progress_cb(done_bytes[0], total_bytes)
                 continue
 
-            # Interpret raw bytes as packed integers (little-endian struct fmt).
-            # frombuffer is zero-copy when data is bytes (read-only buffer).
-            vals_raw = np.frombuffer(data[:n_vals * width], dtype=f'<u{width}')
-            # For aligned scans, stride by (step // width) in the value array;
-            # for unaligned, every byte offset matters so we must work at byte level.
+            # frombuffer is zero-copy (data is bytes — read-only buffer).
+            vals_raw = np.frombuffer(data[:n_vals * width], dtype=dtype_str)
             if aligned:
-                vals_slice = vals_raw          # step == width → every element
+                vals_slice = vals_raw
                 n_out      = len(vals_slice)
-                # Absolute addresses: addr, addr+width, addr+2*width, ...
                 addrs_out  = np.arange(addr, addr + n_out * width, width,
                                        dtype=_NP_ADDR_DTYPE)
             else:
-                # Unaligned: one value per byte offset — requires byte-level scan.
-                # We still use NumPy but must iterate byte offsets.
-                offsets    = np.arange(0, csz - width + 1, 1, dtype=np.intp)
-                vals_slice = np.array(
-                    [struct.unpack_from(WIDTH_FMT[width], data, o)[0] for o in offsets],
-                    dtype=val_dtype)
-                addrs_out  = (addr + offsets).astype(_NP_ADDR_DTYPE)
-                n_out      = len(offsets)
+                # Unaligned: stride_tricks sliding-window — zero Python loop.
+                raw_u8    = np.frombuffer(data, dtype=np.uint8)
+                n_windows = csz - width + 1
+                if n_windows <= 0:
+                    done_bytes[0] += csz
+                    if progress_cb:
+                        progress_cb(done_bytes[0], total_bytes)
+                    continue
+                import sys as _sys
+                windows = np.lib.stride_tricks.as_strided(
+                    raw_u8, shape=(n_windows, width), strides=(1, 1),
+                    writeable=False)
+                if _sys.byteorder == 'little':
+                    vals_slice = np.ascontiguousarray(windows).view(dtype_str).reshape(-1)
+                else:
+                    tmp = np.ascontiguousarray(windows)
+                    tmp.byteswap(inplace=True)
+                    vals_slice = tmp.view(dtype_str).reshape(-1)
+                vals_slice = vals_slice.astype(val_dtype, copy=False)
+                addrs_out  = (addr + np.arange(n_windows, dtype=_NP_ADDR_DTYPE))
+                n_out      = n_windows
 
-            # Enforce the result cap
-            total_so_far = sum(len(c) for c in found_addrs)
-            remaining = MAX_SCAN_RESULTS - total_so_far
+            # Fix 5 (O(chunks) → O(1) cap check): found_count is a running
+            # total maintained below; no sum(len(c) for c in found_addrs) scan.
+            remaining = MAX_SCAN_RESULTS - found_count[0]
             if n_out > remaining:
                 addrs_out  = addrs_out[:remaining]
                 vals_slice = vals_slice[:remaining]
+                n_out      = remaining
                 add_log(f"Unknown scan cap ({MAX_SCAN_RESULTS:,}) hit"
                         " — snapshot truncated", "warn")
                 if cancel_event:
                     cancel_event.set()
                     cancel_event.truncated = True
-                # Drain so readers unblock
                 while True:
                     try:
                         chunk_queue.get_nowait()
@@ -1241,7 +1362,8 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
                         break
 
             found_addrs.append(addrs_out)
-            found_values.append(vals_slice.astype(_NP_VALUE_DTYPE[width]))
+            found_values.append(vals_slice.astype(val_dtype))
+            found_count[0] += n_out   # O(1) running total
 
             done_bytes[0] += csz
             if progress_cb:

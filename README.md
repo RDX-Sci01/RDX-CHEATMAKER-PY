@@ -77,6 +77,7 @@ Generate GoldHEN-compatible JSON cheat files.
 ### Computer
 
 - Python 3.10 or newer
+- numpy & numba are needed
 
 ### Python Dependencies
 

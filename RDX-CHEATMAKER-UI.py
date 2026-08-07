@@ -214,6 +214,7 @@ CMD_PROC_SCAN  = 0xBDAA0009
 CMD_PROC_AUTH  = 0xBDAACCFF
 CMD_TURBO_CAPS = 0xBDAACC10
 CMD_TURBO_START = 0xBDAACC11
+CMD_TURBO_COUNT = 0xBDAACC12
 CMD_TURBO_GET   = 0xBDAACC13
 CMD_TURBO_END   = 0xBDAACC14
 PROC_AUTH_MAGIC = 0xBB40E64D
@@ -222,6 +223,12 @@ PROC_AUTH_MAGIC = 0xBB40E64D
 STATUS_SUCCESS = 0x80000000
 STATUS_ERROR   = 0xF0000001
 PS5_PORT       = 744
+
+# A TurboScan list session lives on its TCP connection.  Retaining that
+# connection lets subsequent exact scans use the payload's resident COUNT
+# command instead of reading millions of candidate addresses back over LAN.
+_turbo_session_lock = threading.RLock()
+_turbo_session = None
 
 WIDTH_FMT   = {1: 'B', 2: '<H', 4: '<I', 8: '<Q'}
 VALID_WIDTHS = [1, 2, 4, 8]
@@ -307,11 +314,12 @@ def _addr_list(a) -> list:
 #
 # Entry format: (removed_addrs: ndarray[uint64],
 #                removed_values: ndarray|None,
-#                prev_dropped: set)
+#                prev_dropped: set,
+#                prev_truncated: bool)
 
 def _undo_entry_bytes(entry: tuple) -> int:
     """Byte size of a single undo entry (removed_addrs + removed_values)."""
-    a, v, _ = entry
+    a, v, _, _ = entry
     nb = a.nbytes if isinstance(a, np.ndarray) else len(a) * 8
     nv = v.nbytes if isinstance(v, np.ndarray) else 0
     return nb + nv
@@ -322,12 +330,14 @@ def _history_bytes() -> int:
 
 def _push_undo(removed_addrs: np.ndarray,
                removed_values: Optional[np.ndarray],
-               prev_dropped: set) -> None:
+               prev_dropped: set,
+               prev_truncated: bool = False) -> None:
     """
     Push one undo delta.  If the resulting history would exceed
     HISTORY_RAM_CAP_MB, evict the oldest entry first.
     """
-    new_entry   = (removed_addrs, removed_values, prev_dropped)
+    new_entry   = (removed_addrs, removed_values, prev_dropped,
+                   bool(prev_truncated))
     new_bytes   = _undo_entry_bytes(new_entry)
     # Evict oldest entries until we are under the cap (beyond normal maxlen).
     cap_bytes   = int(HISTORY_RAM_CAP_MB * 1_048_576)
@@ -582,10 +592,60 @@ def ps5_scan_exact_server(ip: str, pid: int, value: int, width: int,
             f"{' (truncated)' if truncated else ''}")
     return result
 
+def _turbo_fetch_addresses(s: socket.socket, width: int, count: int,
+                           cancel_event=None) -> np.ndarray:
+    """Fetch up to the UI cap from the current resident TurboScan session."""
+    wanted = min(int(count), MAX_SCAN_RESULTS)
+    out = np.empty(wanted, dtype=_NP_ADDR_DTYPE)
+    pos = 0
+    page = 10_000
+    while pos < wanted:
+        take = min(page, wanted - pos)
+        get_body = struct.pack("<III", pos, take, 0)
+        s.sendall(cmd_header(CMD_TURBO_GET, len(get_body)) + get_body)
+        if struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0] != STATUS_SUCCESS:
+            raise RuntimeError("TurboScan result fetch rejected")
+        header = struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0]
+        actual = header & 0x7FFFFFFF
+        has_first = bool(header & 0x80000000)
+        rec_size = 8 + width * (3 if has_first else 2)
+        raw = _recv_exact_cancel(s, actual * rec_size, cancel_event)
+        if struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0] != STATUS_SUCCESS:
+            raise RuntimeError("TurboScan result fetch incomplete")
+        if actual == 0:
+            break
+        records = np.ndarray(shape=(actual,), dtype={
+            "names": ["addr", "rest"],
+            "formats": ["<u8", f"V{rec_size - 8}"],
+            "offsets": [0, 8], "itemsize": rec_size}, buffer=raw)
+        out[pos:pos + actual] = records["addr"]
+        pos += actual
+    return out[:pos]
+
+
+def _close_turbo_session() -> None:
+    """Best-effort release of the console-resident result list and socket."""
+    global _turbo_session
+    with _turbo_session_lock:
+        session, _turbo_session = _turbo_session, None
+        if not session:
+            return
+        s = session["socket"]
+        try:
+            s.sendall(cmd_header(CMD_TURBO_END))
+            recv_exact(s, 4)
+        except Exception:
+            pass
+        finally:
+            s.close()
+
+
 def ps5_scan_exact_turbo(ip: str, pid: int, value: int, width: int,
                          regions: list, aligned: bool = True,
                          cancel_event=None, progress_cb=None) -> np.ndarray:
-    """Segmented SIMD exact scan with a short-lived server-resident session."""
+    """Segmented SIMD exact scan, retaining its server-resident result list."""
+    global _turbo_session
+    _close_turbo_session()
     ps5_auth_scanner(ip)
     version, engines, _ = ps5_turboscan_caps(ip)
     required = 0x01 | 0x04 | 0x10  # SIMD, resident results, segmented scans
@@ -636,6 +696,7 @@ def ps5_scan_exact_turbo(ip: str, pid: int, value: int, width: int,
 
     s = ps5_connect(ip)
     session_created = False
+    retain_session = False
     try:
         s.sendall(cmd_header(CMD_TURBO_START, len(body)) + body)
         if struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0] != STATUS_SUCCESS:
@@ -659,31 +720,8 @@ def ps5_scan_exact_turbo(ip: str, pid: int, value: int, width: int,
         if struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0] != STATUS_SUCCESS:
             raise RuntimeError("TurboScan did not complete")
 
-        wanted = min(int(count), MAX_SCAN_RESULTS)
-        out = np.empty(wanted, dtype=_NP_ADDR_DTYPE)
-        pos = 0
-        page = 10_000
-        while pos < wanted:
-            take = min(page, wanted - pos)
-            get_body = struct.pack("<III", pos, take, 0)
-            s.sendall(cmd_header(CMD_TURBO_GET, len(get_body)) + get_body)
-            if not check_ok(s):
-                raise RuntimeError("TurboScan result fetch rejected")
-            header = struct.unpack("<I", recv_exact(s, 4))[0]
-            actual = header & 0x7FFFFFFF
-            has_first = bool(header & 0x80000000)
-            rec_size = 8 + width * (3 if has_first else 2)
-            raw = recv_exact(s, actual * rec_size)
-            if not check_ok(s):
-                raise RuntimeError("TurboScan result fetch incomplete")
-            if actual == 0:
-                break
-            records = np.ndarray(shape=(actual,), dtype={
-                "names": ["addr", "rest"],
-                "formats": ["<u8", f"V{rec_size - 8}"],
-                "offsets": [0, 8], "itemsize": rec_size}, buffer=raw)
-            out[pos:pos + actual] = records["addr"]
-            pos += actual
+        out = _turbo_fetch_addresses(s, width, count, cancel_event)
+        pos = len(out)
 
         if count > MAX_SCAN_RESULTS and cancel_event:
             cancel_event.truncated = True
@@ -691,15 +729,74 @@ def ps5_scan_exact_turbo(ip: str, pid: int, value: int, width: int,
             progress_cb(max(total_bytes, 1), max(total_bytes, 1))
         add_log(f"TurboScan exact: {pos:,}/{count:,} matches, "
                 f"{total_bytes / 1_073_741_824:.2f} GiB scanned")
-        return out[:pos]
+        with _turbo_session_lock:
+            _turbo_session = {"socket": s, "ip": ip, "pid": pid,
+                              "width": width, "count": int(count),
+                              "engines": engines}
+        retain_session = True
+        return out
     finally:
-        if session_created:
-            try:
-                s.sendall(cmd_header(CMD_TURBO_END))
-                recv_exact(s, 4)
-            except Exception:
-                pass
-        s.close()
+        if not retain_session:
+            if session_created:
+                try:
+                    s.sendall(cmd_header(CMD_TURBO_END))
+                    recv_exact(s, 4)
+                except Exception:
+                    pass
+            s.close()
+
+
+def ps5_scan_next_turbo(ip: str, pid: int, value: int, width: int,
+                         cancel_event=None, progress_cb=None) -> np.ndarray:
+    """Refine the complete resident result set on-console using COUNT."""
+    global _turbo_session
+    with _turbo_session_lock:
+        session = _turbo_session
+        if not session or any((session["ip"] != ip, session["pid"] != pid,
+                               session["width"] != width)):
+            raise RuntimeError("no matching resident TurboScan session")
+        s = session["socket"]
+        old_count = int(session["count"])
+        target = struct.pack(WIDTH_FMT[width], value)
+        value_type = {1: 0, 2: 2, 4: 4, 8: 6}[width]
+        flags = 0x02  # TS_SERVER_RESIDENT
+        if session["engines"] & 0x200:
+            flags |= 0x100  # TS_RESCAN_ALIASING
+        body = struct.pack("<IQBBII", pid, 0, value_type, 0,
+                           len(target), flags)
+        try:
+            if progress_cb:
+                progress_cb(0, max(old_count, 1))
+            s.sendall(cmd_header(CMD_TURBO_COUNT, len(body)) + body)
+            if struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0] != STATUS_SUCCESS:
+                raise RuntimeError("TurboScan rescan rejected")
+            s.sendall(target)
+
+            # COUNT may report progress; list-backed sessions commonly send
+            # only the sentinel, so the UI still remains responsive/spinning.
+            while True:
+                scanned = struct.unpack("<Q", _recv_exact_cancel(s, 8, cancel_event))[0]
+                if scanned == 0xFFFFFFFFFFFFFFFF:
+                    break
+                if progress_cb:
+                    progress_cb(min(int(scanned), old_count), max(old_count, 1))
+            new_count = struct.unpack("<Q", _recv_exact_cancel(s, 8, cancel_event))[0]
+            if struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0] != STATUS_SUCCESS:
+                raise RuntimeError("TurboScan rescan failed")
+            session["count"] = int(new_count)
+            out = _turbo_fetch_addresses(s, width, new_count, cancel_event)
+            if cancel_event is not None:
+                cancel_event.truncated = new_count > MAX_SCAN_RESULTS
+            if progress_cb:
+                progress_cb(max(old_count, 1), max(old_count, 1))
+            add_log(f"Turbo next scan: {len(out):,}/{new_count:,} remain")
+            return out
+        except Exception:
+            # A cancelled or failed command leaves stream framing uncertain.
+            # Drop the session so subsequent scans safely use host fallback.
+            _turbo_session = None
+            s.close()
+            raise
 
 # All helpers use sendall() and try/finally so the socket is always closed.
 
@@ -1496,6 +1593,17 @@ def scan_next(ip: str, pid: int, value: int, width: int,
     the actual comparison cost only ~0.34 ms.  By moving the decode into
     ps5_read_batch workers the Python iteration is eliminated entirely.
     """
+    # Fast/correct path: refine the payload's complete resident list.  This is
+    # especially important when the displayed first-scan results were capped.
+    try:
+        return ps5_scan_next_turbo(ip, pid, value, width,
+                                   cancel_event, progress_cb)
+    except InterruptedError:
+        raise
+    except Exception as exc:
+        add_log(f"Resident Turbo rescan unavailable ({exc}); using host filter",
+                "warn")
+
     dtype = _NP_VALUE_DTYPE[width]
     try:
         target = dtype(value & WIDTH_MAX[width])
@@ -2324,6 +2432,7 @@ def screen_connect(stdscr) -> str:
 def _clear_scan_state() -> None:
     """Wipe all scan-related state. Called whenever the attached process changes."""
     _stop_freeze_worker()
+    _close_turbo_session()
     state["scan_results"]   = _make_addr_array()
     state["scan_values"]    = None
     state["scan_dropped"]   = set()
@@ -2601,6 +2710,9 @@ def _run_scan_with_progress(stdscr, thread_fn, total_label: str,
             timing = f"elapsed {elapsed:.1f}s"
             if eta is not None and frac < 1.0:
                 timing += f", ETA {max(eta, 0.0):.1f}s"
+            # Erase the full previous status line first.  Without this, a
+            # shorter count/ETA leaves stale trailing characters on screen.
+            safe_addstr(stdscr, 9, 3, " " * max(w - 6, 0), color(C_NORM))
             safe_addstr(stdscr, 9, 3,
                 f"{spinner[spin_i % 4]}  {total_label}  "
                 f"{progress['done']:,} / {progress['total']:,}  "
@@ -2668,6 +2780,9 @@ def do_scan_first(stdscr) -> None:
                  f"Max: {WIDTH_MAX[width]}"], "Error", C_ERR)
             return
 
+    # A new first scan supersedes any retained resident refinement session,
+    # including when this scan is unknown-value or uses a fallback engine.
+    _close_turbo_session()
     cancel_event = threading.Event()
     cancel_event.truncated = False   # searcher sets this when result cap is hit
     progress     = {"done": 0, "total": 1, "results": None, "values": None,
@@ -2732,9 +2847,9 @@ def do_scan_first(stdscr) -> None:
 
     trunc_lines = (
         [f"⚠  Scan capped at {MAX_SCAN_RESULTS:,} results — {len(results):,} shown.",
-         "   Some matching addresses were NOT found.",
+         "   Additional matches are retained in the console scan session.",
          "   Run Next Scan (N) with a changed value to narrow results",
-         "   before trusting any address shown here.",
+         "   across the complete result set.",
          ""]
         if progress["truncated"] else []
     )
@@ -2855,7 +2970,8 @@ def do_scan_next(stdscr) -> None:
             removed_mask = new_sorted[ins_clipped] != prev_addrs
         removed_a    = prev_addrs[removed_mask]
         removed_v    = prev_values[removed_mask]
-        _push_undo(removed_a, removed_v, set(state["scan_dropped"]))
+        _push_undo(removed_a, removed_v, set(state["scan_dropped"]),
+                   state.get("scan_truncated", False))
         del new_sorted, removed_mask, removed_a, removed_v   # free intermediates
 
         state["scan_results"] = new_addrs
@@ -2895,8 +3011,10 @@ def do_scan_next(stdscr) -> None:
                 [f"Value {val} out of range for {WIDTH_LABEL[width]}."], "Error", C_ERR)
             return
 
+        cancel_event.truncated = bool(state.get("scan_truncated", False))
         progress = {"done": 0, "total": max(len(prev_addrs), 1),
-                    "results": None, "error": None}
+                    "results": None, "error": None,
+                    "truncated": bool(state.get("scan_truncated", False))}
 
         def run_exact():
             try:
@@ -2904,6 +3022,7 @@ def do_scan_next(stdscr) -> None:
                     state["ip"], state["pid"], val, width, prev_addrs,
                     cancel_event,
                     lambda d, t: progress.update(done=d, total=max(t, 1)))
+                progress["truncated"] = getattr(cancel_event, "truncated", False)
             except Exception as exc:
                 progress["error"] = str(exc)
 
@@ -2926,12 +3045,14 @@ def do_scan_next(stdscr) -> None:
         removed_mask = (len(new_sorted) == 0) | (new_sorted[ins_clipped] != prev_addrs) \
                        if len(new_sorted) > 0 else np.ones(len(prev_addrs), dtype=bool)
         removed_a    = prev_addrs[removed_mask]
-        _push_undo(removed_a, None, set(state["scan_dropped"]))
+        _push_undo(removed_a, None, set(state["scan_dropped"]),
+                   state.get("scan_truncated", False))
         del new_sorted, removed_mask, removed_a
 
         state["scan_results"] = results
         state["scan_values"]  = None
         state["scan_dropped"] = state["scan_dropped"] & set(results.tolist())
+        state["scan_truncated"] = progress.get("truncated", False)
 
         hist_mb = _history_bytes() / 1_048_576
         add_log(f"Exact next scan val={val}: {len(results):,} remain, "
@@ -2946,8 +3067,11 @@ def do_scan_next(stdscr) -> None:
             undo_hint  = (f"  (U to undo — restores "
                           f"{len(results) + len(last_delta[0]):,} candidates)")
         message_box(stdscr,
+            ([f"⚠  More than {MAX_SCAN_RESULTS:,} results remain; showing the first cap.", ""]
+             if state["scan_truncated"] else []) +
             [f"{len(results):,} results remain.", "", tip, undo_hint],
-            "Scan Complete", C_OK if len(results) <= 10 else C_WARN)
+            "Scan Complete" + (" — TRUNCATED" if state["scan_truncated"] else ""),
+            C_OK if len(results) <= 10 and not state["scan_truncated"] else C_WARN)
 
 
 # ── results screen ────────────────────────────────────────────────────────────
@@ -3050,7 +3174,7 @@ def do_show_results(stdscr) -> None:
             stdscr.clear()
             draw_border(stdscr, f"RESULTS  ({len(results)} addresses)")
             wlabel = WIDTH_LABEL.get(state["scan_width"], str(state["scan_width"]))
-            trunc_warn = "  ⚠ TRUNCATED — not all memory was searched" if state.get("scan_truncated") else ""
+            trunc_warn = "  ⚠ CAPPED — additional matches not displayed" if state.get("scan_truncated") else ""
             safe_addstr(stdscr, 2, 3,
                 f"Type: {wlabel}   Process: {state['proc_name']} (PID {state['pid']}){trunc_warn}",
                 color(C_ERR) if trunc_warn else color(C_WARN))
@@ -3133,6 +3257,7 @@ def do_show_results(stdscr) -> None:
                     removed_a    = entry[0]   # ndarray[uint64]
                     removed_v    = entry[1]   # ndarray|None
                     prev_dropped = entry[2]
+                    prev_truncated = entry[3]
                     # Reconstruct prev = sorted union(current, removed)
                     cur_addrs  = state["scan_results"]
                     prev_addrs = np.union1d(cur_addrs, removed_a)  # sorted, unique
@@ -3155,6 +3280,11 @@ def do_show_results(stdscr) -> None:
                     state["scan_results"] = prev_addrs
                     state["scan_values"]  = prev_values_out
                     state["scan_dropped"] = prev_dropped
+                    state["scan_truncated"] = prev_truncated
+                    # COUNT narrows the server list in place and has no rewind
+                    # operation.  Discard it after UI undo; the next scan will
+                    # safely refine the reconstructed client-side candidates.
+                    _close_turbo_session()
                     results = state["scan_results"]
                     with cache_lock:
                         val_cache.clear()
@@ -3641,14 +3771,7 @@ def do_clear_results(stdscr) -> None:
             f"Clear {n:,} scan results and {len(state['scan_history'])} "
             f"undo levels ({hist_mb:.1f} MB)?",
             "Clear Results"):
-        state["scan_results"] = _make_addr_array()
-        state["scan_values"]  = None
-        state["scan_history"] = deque(maxlen=5)
-        state["scan_dropped"] = set()
-        state["scan_pid"]     = None
-        state["scan_truncated"] = False
-        state["scan_unknown"] = False
-        gc.collect()
+        _clear_scan_state()
         add_log(f"Scan results cleared — RSS now {_rss_mb():.0f} MB", "warn")
         message_box(stdscr, ["Results cleared.", "Ready for a fresh First Scan (S)."],
                     "Cleared", C_OK)
@@ -3743,4 +3866,7 @@ if __name__ == '__main__':
         curses.wrapper(main)
     except KeyboardInterrupt:
         pass
+    finally:
+        _stop_freeze_worker()
+        _close_turbo_session()
     print("\nps5cheats_tui exited.")

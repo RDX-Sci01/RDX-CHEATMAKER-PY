@@ -8,6 +8,7 @@ Usage:
 """
 
 import array as _array
+import bisect
 import curses
 import gc
 import os
@@ -69,7 +70,6 @@ try:
         return mask
 
     @nb.njit(parallel=True, cache=True, fastmath=True)
-    @nb.njit(parallel=True, cache=True, fastmath=True)
     def _nb_search_aligned(data: np.ndarray, target: np.ndarray,
                            base_addr: np.uint64, width: np.int32) -> np.ndarray:
         """
@@ -86,10 +86,12 @@ try:
         w      = int(width)
         counts = np.zeros(n, dtype=np.int32)
 
-        for i in _prange(0, n - w + 1, w):
-            # Alignment check: absolute address must be divisible by width.
-            if (base_addr + np.uint64(i)) % np.uint64(w) != 0:
-                continue
+        # Numba's prange supports a unit step; map each parallel iteration to
+        # an aligned byte offset explicitly.
+        first = int((-base_addr) % np.uint64(w))
+        candidate_count = max(0, (n - first - w) // w + 1)
+        for k in _prange(candidate_count):
+            i = first + k * w
             match = True
             for j in range(w):
                 if data[i + j] != target[j]:
@@ -124,7 +126,8 @@ try:
 
         # stride=1: check every byte offset — this is the key difference
         # from _nb_search_aligned which strides by w.
-        for i in _prange(0, n - w + 1, 1):
+        candidate_count = max(0, n - w + 1)
+        for i in _prange(candidate_count):
             match = True
             for j in range(w):
                 if data[i + j] != target[j]:
@@ -207,6 +210,13 @@ CMD_PROC_LIST  = 0xBDAA0001
 CMD_PROC_READ  = 0xBDAA0002
 CMD_PROC_WRITE = 0xBDAA0003
 CMD_PROC_MAPS  = 0xBDAA0004
+CMD_PROC_SCAN  = 0xBDAA0009
+CMD_PROC_AUTH  = 0xBDAACCFF
+CMD_TURBO_CAPS = 0xBDAACC10
+CMD_TURBO_START = 0xBDAACC11
+CMD_TURBO_GET   = 0xBDAACC13
+CMD_TURBO_END   = 0xBDAACC14
+PROC_AUTH_MAGIC = 0xBB40E64D
 # STATUS_SUCCESS / STATUS_ERROR: bit-swapped wire values produced by the server's
 # net_send_int32() helper.  Clients compare raw wire bytes directly.
 STATUS_SUCCESS = 0x80000000
@@ -330,7 +340,7 @@ def _push_undo(removed_addrs: np.ndarray,
 # ── shared state & locks ──────────────────────────────────────────────────────
 _log_lock       = threading.Lock()
 _cache_lock     = threading.Lock()   # protects val_cache in do_show_results
-_map_cache:      dict = {}           # {pid: (timestamp, maps_list)}
+_map_cache:      dict = {}           # {(ip, pid): (timestamp, maps_list)}
 _map_cache_lock = threading.Lock()
 _MAP_CACHE_TTL  = 30.0               # seconds before cached map is stale
 
@@ -356,12 +366,18 @@ def _stop_freeze_worker() -> None:
     if t and t.is_alive():
         t.join(timeout=2.0)
     with _freeze_lock:
-        _freeze_thread = None
-        _freeze_stop.clear()
+        if t and t.is_alive():
+            # Keep the signal asserted and retain the reference.  Clearing it
+            # here would allow a still-blocked worker to resume later.
+            _freeze_thread = t
+        else:
+            _freeze_thread = None
+            _freeze_stop.clear()
 
 state = {
     "ip":           "",
     "connected":    False,
+    "session":      0,                    # increments after every reconnect
     "pid":          None,
     "proc_name":    "",
     "scan_results": _make_addr_array(),   # np.ndarray[uint64]
@@ -397,7 +413,7 @@ def _resolve_ip(ip: str):
         raise OSError(f"Cannot resolve {ip!r}")
     return info[0][0], info[0][4]   # caller uses this; ps5_connect probes all
 
-def ps5_connect(ip: str) -> socket.socket:
+def ps5_connect(ip: str, timeout: float = 15.0) -> socket.socket:
     """
     Connect to the PS5 debug server, probing every address returned by
     getaddrinfo in order.  The first successful connection is returned.
@@ -410,7 +426,7 @@ def ps5_connect(ip: str) -> socket.socket:
     last_exc: Exception = OSError("no addresses")
     for family, _, _, _, sockaddr in info:
         s = socket.socket(family, socket.SOCK_STREAM)
-        s.settimeout(15)
+        s.settimeout(timeout)
         try:
             s.connect(sockaddr)
             return s
@@ -433,6 +449,257 @@ def recv_exact(s: socket.socket, n: int) -> bytes:
 
 def check_ok(s: socket.socket) -> bool:
     return struct.unpack("<I", recv_exact(s, 4))[0] == STATUS_SUCCESS
+
+def _auth_keystream(length: int) -> bytes:
+    """ps5debug-NG auth.c LFSR keystream, seeded with 200/300/400/500."""
+    s1, s2, s3, s4 = 200, 300, 400, 500
+    out = bytearray(length)
+    mask = 0xFFFFFFFF
+    for i in range(length):
+        s1 = ((s1 << 18) & 0xFFF80000) ^ ((s1 ^ ((s1 << 6) & mask)) >> 13)
+        s2 = ((s2 << 2)  & 0xFFFFFFE0) ^ ((s2 ^ ((s2 << 2) & mask)) >> 27)
+        s3 = ((s3 << 7)  & 0xFFFFF800) ^ ((s3 ^ ((s3 << 13) & mask)) >> 21)
+        s4 = ((s4 << 13) & 0xFFF00000) ^ ((s4 ^ ((s4 << 3) & mask)) >> 12)
+        s1 &= mask; s2 &= mask; s3 &= mask; s4 &= mask
+        out[i] = (s1 ^ s2 ^ s3 ^ s4) & 0xFF
+    return bytes(out)
+
+def ps5_auth_scanner(ip: str) -> None:
+    """Enable ps5debug-NG's authenticated iterative/TurboScan commands."""
+    s = ps5_connect(ip)
+    try:
+        body = struct.pack("<II", PROC_AUTH_MAGIC, 2)
+        s.sendall(cmd_header(CMD_PROC_AUTH, len(body)) + body)
+        if not check_ok(s):
+            raise RuntimeError("scanner authentication rejected")
+        length = struct.unpack("<H", recv_exact(s, 2))[0]
+        if length <= 0 or length > 256:
+            raise RuntimeError(f"invalid auth challenge length: {length}")
+        challenge = recv_exact(s, length)
+        key = _auth_keystream(length)
+        s.sendall(bytes(a ^ b for a, b in zip(challenge, key)))
+        if not check_ok(s):
+            raise RuntimeError("scanner authentication response rejected")
+    finally:
+        s.close()
+
+def ps5_turboscan_caps(ip: str) -> tuple:
+    """Return (version, engines, max_threads) from the read-only capability probe."""
+    s = ps5_connect(ip)
+    try:
+        s.sendall(cmd_header(CMD_TURBO_CAPS))
+        if not check_ok(s):
+            raise RuntimeError("TurboScan unavailable")
+        version, engines, max_threads, _ = struct.unpack("<IIII", recv_exact(s, 16))
+        return version, engines, max_threads
+    finally:
+        s.close()
+
+def _recv_exact_cancel(s: socket.socket, n: int,
+                       cancel_event: Optional[threading.Event]) -> bytes:
+    """recv_exact variant that remains cancellable while the server is busy."""
+    buf = bytearray(n)
+    view = memoryview(buf)
+    pos = 0
+    old_timeout = s.gettimeout()
+    s.settimeout(0.5)
+    try:
+        while pos < n:
+            if cancel_event and cancel_event.is_set():
+                raise InterruptedError("scan cancelled")
+            try:
+                got = s.recv_into(view[pos:], n - pos)
+            except socket.timeout:
+                continue
+            if not got:
+                raise ConnectionError("PS5 disconnected")
+            pos += got
+    finally:
+        s.settimeout(old_timeout)
+    return bytes(buf)
+
+def ps5_scan_exact_server(ip: str, pid: int, value: int, width: int,
+                          regions: list, aligned: bool = True,
+                          cancel_event=None,
+                          progress_cb=None) -> np.ndarray:
+    """Run ps5debug's legacy exact-value scanner on-console."""
+    # VM maps can contain overlapping entries after page-table augmentation.
+    # Merge them so bisecting by start cannot select a short overlapping entry
+    # and incorrectly reject an address covered by a longer one.
+    merged = []
+    for start, end in sorted(regions):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    regions = merged
+    if not regions:
+        return np.empty(0, dtype=_NP_ADDR_DTYPE)
+
+    value_type = {1: 0, 2: 2, 4: 4, 8: 6}[width]
+    target = struct.pack(WIDTH_FMT[width], value)
+    body = struct.pack("<IBBI", pid, value_type, 0, len(target))
+    starts = [r[0] for r in regions]
+    total_bytes = max(sum(end - start for start, end in regions), 1)
+    if progress_cb:
+        progress_cb(0, total_bytes)
+
+    s = ps5_connect(ip)
+    found = []
+    truncated = False
+    try:
+        s.sendall(cmd_header(CMD_PROC_SCAN, len(body)) + body)
+        status = struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0]
+        if status != STATUS_SUCCESS:
+            raise RuntimeError("server-side scan command rejected")
+        s.sendall(target)
+        status = struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0]
+        if status != STATUS_SUCCESS:
+            raise RuntimeError("server-side scan failed")
+
+        while True:
+            addr = struct.unpack("<Q", _recv_exact_cancel(s, 8, cancel_event))[0]
+            if addr == 0xFFFFFFFFFFFFFFFF:
+                break
+            i = bisect.bisect_right(starts, addr) - 1
+            if i < 0 or addr + width > regions[i][1]:
+                continue
+            if aligned and addr % width != 0:
+                continue
+            found.append(addr)
+            if len(found) >= MAX_SCAN_RESULTS:
+                truncated = True
+                if cancel_event:
+                    cancel_event.truncated = True
+                break
+    finally:
+        s.close()
+
+    if progress_cb:
+        progress_cb(total_bytes, total_bytes)
+    result = np.asarray(found, dtype=_NP_ADDR_DTYPE)
+    add_log(f"Console exact scan: {len(result):,} matches"
+            f"{' (truncated)' if truncated else ''}")
+    return result
+
+def ps5_scan_exact_turbo(ip: str, pid: int, value: int, width: int,
+                         regions: list, aligned: bool = True,
+                         cancel_event=None, progress_cb=None) -> np.ndarray:
+    """Segmented SIMD exact scan with a short-lived server-resident session."""
+    ps5_auth_scanner(ip)
+    version, engines, _ = ps5_turboscan_caps(ip)
+    required = 0x01 | 0x04 | 0x10  # SIMD, resident results, segmented scans
+    if version < 1 or (engines & required) != required:
+        raise RuntimeError("required TurboScan engines are unavailable")
+
+    combined = []
+    for start, end in sorted(regions):
+        if combined and start <= combined[-1][1]:
+            combined[-1] = (combined[-1][0], max(combined[-1][1], end))
+        else:
+            combined.append((start, end))
+    merged = []
+    for start, end in combined:
+        if aligned:
+            start += (-start) % width
+            if start + width > end:
+                continue
+        while start < end:
+            max_piece = 0xFFFFFFFF
+            if aligned and width > 1:
+                # Keep the next segment's base on the same absolute alignment;
+                # otherwise the server's per-segment stepping can skip values.
+                max_piece -= max_piece % width
+            piece_end = min(end, start + max_piece)
+            merged.append((start, piece_end))
+            start = piece_end
+    if not merged:
+        return np.empty(0, dtype=_NP_ADDR_DTYPE)
+    if len(merged) > 1_048_576:
+        raise RuntimeError("too many TurboScan segments")
+
+    target = struct.pack(WIDTH_FMT[width], value)
+    value_type = {1: 0, 2: 2, 4: 4, 8: 6}[width]
+    flags = 0x02 | 0x10  # server resident + segmented
+    if (engines & 0x02) and os.environ.get("RDX_TURBO_ALIAS", "1") != "0":
+        flags |= 0x01
+        if engines & 0x100:
+            flags |= 0x80
+    # scan_turbo.c uses `alignment ? alignment : value_length`; therefore 0
+    # means width-aligned.  A byte step of 1 is the true unaligned mode.
+    alignment = width if aligned else 1
+    body = struct.pack("<IQIBBBII", pid, 0, 0, value_type, 0,
+                       alignment, len(target), flags)
+    total_bytes = sum(end - start for start, end in merged)
+    if progress_cb:
+        progress_cb(0, max(total_bytes, 1))
+
+    s = ps5_connect(ip)
+    session_created = False
+    try:
+        s.sendall(cmd_header(CMD_TURBO_START, len(body)) + body)
+        if struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0] != STATUS_SUCCESS:
+            raise RuntimeError("TurboScan start rejected")
+        s.sendall(target)
+        if struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0] != STATUS_SUCCESS:
+            raise RuntimeError("TurboScan value rejected")
+
+        segment_data = bytearray(struct.pack("<I", len(merged)))
+        for start, end in merged:
+            segment_data.extend(struct.pack("<QI", start, end - start))
+        s.sendall(segment_data)
+
+        stored, count = struct.unpack("<IQ", _recv_exact_cancel(s, 12, cancel_event))
+        if not stored:
+            # Segmented decline includes an empty stream sentinel before status.
+            _recv_exact_cancel(s, 8, cancel_event)
+            _recv_exact_cancel(s, 4, cancel_event)
+            raise RuntimeError("TurboScan resident result capacity exceeded")
+        session_created = True
+        if struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0] != STATUS_SUCCESS:
+            raise RuntimeError("TurboScan did not complete")
+
+        wanted = min(int(count), MAX_SCAN_RESULTS)
+        out = np.empty(wanted, dtype=_NP_ADDR_DTYPE)
+        pos = 0
+        page = 10_000
+        while pos < wanted:
+            take = min(page, wanted - pos)
+            get_body = struct.pack("<III", pos, take, 0)
+            s.sendall(cmd_header(CMD_TURBO_GET, len(get_body)) + get_body)
+            if not check_ok(s):
+                raise RuntimeError("TurboScan result fetch rejected")
+            header = struct.unpack("<I", recv_exact(s, 4))[0]
+            actual = header & 0x7FFFFFFF
+            has_first = bool(header & 0x80000000)
+            rec_size = 8 + width * (3 if has_first else 2)
+            raw = recv_exact(s, actual * rec_size)
+            if not check_ok(s):
+                raise RuntimeError("TurboScan result fetch incomplete")
+            if actual == 0:
+                break
+            records = np.ndarray(shape=(actual,), dtype={
+                "names": ["addr", "rest"],
+                "formats": ["<u8", f"V{rec_size - 8}"],
+                "offsets": [0, 8], "itemsize": rec_size}, buffer=raw)
+            out[pos:pos + actual] = records["addr"]
+            pos += actual
+
+        if count > MAX_SCAN_RESULTS and cancel_event:
+            cancel_event.truncated = True
+        if progress_cb:
+            progress_cb(max(total_bytes, 1), max(total_bytes, 1))
+        add_log(f"TurboScan exact: {pos:,}/{count:,} matches, "
+                f"{total_bytes / 1_073_741_824:.2f} GiB scanned")
+        return out[:pos]
+    finally:
+        if session_created:
+            try:
+                s.sendall(cmd_header(CMD_TURBO_END))
+                recv_exact(s, 4)
+            except Exception:
+                pass
+        s.close()
 
 # All helpers use sendall() and try/finally so the socket is always closed.
 
@@ -498,12 +765,16 @@ def ps5_read(ip: str, pid: int, addr: int, length: int) -> bytes:
                 except Exception: pass
     raise last_exc
 
-def ps5_write(ip: str, pid: int, addr: int, data: bytes) -> bool:
+def ps5_write(ip: str, pid: int, addr: int, data: bytes,
+              cancel_event: Optional[threading.Event] = None,
+              timeout: float = 15.0) -> bool:
     """Two-phase write with up to _UI_MAX_RETRIES retries."""
     for attempt in range(_UI_MAX_RETRIES):
+        if cancel_event and cancel_event.is_set():
+            return False
         s = None
         try:
-            s = ps5_connect(ip)
+            s = ps5_connect(ip, timeout=timeout)
             body = struct.pack("<IQI", pid, addr, len(data))
             s.sendall(cmd_header(CMD_PROC_WRITE, len(body)) + body)
             if not check_ok(s):
@@ -512,12 +783,27 @@ def ps5_write(ip: str, pid: int, addr: int, data: bytes) -> bool:
             return check_ok(s)
         except Exception:
             if attempt < _UI_MAX_RETRIES - 1:
-                time.sleep(0.1 * (attempt + 1))
+                delay = 0.1 * (attempt + 1)
+                if cancel_event:
+                    if cancel_event.wait(delay):
+                        return False
+                else:
+                    time.sleep(delay)
         finally:
             if s:
                 try: s.close()
                 except Exception: pass
     return False
+
+def ps5_write_verified(ip: str, pid: int, addr: int, data: bytes) -> tuple:
+    """Write and immediately read back; returns (ack, verified, actual_bytes)."""
+    if not ps5_write(ip, pid, addr, data):
+        return False, False, None
+    try:
+        actual = ps5_read(ip, pid, addr, len(data))
+    except Exception:
+        return True, None, None
+    return True, actual == data, actual
 
 # ── batch reader for scan_next ────────────────────────────────────────────────
 
@@ -555,43 +841,53 @@ def ps5_read_batch(ip: str, pid: int, addrs: np.ndarray, width: int,
         Same as before — callers unchanged.
     """
     NEXT_WORKERS  = 12          # Phase 1: raised from 6 → 12
-    COALESCE_MAX  = 4096        # max window span in bytes per coalesced read
+    COALESCE_MAX  = 8 * 1024 * 1024
+    MAX_BYTES_PER_CANDIDATE = 4096
     LOCAL_BUF     = 256         # thread-local accumulation size before flush
 
     if len(addrs) == 0:
         return (np.empty(0, dtype=_NP_ADDR_DTYPE),
                 np.empty(0, dtype=_NP_VALUE_DTYPE[width]))
 
+    started = time.monotonic()
+
     # ── Phase 2: build coalesced work items ────────────────────────────────────
     # Sort addresses so contiguous runs are adjacent.
     sorted_idx  = np.argsort(addrs, kind='stable')
     sorted_addr = addrs[sorted_idx]
 
-    # Identify run boundaries: a new run starts wherever the gap between
-    # consecutive sorted addresses exceeds COALESCE_MAX.
-    gaps       = np.diff(sorted_addr.astype(np.int64))   # signed for gap calc
-    run_breaks = np.flatnonzero(gaps > COALESCE_MAX)      # indices where runs end
-    # Build list of (window_start_addr, window_end_addr_exclusive,
-    #                first_sorted_idx, last_sorted_idx_exclusive)
-    run_starts = np.concatenate([[0], run_breaks + 1])
-    run_ends   = np.concatenate([run_breaks + 1, [len(sorted_addr)]])
-
     # Each work item: (window_base_addr, window_size_bytes, local_addr_array)
     # The local_addr_array holds the individual candidate addresses within the
     # window so we can slice the right offsets after the single window read.
+    #
+    # Bound windows by their total span, not merely by adjacent gaps.  The old
+    # grouping joined an entire dense region into one huge run and then fell
+    # back to one request per address when that run exceeded 4 KiB.
     work_items: list = []
-    for rs, re in zip(run_starts, run_ends):
+    rs = 0
+    while rs < len(sorted_addr):
+        if cancel_event and cancel_event.is_set():
+            return (np.empty(0, dtype=_NP_ADDR_DTYPE),
+                    np.empty(0, dtype=_NP_VALUE_DTYPE[width]))
         first_addr = int(sorted_addr[rs])
-        last_addr  = int(sorted_addr[re - 1])
-        span       = last_addr - first_addr + width
-        if span <= COALESCE_MAX:
-            # Single coalesced read covers the whole run.
-            work_items.append(('window', first_addr, span,
-                                sorted_addr[rs:re].copy()))
-        else:
-            # Span too large — fall back to individual reads for this run.
-            for i in range(rs, re):
-                work_items.append(('single', int(sorted_addr[i]), width, None))
+        max_last   = first_addr + COALESCE_MAX - width
+        span_re = int(np.searchsorted(sorted_addr, max_last, side='right'))
+        # Take the largest prefix whose window does not read more than a
+        # bounded amount of unrelated memory.  Density is not monotonic when
+        # gaps exist, so evaluate all possible endpoints with NumPy instead
+        # of using a binary search that can reject a later dense prefix.
+        endpoints = sorted_addr[rs:span_re]
+        spans = endpoints.astype(np.uint64) - np.uint64(first_addr + width) \
+                + np.uint64(2 * width)
+        budgets = np.arange(1, len(endpoints) + 1, dtype=np.uint64) \
+                  * np.uint64(MAX_BYTES_PER_CANDIDATE)
+        valid_ends = np.flatnonzero(spans <= budgets)
+        re = rs + (int(valid_ends[-1]) + 1 if len(valid_ends) else 1)
+        last_addr = int(sorted_addr[re - 1])
+        span      = last_addr - first_addr + width
+        work_items.append(('window', first_addr, span,
+                           sorted_addr[rs:re].copy()))
+        rs = re
 
     total     = len(addrs)
     val_dtype = _NP_VALUE_DTYPE[width]
@@ -604,9 +900,11 @@ def ps5_read_batch(ip: str, pid: int, addrs: np.ndarray, width: int,
     work_ptr  = [0]
     ptr_lock  = threading.Lock()
     done_ctr  = [0]
+    connected_workers = [0]
+    worker_errors: list = []
 
     def _worker():
-        sock = _ScanSocket(ip, pid)
+        sock = None
         local_addrs = np.empty(LOCAL_BUF, dtype=_NP_ADDR_DTYPE)
         local_vals  = np.empty(LOCAL_BUF, dtype=val_dtype)
         local_n     = 0
@@ -623,6 +921,14 @@ def ps5_read_batch(ip: str, pid: int, addrs: np.ndarray, width: int,
             local_n = 0
 
         try:
+            try:
+                sock = _ScanSocket(ip, pid)
+                with ptr_lock:
+                    connected_workers[0] += 1
+            except Exception as exc:
+                with ptr_lock:
+                    worker_errors.append(str(exc))
+                return
             while True:
                 if cancel_event and cancel_event.is_set():
                     break
@@ -636,7 +942,7 @@ def ps5_read_batch(ip: str, pid: int, addrs: np.ndarray, width: int,
                 if kind == 'window':
                     _, base_addr, span, cand_addrs = item
                     try:
-                        window = sock.read(base_addr, span)
+                        window = sock.read(base_addr, span, cancel_event)
                         if len(window) == span:
                             # Vectorised decode: interpret entire window as packed
                             # integers, then gather only the candidate offsets.
@@ -648,22 +954,24 @@ def ps5_read_batch(ip: str, pid: int, addrs: np.ndarray, width: int,
                             #       off = int(ca) - base_addr
                             #       val = struct.unpack(fmt, window[off:off+w])[0]
                             #
-                            # New (NumPy gather, C-level, O(1) Python overhead):
-                            #   offsets = cand_addrs - base_addr  → index array
-                            #   win_int = frombuffer(window, '<u{w}')
-                            #   vals    = win_int[offsets // w]   → all values
-                            #
-                            # Requirement: window must be aligned to `width` bytes
-                            # from its base, which is guaranteed because base_addr
-                            # is the first candidate address (itself aligned) and
-                            # span is a multiple of width by construction.
-                            win_int  = np.frombuffer(window, dtype=f'<u{width}')
-                            offsets  = (cand_addrs.astype(np.int64) - base_addr) // width
-                            # Guard: only keep offsets that fit inside the window.
-                            valid    = (offsets >= 0) & (offsets < len(win_int))
-                            v_off    = offsets[valid].astype(np.intp)
+                            # New: build byte indices for every candidate and
+                            # combine their little-endian bytes in NumPy.
+                            byte_offsets = cand_addrs.astype(np.int64) - base_addr
+                            # Decode at each candidate's exact byte offset.  In
+                            # unaligned scan sessions these offsets need not be
+                            # multiples of `width`, and the window length need
+                            # not be divisible by `width`.
+                            valid    = ((byte_offsets >= 0) &
+                                        (byte_offsets + width <= len(window)))
+                            v_off    = byte_offsets[valid].astype(np.intp)
                             v_addrs  = cand_addrs[valid]
-                            v_vals   = win_int[v_off].astype(val_dtype)
+                            # An overlapping typed view decodes values at every
+                            # possible byte offset without allocating a 2-D
+                            # byte-index matrix.
+                            all_vals = np.ndarray(
+                                shape=(len(window) - width + 1,),
+                                dtype=f'<u{width}', buffer=window, strides=(1,))
+                            v_vals = all_vals[v_off].astype(val_dtype, copy=False)
                             # Write into local buffer in one slice assignment;
                             # flush in chunks of LOCAL_BUF if needed.
                             n_v = len(v_addrs)
@@ -685,7 +993,7 @@ def ps5_read_batch(ip: str, pid: int, addrs: np.ndarray, width: int,
                     _, addr, _w, _ = item
                     n_done = 1
                     try:
-                        data = sock.read(addr, _w)
+                        data = sock.read(addr, _w, cancel_event)
                         if len(data) == _w:
                             local_addrs[local_n] = addr
                             local_vals [local_n] = struct.unpack(fmt, data)[0]
@@ -701,7 +1009,8 @@ def ps5_read_batch(ip: str, pid: int, addrs: np.ndarray, width: int,
                         progress_cb(done_ctr[0], total)
         finally:
             _flush()
-            sock.close()
+            if sock:
+                sock.close()
 
     workers = [threading.Thread(target=_worker, daemon=True)
                for _ in range(min(NEXT_WORKERS, max(1, len(work_items))))]
@@ -710,7 +1019,17 @@ def ps5_read_batch(ip: str, pid: int, addrs: np.ndarray, width: int,
     for w in workers:
         w.join()
 
+    if connected_workers[0] == 0:
+        detail = worker_errors[0] if worker_errors else "unknown connection error"
+        raise ConnectionError(f"No batch-read worker could connect: {detail}")
+    for error in worker_errors:
+        add_log(f"Batch-read worker unavailable: {error}", "warn")
+
     n = write_ptr[0]
+    elapsed = max(time.monotonic() - started, 1e-9)
+    add_log(f"Batch read: {n:,}/{total:,} candidates via "
+            f"{len(work_items):,} windows in {elapsed:.2f}s "
+            f"({n / elapsed:,.0f} candidates/s)")
     return out_addrs[:n].copy(), out_vals[:n].copy()
 
 # ── persistent-socket reader for scan_first ───────────────────────────────────
@@ -754,20 +1073,25 @@ class _ScanSocket:
             except Exception: pass
         self._s = ps5_connect(self.ip)
 
-    def read(self, addr: int, length: int) -> bytes:
+    def read(self, addr: int, length: int,
+             cancel_event: Optional[threading.Event] = None) -> bytes:
         """Read `length` bytes from `addr`, reconnecting on transient failure."""
         # Patch addr and length directly into the pre-built bytearray.
         # sendall accepts bytearray natively — no bytes() copy needed.
         struct.pack_into("<QI", self._req, 16, addr, length)
         for attempt in range(self.MAX_RETRIES):
+            if cancel_event and cancel_event.is_set():
+                raise InterruptedError("scan cancelled")
             try:
                 if self._s is None:
                     self._connect()
                 self._s.sendall(self._req)   # zero-copy: no bytes() allocation
                 if not check_ok(self._s):
                     raise RuntimeError("read rejected")
-                return recv_exact(self._s, length)
+                return _recv_exact_cancel(self._s, length, cancel_event)
             except Exception as exc:
+                if cancel_event and cancel_event.is_set():
+                    raise InterruptedError("scan cancelled") from exc
                 add_log(f"scan read err (attempt {attempt+1}/{self.MAX_RETRIES}) "
                         f"@ {hex(addr)}: {exc}", "warn")
                 try: self._s.close()
@@ -775,7 +1099,12 @@ class _ScanSocket:
                 self._s = None
                 if attempt == self.MAX_RETRIES - 1:
                     raise
-                time.sleep(0.1 * (attempt + 1))
+                delay = 0.1 * (attempt + 1)
+                if cancel_event:
+                    if cancel_event.wait(delay):
+                        raise InterruptedError("scan cancelled")
+                else:
+                    time.sleep(delay)
 
     def close(self):
         if self._s:
@@ -787,17 +1116,18 @@ def _get_maps_cached(ip: str, pid: int) -> list:
     """
     Return ps5_maps() with a 30-second cache.  Consecutive scans on the same
     process reuse the map rather than paying an extra RTT before each scan.
-    Invalidated automatically when pid changes or TTL expires.
+    Invalidated automatically when the endpoint or pid changes, or TTL expires.
     """
     now = time.time()
     with _map_cache_lock:
-        entry = _map_cache.get(pid)
+        cache_key = (ip, pid)
+        entry = _map_cache.get(cache_key)
         if entry and (now - entry[0]) < _MAP_CACHE_TTL:
             return entry[1]
     maps = ps5_maps(ip, pid)
     with _map_cache_lock:
         _map_cache.clear()          # only cache one pid at a time
-        _map_cache[pid] = (now, maps)
+        _map_cache[cache_key] = (now, maps)
     return maps
 
 
@@ -838,6 +1168,10 @@ def scan_first(ip: str, pid: int, value: int, width: int = 4,
     aligned=True  → struct.iter_unpack (fast, aligned offsets only)
     aligned=False → byte-by-byte (thorough, finds unaligned values)
     """
+    started = time.monotonic()
+    if cancel_event is None:
+        cancel_event = threading.Event()
+        cancel_event.truncated = False
     # Validate via struct.pack — handles both signed and unsigned types correctly.
     # The old `value < 0` guard blocked all signed-type scans (int8/16/32/64).
     try:
@@ -892,6 +1226,42 @@ def scan_first(ip: str, pid: int, value: int, width: int = 4,
     scannable.sort(key=lambda r: r['end'] - r['start'], reverse=True)
     total_bytes = max(sum(r['end'] - r['start'] for r in scannable), 1)
 
+    if not scannable:
+        if progress_cb:
+            progress_cb(1, 1)
+        add_log("First scan: no eligible memory regions", "warn")
+        return np.empty(0, dtype=_NP_ADDR_DTYPE)
+
+    # CTN/Reaper-style fast path: compare on the console and return only match
+    # addresses.  Preserve this UI's scope/alignment semantics by filtering the
+    # returned addresses against the selected maps.  Set RDX_SERVER_SCAN=0 to
+    # force the original host-side scanner for troubleshooting.
+    if os.environ.get("RDX_SERVER_SCAN", "1") != "0":
+        selected_ranges = sorted((r['start'], r['end']) for r in scannable)
+        if os.environ.get("RDX_TURBO_SCAN", "1") != "0":
+            try:
+                result = ps5_scan_exact_turbo(
+                    ip, pid, value, width, selected_ranges, aligned,
+                    cancel_event, progress_cb)
+                elapsed = max(time.monotonic() - started, 1e-9)
+                add_log(f"Turbo first scan completed in {elapsed:.2f}s")
+                return result
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                add_log(f"TurboScan unavailable ({exc}); trying legacy console scan", "warn")
+        try:
+            result = ps5_scan_exact_server(
+                ip, pid, value, width, selected_ranges, aligned,
+                cancel_event, progress_cb)
+            elapsed = max(time.monotonic() - started, 1e-9)
+            add_log(f"Console first scan completed in {elapsed:.2f}s")
+            return result
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            add_log(f"Console scan unavailable ({exc}); using host scanner", "warn")
+
     # ── build flat work list of (base_addr, size) chunks ─────────────────────
     # Use region_size for small regions to avoid padding waste on tiny regions.
     # Many PS5 mappings are 64KB-512KB; sending a 4MB request for 128KB wastes
@@ -902,9 +1272,11 @@ def scan_first(ip: str, pid: int, value: int, width: int = 4,
         size = r['end'] - r['start']
         off  = 0
         while off < size:
-            csz = min(CHUNK, size - off)
+            # Include enough look-ahead bytes to find a value that begins at
+            # the end of this chunk and continues into the next one.
+            csz = min(CHUNK + width - 1, size - off)
             work.append((r['start'] + off, csz))
-            off += csz
+            off += CHUNK
 
     # Pre-build O(1) lookup dict for partial-read detection in the searcher.
     # The old code used next((s for a,s in work if a==addr), None) which is
@@ -923,11 +1295,20 @@ def scan_first(ip: str, pid: int, value: int, width: int = 4,
     work_idx    = [0]          # shared index into work[]; protected by work_lock
     reader_err      = []
     reader_err_lock = threading.Lock()
+    connected_readers = [0]
 
     # ── reader thread ─────────────────────────────────────────────────────────
     def _reader():
-        sock = _ScanSocket(ip, pid)
+        sock = None
         try:
+            try:
+                sock = _ScanSocket(ip, pid)
+                with reader_err_lock:
+                    connected_readers[0] += 1
+            except Exception as exc:
+                with reader_err_lock:
+                    reader_err.append(f"scan connection failed: {exc}")
+                return
             while True:
                 if cancel_event and cancel_event.is_set():
                     break
@@ -955,7 +1336,8 @@ def scan_first(ip: str, pid: int, value: int, width: int = 4,
                     except _queue.Full:
                         continue
         finally:
-            sock.close()
+            if sock:
+                sock.close()
 
     # ── searcher ──────────────────────────────────────────────────────────────
     # Fast path: _nb_search (Numba, parallel across all CPU cores, GIL-free).
@@ -1077,12 +1459,20 @@ def scan_first(ip: str, pid: int, value: int, width: int = 4,
 
     for wt in watchers:
         wt.join()
+    if connected_readers[0] == 0:
+        detail = reader_err[0] if reader_err else "unknown connection error"
+        raise ConnectionError(f"No first-scan reader could connect: {detail}")
     for msg in reader_err:
         add_log(msg, "warn")
 
     # Convert plain list → ndarray once here; avoids O(N) reallocations that
     # array.array or repeated np.append would cause inside the hot loop.
-    return np.array(found, dtype=_NP_ADDR_DTYPE)
+    result = np.array(found, dtype=_NP_ADDR_DTYPE)
+    elapsed = max(time.monotonic() - started, 1e-9)
+    processed_mb = min(done_bytes[0], total_bytes) / 1_048_576
+    add_log(f"First-scan transfer/search: {processed_mb:.1f} MiB "
+            f"in {elapsed:.2f}s ({processed_mb / elapsed:.1f} MiB/s)")
+    return result
 
 
 def scan_next(ip: str, pid: int, value: int, width: int,
@@ -1167,6 +1557,10 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
     most games) and the cap is rarely hit in the first pass; subsequent
     relational next scans reduce candidates rapidly.
     """
+    started = time.monotonic()
+    if cancel_event is None:
+        cancel_event = threading.Event()
+        cancel_event.truncated = False
     maps = _get_maps_cached(ip, pid)
 
     CHUNK        = 0x2000000   # 32 MB — matches scan_first for consistent RTT amortisation
@@ -1199,14 +1593,23 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
     scannable.sort(key=lambda r: r['end'] - r['start'], reverse=True)
     total_bytes = max(sum(r['end'] - r['start'] for r in scannable), 1)
 
+    if not scannable:
+        if progress_cb:
+            progress_cb(1, 1)
+        add_log("Unknown scan: no eligible memory regions", "warn")
+        return (np.empty(0, dtype=_NP_ADDR_DTYPE),
+                np.empty(0, dtype=_NP_VALUE_DTYPE[width]))
+
     work: list = []
     for r in scannable:
         size = r['end'] - r['start']
         off  = 0
         while off < size:
-            csz = min(CHUNK, size - off)
+            # Overlap adjacent reads by width-1 bytes so unaligned values that
+            # cross a chunk boundary are included in the snapshot.
+            csz = min(CHUNK + width - 1, size - off)
             work.append((r['start'] + off, csz))
-            off += csz
+            off += CHUNK
 
     chunk_queue: "_queue.Queue[Optional[tuple]]" = _queue.Queue(maxsize=QUEUE_DEPTH)
     # Use lists of ndarray chunks; np.concatenate at the end is O(total) and
@@ -1219,10 +1622,19 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
     work_idx     = [0]
     reader_err      = []
     reader_err_lock = threading.Lock()
+    connected_readers = [0]
 
     def _reader():
-        sock = _ScanSocket(ip, pid)
+        sock = None
         try:
+            try:
+                sock = _ScanSocket(ip, pid)
+                with reader_err_lock:
+                    connected_readers[0] += 1
+            except Exception as exc:
+                with reader_err_lock:
+                    reader_err.append(f"snapshot connection failed: {exc}")
+                return
             while True:
                 if cancel_event and cancel_event.is_set():
                     break
@@ -1249,9 +1661,8 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
                     except _queue.Full:
                         continue
         finally:
-            sock.close()
-
-    step = width if aligned else 1
+            if sock:
+                sock.close()
 
     def _snapshot_all():
         """
@@ -1272,6 +1683,7 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
         array extension amortises to O(1) per element.
         """
         nonlocal found_addrs, found_values
+        total_so_far = 0
         sentinels_received = 0
         while sentinels_received < n_workers:
             item = chunk_queue.get()
@@ -1329,23 +1741,28 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
             # For aligned scans, stride by (step // width) in the value array;
             # for unaligned, every byte offset matters so we must work at byte level.
             if aligned:
-                vals_slice = vals_raw          # step == width → every element
+                # Memory mappings are usually page-aligned, but the protocol
+                # does not guarantee it.  Start at the first absolute address
+                # divisible by the selected width.
+                lead       = (-addr) % width
+                aligned_n  = (csz - lead) // width
+                vals_slice = np.frombuffer(
+                    data[lead:lead + aligned_n * width], dtype=f'<u{width}')
                 n_out      = len(vals_slice)
-                # Absolute addresses: addr, addr+width, addr+2*width, ...
-                addrs_out  = np.arange(addr, addr + n_out * width, width,
+                first_addr = addr + lead
+                addrs_out  = np.arange(first_addr, first_addr + n_out * width, width,
                                        dtype=_NP_ADDR_DTYPE)
             else:
-                # Unaligned: one value per byte offset — requires byte-level scan.
-                # We still use NumPy but must iterate byte offsets.
-                offsets    = np.arange(0, csz - width + 1, 1, dtype=np.intp)
-                vals_slice = np.array(
-                    [struct.unpack_from(WIDTH_FMT[width], data, o)[0] for o in offsets],
-                    dtype=val_dtype)
+                # Overlapping typed view: one value at every byte offset, with
+                # all decoding performed in NumPy rather than Python.
+                n_out      = csz - width + 1
+                offsets    = np.arange(n_out, dtype=np.intp)
+                vals_slice = np.ndarray(
+                    shape=(n_out,), dtype=f'<u{width}',
+                    buffer=data, strides=(1,))
                 addrs_out  = (addr + offsets).astype(_NP_ADDR_DTYPE)
-                n_out      = len(offsets)
 
             # Enforce the result cap
-            total_so_far = sum(len(c) for c in found_addrs)
             remaining = MAX_SCAN_RESULTS - total_so_far
             if n_out > remaining:
                 addrs_out  = addrs_out[:remaining]
@@ -1364,6 +1781,7 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
 
             found_addrs.append(addrs_out)
             found_values.append(vals_slice.astype(_NP_VALUE_DTYPE[width]))
+            total_so_far += len(addrs_out)
 
             done_bytes[0] += csz
             if progress_cb:
@@ -1400,6 +1818,9 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
 
     for wt in watchers:
         wt.join()
+    if connected_readers[0] == 0:
+        detail = reader_err[0] if reader_err else "unknown connection error"
+        raise ConnectionError(f"No snapshot reader could connect: {detail}")
     for msg in reader_err:
         add_log(msg, "warn")
 
@@ -1414,6 +1835,10 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
 
     add_log(f"Unknown-scan snapshot: {len(out_addrs):,} candidates, "
             f"RSS {_rss_mb():.0f} MB")
+    elapsed = max(time.monotonic() - started, 1e-9)
+    processed_mb = min(done_bytes[0], total_bytes) / 1_048_576
+    add_log(f"Unknown-scan transfer/decode: {processed_mb:.1f} MiB "
+            f"in {elapsed:.2f}s ({processed_mb / elapsed:.1f} MiB/s)")
     return out_addrs, out_values
 
 
@@ -1879,6 +2304,13 @@ def screen_connect(stdscr) -> str:
     stdscr.refresh()
     try:
         procs = ps5_proc_list(ip)
+        # A successful connection starts a new protocol session.  PIDs can be
+        # reused after rest mode/restart and can coincide across consoles, so
+        # no address or map state from the prior session is safe to retain.
+        _clear_scan_state()
+        state["pid"] = None
+        state["proc_name"] = ""
+        state["session"] += 1
         state["connected"] = True
         add_log(f"Connected to {ip}, {len(procs)} processes")
         return screen_proc_select(stdscr, procs)
@@ -2154,6 +2586,7 @@ def _run_scan_with_progress(stdscr, thread_fn, total_label: str,
             add_log(f"Scan thread unhandled error: {exc}", "error")
 
     t = threading.Thread(target=_guarded_fn, daemon=True)
+    started = time.monotonic()
     t.start()
 
     spinner = ["|", "/", "-", "\\"]
@@ -2163,9 +2596,15 @@ def _run_scan_with_progress(stdscr, thread_fn, total_label: str,
         while t.is_alive():
             h, w = stdscr.getmaxyx()           # Issue #1: re-read on every tick
             frac = progress["done"] / max(progress["total"], 1)
+            elapsed = max(time.monotonic() - started, 0.0)
+            eta = ((elapsed / frac) - elapsed) if frac > 0 else None
+            timing = f"elapsed {elapsed:.1f}s"
+            if eta is not None and frac < 1.0:
+                timing += f", ETA {max(eta, 0.0):.1f}s"
             safe_addstr(stdscr, 9, 3,
                 f"{spinner[spin_i % 4]}  {total_label}  "
-                f"{progress['done']:,} / {progress['total']:,}  [Esc=cancel]",
+                f"{progress['done']:,} / {progress['total']:,}  "
+                f"[{timing}]  [Esc=cancel]",
                 color(C_WARN))
             draw_progress_bar(stdscr, 10, 3, min(w - 8, 60), frac,
                               f"  {int(frac * 100)}%")
@@ -2408,9 +2847,12 @@ def do_scan_next(stdscr) -> None:
         # set-difference via searchsorted rather than building a Python set.
         new_sorted  = np.sort(new_addrs)
         # Find indices in prev_addrs that are NOT in new_sorted.
-        ins         = np.searchsorted(new_sorted, prev_addrs)
-        ins_clipped = np.clip(ins, 0, len(new_sorted) - 1)
-        removed_mask = new_sorted[ins_clipped] != prev_addrs
+        if len(new_sorted) == 0:
+            removed_mask = np.ones(len(prev_addrs), dtype=bool)
+        else:
+            ins          = np.searchsorted(new_sorted, prev_addrs)
+            ins_clipped  = np.clip(ins, 0, len(new_sorted) - 1)
+            removed_mask = new_sorted[ins_clipped] != prev_addrs
         removed_a    = prev_addrs[removed_mask]
         removed_v    = prev_values[removed_mask]
         _push_undo(removed_a, removed_v, set(state["scan_dropped"]))
@@ -2668,9 +3110,16 @@ def do_show_results(stdscr) -> None:
                 with cache_lock:
                     val_cache.clear()
             elif key in (ord('d'), ord('D')):
+                dropped_idx = sel
                 dropped = results[sel]
                 results = _make_addr_array(a for i, a in enumerate(results) if i != sel)
                 state["scan_results"] = results
+                # Unknown-value scans keep a parallel value snapshot.  Remove
+                # the matching element or the next relational scan sees a
+                # mismatched/corrupted address-value pair.
+                if state.get("scan_values") is not None:
+                    state["scan_values"] = np.delete(
+                        state["scan_values"], dropped_idx)
                 # Track dropped address separately from scan history
                 state["scan_dropped"].add(dropped)
                 with cache_lock:
@@ -2761,6 +3210,10 @@ def _add_cheat_at(stdscr, addr: int) -> None:
             "value":   val,
             "type":    typ,
             "width":   scan_w,
+            # Local safety metadata; generate_cht intentionally does not export it.
+            "pid":     state["pid"],
+            "process": state["proc_name"],
+            "session": state["session"],
         }
         state["cheats"].append(entry)
         add_log(f"Added '{entry['name']}' @ {hex(addr)} = {val}")
@@ -2797,12 +3250,31 @@ def do_write(stdscr) -> None:
             if not confirm_box(stdscr, f"{map_err}\nWrite anyway?", "Unmapped Address"):
                 return
         data = struct.pack(WIDTH_FMT[width], val)
-        ok   = ps5_write(state["ip"], state["pid"], addr, data)
-        add_log(f"Write {hex(addr)} = {val} {'OK' if ok else 'FAILED'}",
-                "info" if ok else "error")
-        if ok:
-            message_box(stdscr, [f"Wrote {val} to {hex(addr)}"], "Write OK", C_OK)
+        ack, verified, actual = ps5_write_verified(
+            state["ip"], state["pid"], addr, data)
+        if ack and verified:
+            add_log(f"Write {hex(addr)} = {val} verified")
+            message_box(stdscr,
+                        [f"Wrote {val} to {hex(addr)}", "Read-back verified."],
+                        "Write OK", C_OK)
+        elif ack and verified is None:
+            add_log(f"Write {hex(addr)} = {val} acknowledged; read-back failed", "warn")
+            message_box(stdscr,
+                ["ps5debug acknowledged the write,",
+                 "but the address could not be read back.",
+                 "Check the Log and connection."],
+                "Write Unverified", C_WARN)
+        elif ack:
+            actual_val = struct.unpack(WIDTH_FMT[width], actual)[0]
+            add_log(f"Write mismatch {hex(addr)}: wanted {val}, read {actual_val}", "error")
+            message_box(stdscr,
+                ["ps5debug acknowledged the command, but memory did not change.",
+                 f"Requested: {val}", f"Read back: {actual_val}",
+                 "The game may restore the value, or this payload/firmware",
+                 "may not support writes to that mapping."],
+                "Write Mismatch", C_ERR)
         else:
+            add_log(f"Write {hex(addr)} = {val} rejected", "error")
             message_box(stdscr, ["Write rejected by ps5debug."], "Write Failed", C_ERR)
     except Exception as exc:
         message_box(stdscr, [f"Error: {exc}"], "Error", C_ERR)
@@ -2822,7 +3294,7 @@ def do_cheat_list(stdscr) -> None:
                 "No cheats yet — scan and add some!", color(C_WARN))
         else:
             safe_addstr(stdscr, 2, 3,
-                "↑↓ select   Enter edit   D delete   Q back", color(C_NORM))
+                "↑↓ select   Enter edit   A apply once   D delete   Q back", color(C_NORM))
             hdr = f"  {'Name':<28}  {'Address':<18}  {'Value':<10}  Type"
             safe_addstr(stdscr, 3, 2, hdr[:w - 4],
                         color(C_TITLE) | curses.A_UNDERLINE)
@@ -2841,7 +3313,8 @@ def do_cheat_list(stdscr) -> None:
 
         draw_statusbar(stdscr, [
             ("↑↓ navigate", C_NORM), ("Enter edit", C_OK),
-            ("D delete", C_ERR),     ("Q back", C_NORM),
+            ("A apply once", C_WARN), ("D delete", C_ERR),
+            ("Q back", C_NORM),
         ])
         stdscr.refresh()
 
@@ -2851,6 +3324,8 @@ def do_cheat_list(stdscr) -> None:
         elif key in (curses.KEY_ENTER, 10, 13) and cheats:
             _edit_cheat(stdscr, sel)
             cheats = state["cheats"]
+        elif key in (ord('a'), ord('A')) and cheats:
+            _apply_cheat_once(stdscr, cheats[sel])
         elif key in (ord('d'), ord('D')) and cheats:
             name = cheats[sel]["name"]
             if confirm_box(stdscr, f"Delete '{name}'?", "Delete Cheat"):
@@ -2864,6 +3339,59 @@ def do_cheat_list(stdscr) -> None:
                 offset = min(offset, max(0, len(cheats) - visible))
         elif key in (ord('q'), ord('Q')):
             break
+
+
+def _apply_cheat_once(stdscr, cheat: dict) -> None:
+    """Apply one saved cheat value immediately and verify the result."""
+    owner_pid = cheat.get("pid")
+    if owner_pid is None:
+        message_box(stdscr,
+            ["This cheat predates process ownership tracking.",
+             "Re-add it from current scan results before applying it."],
+            "Unowned Cheat", C_WARN)
+        return
+    if cheat.get("session") != state["session"]:
+        message_box(stdscr,
+            ["This cheat belongs to an earlier PS5 connection session.",
+             "The game or payload may have restarted and reused its PID.",
+             "Re-add the address from fresh scan results."],
+            "Stale Cheat", C_ERR)
+        return
+    if owner_pid != state["pid"]:
+        owner_name = cheat.get("process") or "unknown process"
+        message_box(stdscr,
+            [f"This address belongs to PID {owner_pid} ({owner_name}).",
+             f"Current process is PID {state['pid']} ({state['proc_name']}).",
+             "Application blocked to avoid writing to the wrong process."],
+            "Stale Cheat", C_ERR)
+        return
+    addr  = int(cheat["address"])
+    width = int(cheat["width"])
+    value = int(cheat["value"])
+    map_err = _validate_addr_in_maps(state["ip"], state["pid"], addr, width)
+    if map_err and not confirm_box(stdscr, f"{map_err}\nWrite anyway?", "Unmapped Address"):
+        return
+    data = struct.pack(WIDTH_FMT[width], value)
+    ack, verified, actual = ps5_write_verified(
+        state["ip"], state["pid"], addr, data)
+    if ack and verified:
+        add_log(f"Applied '{cheat['name']}' @ {hex(addr)} = {value} (verified)")
+        message_box(stdscr, [f"Applied '{cheat['name']}'.", "Read-back verified."],
+                    "Cheat Applied", C_OK)
+    elif ack and verified is None:
+        add_log(f"Applied '{cheat['name']}' but read-back failed", "warn")
+        message_box(stdscr, ["Write acknowledged, but read-back failed."],
+                    "Apply Unverified", C_WARN)
+    elif ack:
+        actual_value = struct.unpack(WIDTH_FMT[width], actual)[0]
+        add_log(f"Apply mismatch '{cheat['name']}': read {actual_value}", "error")
+        message_box(stdscr,
+                    ["Write was acknowledged but did not stick.",
+                     f"Requested: {value}", f"Read back: {actual_value}"],
+                    "Apply Mismatch", C_ERR)
+    else:
+        add_log(f"Apply rejected for '{cheat['name']}'", "error")
+        message_box(stdscr, ["Write rejected by ps5debug."], "Apply Failed", C_ERR)
 
 
 def _edit_cheat(stdscr, idx: int) -> None:
@@ -2965,6 +3493,20 @@ def do_export(stdscr) -> None:
 
 def do_freeze(stdscr) -> None:
     global _freeze_thread
+    # Do not clear/reuse the shared stop signal while an older worker may still
+    # be blocked in a socket call.  _stop_freeze_worker retains its reference
+    # and leaves the signal asserted when the join timeout expires.
+    _stop_freeze_worker()
+    with _freeze_lock:
+        old_worker_alive = bool(_freeze_thread and _freeze_thread.is_alive())
+    if old_worker_alive:
+        add_log("New freeze blocked: previous worker is still shutting down", "error")
+        message_box(stdscr,
+            ["The previous freeze worker is still shutting down.",
+             "Wait for its network operation to finish, then try again."],
+            "Freeze Still Active", C_ERR)
+        return
+
     stdscr.clear()
     h, w = stdscr.getmaxyx()
     draw_border(stdscr, "FREEZE ADDRESS")
@@ -3031,11 +3573,19 @@ def do_freeze(stdscr) -> None:
             if state["pid"] != frozen_pid or state["ip"] != frozen_ip:
                 add_log("Freeze aborted — process or connection changed", "warn")
                 break
-            if not ps5_write(frozen_ip, frozen_pid, addr, data):
+            if not ps5_write(frozen_ip, frozen_pid, addr, data,
+                             cancel_event=_freeze_stop, timeout=1.0):
+                if _freeze_stop.is_set():
+                    break
                 write_errors[0] += 1
-            # Use the local event for interruptible sleep; also wake early
-            # if the global freeze_stop is set by _stop_freeze_worker().
-            stop_event.wait(interval)
+            # Check both stop signals during the interval.  A user-provided
+            # long interval must not let this worker survive a process change.
+            sleep_until = time.time() + interval
+            while time.time() < sleep_until:
+                if stop_event.wait(min(0.1, sleep_until - time.time())):
+                    break
+                if _freeze_stop.is_set():
+                    break
 
     # Issue #7: register globally before starting the thread.
     with _freeze_lock:
@@ -3095,6 +3645,8 @@ def do_clear_results(stdscr) -> None:
         state["scan_values"]  = None
         state["scan_history"] = deque(maxlen=5)
         state["scan_dropped"] = set()
+        state["scan_pid"]     = None
+        state["scan_truncated"] = False
         state["scan_unknown"] = False
         gc.collect()
         add_log(f"Scan results cleared — RSS now {_rss_mb():.0f} MB", "warn")

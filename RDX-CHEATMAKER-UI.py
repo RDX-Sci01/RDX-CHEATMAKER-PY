@@ -369,7 +369,8 @@ _log_lock       = threading.Lock()
 _cache_lock     = threading.Lock()   # protects val_cache in do_show_results
 _map_cache:      dict = {}           # {(ip, pid): (timestamp, maps_list)}
 _map_cache_lock = threading.Lock()
-_MAP_CACHE_TTL  = 30.0               # seconds before cached map is stale
+_MAP_CACHE_TTL  = 30.0               # general scan cache TTL
+_WRITE_MAP_CACHE_TTL = 10.0          # shorter TTL for writes/freezes
 
 # Issues #7/#8/#9/#10: track the active freeze worker globally so it can be
 # stopped when the user changes process or reconnects.  Without this the old
@@ -416,6 +417,7 @@ state = {
     "scan_width":   4,
     "scan_aligned":       True,
     "scan_writable_only": True,
+    "scan_engine": "auto",          # auto / turbo / console / host
     "cheats":       [],
     "game_id":      "",
     "game_ver":     "01.00",
@@ -741,15 +743,15 @@ def ps5_scan_exact_turbo(ip: str, pid: int, value: int, width: int,
         if progress_cb and total_bytes > 0:
             def _heartbeat():
                 # Assume ~500 MB/s effective throughput as a baseline estimate.
-                # Advances done from 0 to 95% of total_bytes at that rate,
-                # then holds at 95% until the real completion fires.
-                # The final 5% is covered by the post-scan ramp in
+                # Advances done from 0 to 99% of total_bytes at that rate,
+                # then holds at 99% until the real completion fires.
+                # The final 1% is covered by the post-scan ramp in
                 # _run_scan_with_progress so the bar reaches 100% visibly.
                 _estimated_secs = max(total_bytes / (500 * 1024 * 1024), 0.5)
                 _step = max(int(total_bytes * 0.01), 1)   # 1% per tick
-                _interval = _estimated_secs / 95           # tick every 1% of est. time
+                _interval = _estimated_secs / 99           # tick every 1% of est. time
                 _done = 0
-                _cap  = int(total_bytes * 0.95)
+                _cap  = int(total_bytes * 0.99)
                 while not _hb_stop.wait(max(_interval, 0.05)):
                     _done = min(_done + _step, _cap)
                     try:
@@ -1210,11 +1212,15 @@ class _ScanSocket:
     """
     MAX_RETRIES = 3
     _HDR_SIZE   = 28   # 12 (cmd_packet) + 16 (cmd_proc_read_packet)
+    _POOL_MAX   = 6
+    _pool_lock  = threading.Lock()
+    _pool       = {}  # {(ip, pid): [socket, ...]}
 
     def __init__(self, ip: str, pid: int):
         self.ip  = ip
         self.pid = pid
         self._s: Optional[socket.socket] = None
+        self._from_pool = False
         # Pre-built mutable request buffer; addr field patched in read()
         self._req = bytearray(self._HDR_SIZE)
         struct.pack_into("<III", self._req,  0,
@@ -1223,11 +1229,31 @@ class _ScanSocket:
         # addr at offset 16, length at offset 24 — set per-call
         self._connect()
 
+    @classmethod
+    def clear_pool(cls, ip=None, pid=None):
+        with cls._pool_lock:
+            for key in list(cls._pool):
+                if ip is not None and key[0] != ip: continue
+                if pid is not None and key[1] != pid: continue
+                for sock in cls._pool.pop(key, []):
+                    try: sock.close()
+                    except Exception: pass
+
     def _connect(self):
         if self._s:
             try: self._s.close()
             except Exception: pass
+            self._s = None
+        key = (self.ip, self.pid)
+        with self._pool_lock:
+            bucket = self._pool.get(key)
+            if bucket:
+                self._s = bucket.pop()
+                self._from_pool = True
+                if not bucket: self._pool.pop(key, None)
+                return
         self._s = ps5_connect(self.ip)
+        self._from_pool = False
 
     def read(self, addr: int, length: int,
              cancel_event: Optional[threading.Event] = None) -> bytes:
@@ -1253,6 +1279,7 @@ class _ScanSocket:
                 try: self._s.close()
                 except Exception: pass
                 self._s = None
+                self._from_pool = False
                 if attempt == self.MAX_RETRIES - 1:
                     raise
                 delay = 0.1 * (attempt + 1)
@@ -1263,10 +1290,19 @@ class _ScanSocket:
                     time.sleep(delay)
 
     def close(self):
-        if self._s:
-            try: self._s.close()
-            except Exception: pass
-            self._s = None
+        if not self._s:
+            return
+        sock, self._s = self._s, None
+        key = (self.ip, self.pid)
+        with self._pool_lock:
+            bucket = self._pool.setdefault(key, [])
+            if len(bucket) < self._POOL_MAX:
+                bucket.append(sock)
+                self._from_pool = True
+                return
+        try: sock.close()
+        except Exception: pass
+        self._from_pool = False
 
 def _get_maps_cached(ip: str, pid: int) -> list:
     """
@@ -1388,35 +1424,33 @@ def scan_first(ip: str, pid: int, value: int, width: int = 4,
         add_log("First scan: no eligible memory regions", "warn")
         return np.empty(0, dtype=_NP_ADDR_DTYPE)
 
-    # CTN/Reaper-style fast path: compare on the console and return only match
-    # addresses.  Preserve this UI's scope/alignment semantics by filtering the
-    # returned addresses against the selected maps.  Set RDX_SERVER_SCAN=0 to
-    # force the original host-side scanner for troubleshooting.
-    if os.environ.get("RDX_SERVER_SCAN", "1") != "0":
-        selected_ranges = sorted((r['start'], r['end']) for r in scannable)
-        if os.environ.get("RDX_TURBO_SCAN", "1") != "0":
-            try:
-                result = ps5_scan_exact_turbo(
-                    ip, pid, value, width, selected_ranges, aligned,
-                    cancel_event, progress_cb)
-                elapsed = max(time.monotonic() - started, 1e-9)
-                add_log(f"Turbo first scan completed in {elapsed:.2f}s")
-                return result
-            except InterruptedError:
-                raise
-            except Exception as exc:
-                add_log(f"TurboScan unavailable ({exc}); trying legacy console scan", "warn")
+    # Select the scanner engine from the UI setting.
+    engine = state.get("scan_engine", "auto")
+    selected_ranges = sorted((r['start'], r['end']) for r in scannable)
+    if engine in ("auto", "turbo") and os.environ.get("RDX_TURBO_SCAN", "1") != "0":
         try:
-            result = ps5_scan_exact_server(
-                ip, pid, value, width, selected_ranges, aligned,
-                cancel_event, progress_cb)
-            elapsed = max(time.monotonic() - started, 1e-9)
-            add_log(f"Console first scan completed in {elapsed:.2f}s")
+            result = ps5_scan_exact_turbo(ip, pid, value, width, selected_ranges, aligned,
+                                          cancel_event, progress_cb)
+            add_log(f"Turbo first scan completed in {max(time.monotonic()-started,1e-9):.2f}s")
             return result
         except InterruptedError:
             raise
         except Exception as exc:
-            add_log(f"Console scan unavailable ({exc}); using host scanner", "warn")
+            add_log(f"TurboScan unavailable ({exc})", "warn")
+            if engine == "turbo":
+                raise
+    if engine in ("auto", "console"):
+        try:
+            result = ps5_scan_exact_server(ip, pid, value, width, selected_ranges, aligned,
+                                           cancel_event, progress_cb)
+            add_log(f"Console first scan completed in {max(time.monotonic()-started,1e-9):.2f}s")
+            return result
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            add_log(f"Console scan unavailable ({exc})", "warn")
+            if engine == "console":
+                raise
 
     # ── build flat work list of (base_addr, size) chunks ─────────────────────
     # Use region_size for small regions to avoid padding waste on tiny regions.
@@ -1652,16 +1686,15 @@ def scan_next(ip: str, pid: int, value: int, width: int,
     the actual comparison cost only ~0.34 ms.  By moving the decode into
     ps5_read_batch workers the Python iteration is eliminated entirely.
     """
-    # Fast/correct path: refine the payload's complete resident list.  This is
-    # especially important when the displayed first-scan results were capped.
-    try:
-        return ps5_scan_next_turbo(ip, pid, value, width,
-                                   cancel_event, progress_cb)
-    except InterruptedError:
-        raise
-    except Exception as exc:
-        add_log(f"Resident Turbo rescan unavailable ({exc}); using host filter",
-                "warn")
+    if state.get("scan_engine", "auto") in ("auto", "turbo"):
+        try:
+            return ps5_scan_next_turbo(ip, pid, value, width, cancel_event, progress_cb)
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            add_log(f"Resident Turbo rescan unavailable ({exc}); using host filter", "warn")
+            if state.get("scan_engine") == "turbo":
+                raise
 
     dtype = _NP_VALUE_DTYPE[width]
     try:
@@ -2296,6 +2329,49 @@ def classify_pointer_results(ip: str, pid: int,
             region_map)
 
 
+# A pointer scan normally finds an exact pointer value.  That is not enough
+# to find common struct-member pointers, where the memory cell contains
+# (target_address - struct_offset).  The old _auto_pointer_offset() tried to
+# infer the offset by reading the exact-match cell, which can only ever produce
+# zero.  Keep the zero case cheap and use an explicit bounded sweep for the
+# actual struct-offset case.
+POINTER_STRUCT_SWEEP_MAX = 0x200
+POINTER_STRUCT_SWEEP_STEP = 8
+
+def _pointer_target_sweep(ip: str, pid: int, target_addr: int,
+                          cancel_event=None) -> list:
+    """Return (holder_address, struct_offset) hits for a target.
+
+    For each aligned offset O, a holder containing ``target_addr - O`` is a
+    valid pointer to ``target_addr`` at ``holder + O``.  The sweep is bounded
+    to 0x200 bytes to avoid turning pointer scanning into an unbounded search.
+    Results are deduplicated by holder/offset and capped like normal pointer
+    scan results.
+    """
+    hits = []
+    seen = set()
+    max_off = min(POINTER_STRUCT_SWEEP_MAX, target_addr - _ADDR_MIN)
+    for off in range(0, max_off + 1, POINTER_STRUCT_SWEEP_STEP):
+        if cancel_event and cancel_event.is_set():
+            break
+        wanted = target_addr - off
+        if wanted < _ADDR_MIN or wanted > _ADDR_MAX:
+            continue
+        ptr_addrs = scan_for_pointer(ip, pid, wanted,
+                                     cancel_event=cancel_event,
+                                     progress_cb=None)
+        for addr in ptr_addrs.tolist():
+            key = (int(addr), int(off))
+            if key in seen:
+                continue
+            seen.add(key)
+            hits.append(key)
+            if len(hits) >= MAX_PTR_RESULTS:
+                add_log("Pointer struct-offset sweep reached result cap", "warn")
+                return hits
+    return hits
+
+
 def pointer_chain_scan(ip: str, pid: int,
                        target_addr: int,
                        max_depth: int = 3,
@@ -2335,60 +2411,82 @@ def pointer_chain_scan(ip: str, pid: int,
             if progress_cb:
                 progress_cb(depth - 1, max_depth)
 
-            ptr_addrs = scan_for_pointer(
-                ip, pid, pointed_to,
-                cancel_event=cancel_event,
-                # Do not forward progress_cb: scan_first reports byte offsets
-                # (millions) as numerator, which corrupts the depth-level bar
-                # whose denominator is max_depth (1-4).  The spinner in
-                # _run_scan_with_progress keeps the UI alive during each scan.
-                progress_cb=None,
-            )
-            if len(ptr_addrs) == 0:
+            # The first level gets the bounded struct-member sweep because
+            # this is where a static pointer commonly anchors a heap object.
+            # Deeper levels use exact pointer matches to avoid multiplying a
+            # 65-scan sweep by every intermediate candidate.
+            if depth == 1:
+                pointer_hits = _pointer_target_sweep(
+                    ip, pid, pointed_to, cancel_event=cancel_event)
+            else:
+                ptr_addrs = scan_for_pointer(
+                    ip, pid, pointed_to, cancel_event=cancel_event,
+                    progress_cb=None)
+                pointer_hits = [(int(a), 0) for a in ptr_addrs.tolist()]
+            if not pointer_hits:
                 continue
 
-            # Cap results per level to avoid combinatorial explosion.
-            if len(ptr_addrs) > MAX_PTR_RESULTS:
-                add_log(f"Depth {depth}: capping {len(ptr_addrs):,} → "
-                        f"{MAX_PTR_RESULTS:,} results", "warn")
-                ptr_addrs = ptr_addrs[:MAX_PTR_RESULTS]
+            # Group/deduplicate by holder while retaining distinct offsets.
+            # A holder may legitimately produce more than one candidate if the
+            # same address can be interpreted through different pointer values.
+            static_hits = []
+            heap_hits = []
+            try:
+                maps = _get_maps_cached(ip, pid)
+            except Exception:
+                maps = []
+            # Classification is independent of the offset, so build the map
+            # index once instead of fetching/rebuilding it for every hit.
+            starts = np.array([r["start"] for r in maps], dtype=np.uint64)
+            ends = np.array([r["end"] for r in maps], dtype=np.uint64)
+            if len(starts):
+                order = np.argsort(starts)
+                starts = starts[order]; ends = ends[order]
+                maps_s = [maps[i] for i in order]
+            else:
+                maps_s = []
+            for addr, step_offset in pointer_hits:
+                mi = int(np.searchsorted(starts, addr, side="right")) - 1 if len(starts) else -1
+                if mi >= 0 and addr < int(ends[mi]):
+                    region = maps_s[mi]
+                    rname = region.get("name", "") or "anon"
+                    is_static = _is_static_region(region)
+                else:
+                    rname = "unmapped"; is_static = False
+                (static_hits if is_static else heap_hits).append((addr, step_offset, rname))
 
-            static_a, heap_a, rmap = classify_pointer_results(ip, pid, ptr_addrs)
-
-            # offset = target_addr - address_of_the_pointer_holder
-            # (0 when the pointer IS the value, non-zero when offset into struct)
-            # For a direct pointer scan the offset between the pointer's value
-            # and the pointed-to address is always 0 at this stage.  The user
-            # can refine offsets in the verify screen.
-            for addr in static_a.tolist():
+            for addr, step_offset, rname in static_hits:
                 candidates.append({
-                    "base":    addr,
-                    "offsets": chain_so_far + [0],
-                    "depth":   depth,
-                    "region":  rmap.get(addr, ""),
-                    "static":  True,
+                    "base": addr,
+                    "offsets": chain_so_far + [step_offset],
+                    "depth": depth,
+                    "region": rname,
+                    "static": True,
                 })
 
             # Track heap results as seeds for deeper levels.
-            # Cap next_targets at MAX_PTR_RESULTS to mirror the per-level cap
-            # on ptr_addrs and prevent the dict from ballooning exponentially
-            # across depths (500K heap seeds × 4 depths = 2M entries otherwise).
-            heap_list = heap_a.tolist()
+            heap_list = heap_hits
             if len(next_targets) + len(heap_list) > MAX_PTR_RESULTS:
                 heap_list = heap_list[:max(0, MAX_PTR_RESULTS - len(next_targets))]
                 add_log(f"Depth {depth}: next_targets capped at {MAX_PTR_RESULTS:,}", "warn")
-            for addr in heap_list:
-                new_chain = chain_so_far + [0]
-                next_targets[addr] = new_chain
-                # Only emit heap candidates as final results at max depth.
+            for addr, step_offset, rname in heap_list:
+                new_chain = chain_so_far + [step_offset]
+                # Keep one chain per heap holder for the next depth.  If the
+                # same holder was discovered through multiple offsets, prefer
+                # the shorter chain; emitting every duplicate would explode the
+                # search space without improving the next pointer level.
+                old_chain = next_targets.get(addr)
+                if old_chain is None or len(new_chain) < len(old_chain):
+                    next_targets[addr] = new_chain
                 if depth == max_depth:
                     candidates.append({
-                        "base":    addr,
+                        "base": addr,
                         "offsets": new_chain,
-                        "depth":   depth,
-                        "region":  rmap.get(addr, "heap"),
-                        "static":  False,
+                        "depth": depth,
+                        "region": rname,
+                        "static": False,
                     })
+
 
         current_targets = next_targets
         if not current_targets:
@@ -2412,19 +2510,21 @@ def _validate_write_addr(addr: int) -> Optional[str]:
         return f"Address {hex(addr)} is in kernel space — write blocked."
     return None
 
-def _validate_addr_in_maps(ip: str, pid: int, addr: int, length: int) -> Optional[str]:
-    """
-    Return an error string if `addr`..`addr+length` does not fall within a
-    writable mapped region of the process, else None.
-
-    Uses the 30-second map cache so repeated writes/freezes don't pay an
-    extra RTT each time.
-
-    Returns an error string (not None) when the map cannot be fetched, so
-    callers always see a real validation result — never a silent pass-through.
-    """
+def _validate_addr_in_maps(ip: str, pid: int, addr: int, length: int,
+                           ttl_override: Optional[float] = None) -> Optional[str]:
+    """Validate a writable address using a shorter cache for write paths."""
     try:
-        maps = _get_maps_cached(ip, pid)
+        ttl = _WRITE_MAP_CACHE_TTL if ttl_override is None else max(0.0, float(ttl_override))
+        now = time.time()
+        key = (ip, pid)
+        with _map_cache_lock:
+            entry = _map_cache.get(key)
+            maps = entry[1] if entry and (now - entry[0]) < ttl else None
+        if maps is None:
+            maps = ps5_maps(ip, pid)
+            with _map_cache_lock:
+                _map_cache.clear()
+                _map_cache[key] = (now, maps)
     except Exception as exc:
         # Fail-CLOSED: surface the error so the caller can confirm explicitly.
         return f"Could not fetch memory map to validate address: {exc}"
@@ -2778,6 +2878,7 @@ def _clear_scan_state() -> None:
     state["scan_unknown"]   = False
     with _map_cache_lock:
         _map_cache.clear()
+    _ScanSocket.clear_pool()
     gc.collect()
 
 
@@ -2860,107 +2961,208 @@ def screen_proc_select(stdscr, procs: list) -> str:
             sel = 0
 
 def _draw_main_header(stdscr) -> None:
+    """Compact persistent application header: connection/process first, telemetry second."""
     _, w = stdscr.getmaxyx()
-    conn = f" ★ {state['ip']}  PID {state['pid']} ({state['proc_name']}) "
-    safe_addstr(stdscr, 2, 3, conn, color(C_OK) | curses.A_BOLD)
-    wlabel = {1: "byte", 2: "uint16", 4: "uint32", 8: "uint64"}.get(
-        state["scan_width"], "?")
-    align  = "aligned" if state["scan_aligned"] else "unaligned"
-    rss    = _rss_mb()
-    frac   = _rss_frac()
-    hist_mb = _history_bytes() / 1_048_576
-    # Colour: green < 50 %, yellow < 75 %, red ≥ 75 % of total RAM
-    if frac >= 0.75:
-        ram_cp = C_ERR
-    elif frac >= 0.50:
-        ram_cp = C_WARN
-    else:
-        ram_cp = C_OK
-    stats  = (f"  Results: {len(state['scan_results']):,}   "
-              f"Cheats: {len(state['cheats'])}   "
-              f"Width: {wlabel}  ({align})")
-    ram_str = f"   RAM {rss:.0f} MB ({frac*100:.0f}%)  Undo {hist_mb:.1f} MB"
-    safe_addstr(stdscr, 3, 3, stats, color(C_WARN))
-    safe_addstr(stdscr, 3, 3 + len(stats), ram_str, color(ram_cp))
+    conn = f"● {state['ip']}   {state['proc_name']}   PID {state['pid']}"
+    safe_addstr(stdscr, 2, 3, conn[:max(w - 6, 0)], color(C_OK) | curses.A_BOLD)
+    results = len(state["scan_results"])
+    cheats = len(state["cheats"])
+    width = WIDTH_LABEL.get(state["scan_width"], "?")
+    scan_note = f"Results {results:,}   Cheats {cheats}   {width}"
+    safe_addstr(stdscr, 3, 3, scan_note[:max(w - 6, 0)], color(C_WARN))
 
-def screen_main(stdscr):
-    menu = [
-        ("S", "First Scan",          "scan_first",    C_NORM),
-        ("N", "Next Scan",           "scan_next",     C_NORM),
-        ("R", "Results",             "results",       C_NORM),
-        ("W", "Write to Address",    "write",         C_WARN),
-        ("C", "Cheat List",          "cheat_list",    C_NORM),
-        ("E", "Export .json",        "export",        C_OK),
-        ("F", "Freeze Address",      "freeze",        C_WARN),
-        ("L", "Log",                 "log",           C_NORM),
-        ("X", "Clear Results",       "clear",         C_WARN),
-        ("H", "Clear Scan History",  "clear_history", C_WARN),
-        ("P", "Change Process",      "proc",          C_NORM),
-        ("O", "Pointer Scan",        "pointer_scan",  C_ACC),
-        ("V", "Verify Ptr Chain",    "ptr_verify",    C_ACC),
-        ("Q", "Quit",                None,            C_ERR),
+
+def _draw_toast(stdscr, cp=C_OK) -> None:
+    """Draw the latest non-modal status message above the action bar."""
+    h, w = stdscr.getmaxyx()
+    if h < 4 or w < 8:
+        return
+    with _log_lock:
+        last_entry = state["log"][-1] if state["log"] else None
+    if last_entry:
+        msg = f"✓ {last_entry['msg']}"
+        if last_entry.get("level") == "warn":
+            cp = C_WARN
+            msg = f"⚠ {last_entry['msg']}"
+        elif last_entry.get("level") == "error":
+            cp = C_ERR
+            msg = f"✗ {last_entry['msg']}"
+        safe_addstr(stdscr, h - 2, 3, msg[:max(w - 6, 0)], color(cp))
+
+
+def do_command_palette(stdscr) -> None:
+    commands = [
+        ("First Scan", "scan_first"), ("Next Scan", "scan_next"),
+        ("Results", "results"), ("Cheat List", "cheat_list"),
+        ("Pointer Scan", "pointer_scan"), ("Write Address", "write"),
+        ("Freeze Address", "freeze"), ("Import Cheats", "import"),
+        ("Export Cheats", "export"), ("Scan Settings", "scan_settings"),
+        ("Logs", "log"), ("Clear Results", "clear"),
+        ("Clear Scan History", "clear_history"), ("Change Process", "proc"),
+        ("Verify Pointer", "ptr_verify"),
     ]
+    query = ""
     sel = 0
-    stdscr.timeout(100)   # return -1 after 100 ms so header (RAM display) refreshes
     while True:
         stdscr.clear()
         h, w = stdscr.getmaxyx()
-        draw_border(stdscr, "PS5 CHEAT MAKER")
-        draw_header_banner(stdscr)
+        draw_border(stdscr, "COMMAND PALETTE")
+        safe_addstr(stdscr, 2, 3, f"> {query}_", color(C_ACC) | curses.A_BOLD)
+        visible = max(1, min(12, h - 7))
+        q = query.lower()
+        matches = [c for c in commands if q in c[0].lower()]
+        if matches:
+            sel = min(sel, len(matches) - 1)
+            for i, (label, _) in enumerate(matches[:visible]):
+                attr = color(C_SEL) | curses.A_BOLD if i == sel else color(C_NORM)
+                safe_addstr(stdscr, 4 + i, 4, ("▶ " if i == sel else "  ") + label, attr)
+        else:
+            safe_addstr(stdscr, 4, 4, "No matching commands.", color(C_WARN))
+        draw_statusbar(stdscr, [("↑↓", C_NORM), ("Enter run", C_OK), ("Backspace", C_NORM), ("Esc", C_NORM)])
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key == curses.KEY_RESIZE:
+            curses.update_lines_cols(); continue
+        if key in (27, ord('q'), ord('Q')) and not query:
+            return
+        if key in (curses.KEY_UP,):
+            sel = max(0, sel - 1)
+        elif key in (curses.KEY_DOWN,):
+            sel = min(max(len(matches) - 1, 0), sel + 1)
+        elif key in (curses.KEY_ENTER, 10, 13) and matches:
+            result = dispatch(stdscr, matches[sel][1])
+            if result == "proc":
+                return "proc"
+            return
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            query = query[:-1]; sel = 0
+        elif 32 <= key <= 126:
+            query += chr(key); sel = 0
+
+
+def _main_menu_entries():
+    """Return the deliberately small primary workflow menu.
+
+    Advanced/destructive utilities remain discoverable through the command
+    palette instead of competing with the scan/results/cheat workflow.
+    """
+    return [
+        ("S", "First Scan",  "scan_first",  C_NORM),
+        ("N", "Next Scan",   "scan_next",   C_NORM),
+        ("R", "Results",     "results",     C_ACC),
+        ("C", "Cheat List",  "cheat_list",  C_NORM),
+        ("P", "Pointer Scan", "pointer_scan", C_ACC),
+        ("I", "Import Cheats", "import",    C_OK),
+        ("E", "Export Cheats", "export",    C_OK),
+        ("T", "Settings",    "scan_settings", C_ACC),
+        ("L", "Logs",        "log",         C_NORM),
+        ("Q", "Quit",        None,           C_ERR),
+    ]
+
+
+def screen_main(stdscr):
+    """Compact primary navigation: workflow first, advanced tools elsewhere."""
+    menu = _main_menu_entries()
+    sel = 0
+    stdscr.timeout(100)
+    while True:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        draw_border(stdscr, "RDX CHEAT MAKER")
         _draw_main_header(stdscr)
 
-        col2  = w > 60
-        split = (len(menu) + 1) // 2 if col2 else len(menu)
-        for i, (key, label, _, cp) in enumerate(menu):
-            col = i // split if col2 else 0
-            row = i % split
-            unavail = (
-                (label == "Next Scan"    and len(state["scan_results"]) == 0) or
-                (label == "Results"      and len(state["scan_results"]) == 0) or
-                (label == "Export .json" and not state["cheats"])
-            )
-            attr = (color(C_SEL) | curses.A_BOLD if i == sel
-                    else color(C_NORM) | curses.A_DIM if unavail
-                    else color(cp))
-            safe_addstr(stdscr, 5 + row, 5 + col * 35,
-                        f"[{key}]  {label}".ljust(30), attr)
+        # The primary workflow is intentionally linear and small.  Do not
+        # expose low-frequency destructive/debug utilities here.
+        sections = [
+            ("SCAN", 0, 3),
+            ("CHEATS", 3, 2),
+            ("TOOLS", 5, 4),
+        ]
+        if w >= 78:
+            col_x = [3, max(25, w // 3), max(50, (2 * w) // 3)]
+            for title, start_i, count in sections:
+                x = col_x[sections.index((title, start_i, count))]
+                safe_addstr(stdscr, 5, x, title, color(C_TITLE) | curses.A_BOLD)
+                for j in range(count):
+                    i = start_i + j
+                    if i >= len(menu):
+                        continue
+                    key, label, _, cp = menu[i]
+                    unavailable = (
+                        (label == "Next Scan" and not state["scan_results"]) or
+                        (label == "Results" and not state["scan_results"]) or
+                        (label == "Export Cheats" and not state["cheats"])
+                    )
+                    attr = (color(C_SEL) | curses.A_BOLD if i == sel else
+                            color(C_NORM) | curses.A_DIM if unavailable else color(cp))
+                    safe_addstr(stdscr, 7 + j, x,
+                                f"[{key}] {label}"[:max(w - x - 2, 0)], attr)
+        else:
+            safe_addstr(stdscr, 5, 3, "WORKFLOW", color(C_TITLE) | curses.A_BOLD)
+            for i, (key, label, _, cp) in enumerate(menu):
+                unavailable = (
+                    (label == "Next Scan" and not state["scan_results"]) or
+                    (label == "Results" and not state["scan_results"]) or
+                    (label == "Export Cheats" and not state["cheats"])
+                )
+                attr = (color(C_SEL) | curses.A_BOLD if i == sel else
+                        color(C_NORM) | curses.A_DIM if unavailable else color(cp))
+                safe_addstr(stdscr, 7 + i, 3,
+                            f"[{key}] {label}"[:max(w - 6, 0)], attr)
 
-        with _log_lock:
-            last_entry = state["log"][-1] if state["log"] else None
-        if last_entry:
-            lcp = {"error": C_ERR, "warn": C_WARN, "info": C_OK}.get(
-                last_entry["level"], C_NORM)
-            safe_addstr(stdscr, h - 3, 3,
-                        f"[{last_entry['ts']}] {last_entry['msg']}"[:w - 6],
-                        color(lcp))
-
+        _draw_toast(stdscr)
         draw_statusbar(stdscr, [
-            ("arrows / letter", C_NORM), ("Enter select", C_OK), ("Q quit", C_ERR),
+            ("↑↓", C_NORM), ("Enter", C_OK), ("/ Commands", C_ACC),
+            ("? Help", C_ACC), ("Q Quit", C_ERR)
         ])
         stdscr.refresh()
-
         key = stdscr.getch()
         if key == -1:
-            continue   # 100 ms timeout elapsed, no key — just redraw
-        if key == curses.KEY_RESIZE:        # Issue #1: terminal resized — redraw
+            continue
+        if key == curses.KEY_RESIZE:
             curses.update_lines_cols()
             continue
-        if key == curses.KEY_UP    and sel > 0:              sel -= 1
-        elif key == curses.KEY_DOWN and sel < len(menu) - 1: sel += 1
+        if key == curses.KEY_UP:
+            sel = max(0, sel - 1)
+        elif key == curses.KEY_DOWN:
+            sel = min(len(menu) - 1, sel + 1)
         elif key in (curses.KEY_ENTER, 10, 13):
             action = menu[sel][2]
             if action is None:
                 return None
-            if dispatch(stdscr, action) == "proc":
+            result = dispatch(stdscr, action)
+            if result == "proc":
                 return "proc"
+        elif key == ord('/'):
+            result = do_command_palette(stdscr)
+            if result == "proc":
+                return "proc"
+        elif key == ord('?'):
+            do_help(stdscr)
         else:
             for k, _, action, _ in menu:
                 if key in (ord(k.lower()), ord(k.upper())):
                     if action is None:
                         return None
-                    if dispatch(stdscr, action) == "proc":
+                    result = dispatch(stdscr, action)
+                    if result == "proc":
                         return "proc"
                     break
+
+def do_help(stdscr) -> None:
+    lines = [
+        "Navigation   ↑↓ Select   Enter Run   Esc Back   Q Quit",
+        "Global       / Command Palette   ? Help",
+        "Scanning     S First Scan   N Next Scan   R Results",
+        "Results      A Apply   C Cheat   P Pointer   N Next   M More",
+        "Cheats       Enter Inspect   A Apply   D Delete",
+        "Pointer      E Edit   T Test   S Save Cheat",
+        "Tools        I Import   E Export   T Settings   L Logs",
+        "",
+        "Routine success messages stay in the status line;",
+        "errors and destructive operations remain modal.",
+    ]
+    message_box(stdscr, lines, "Keyboard Help", C_ACC)
 
 def dispatch(stdscr, action: str):
     actions = {
@@ -2968,10 +3170,12 @@ def dispatch(stdscr, action: str):
         "ptr_verify":   do_ptr_verify_manual,
         "scan_first":    do_scan_first,
         "scan_next":     do_scan_next,
+        "scan_settings": do_scan_settings,
         "results":       do_show_results,
         "write":         do_write,
         "cheat_list":    do_cheat_list,
         "export":        do_export,
+        "import":        do_import,
         "freeze":        do_freeze,
         "log":           do_log,
         "clear":         do_clear_results,
@@ -3091,17 +3295,36 @@ def _run_scan_with_progress(stdscr, thread_fn, total_label: str,
     # may fire between two UI ticks leaving the bar stuck below 100%.
     if not cancel_event.is_set():
         total = max(progress["total"], 1)
-        progress["done"] = total
         h, w = stdscr.getmaxyx()
+        start_done = min(max(int(progress.get("done", 0)), 0), total)
+        ramp_start = min(start_done, max(total - 1, 0))
+        for step in range(1, 6):
+            done = ramp_start + ((total - ramp_start) * step // 5)
+            progress["done"] = done
+            frac = done / total
+            safe_addstr(stdscr, 9, 3, " " * max(w - 6, 0), color(C_NORM))
+            safe_addstr(stdscr, 9, 3, f"✓  {total_label}  Completing…", color(C_OK) | curses.A_BOLD)
+            draw_progress_bar(stdscr, 10, 3, min(w - 8, 60), frac, f"  {int(frac * 100)}%")
+            stdscr.refresh()
+            time.sleep(0.05)
+        progress["done"] = total
         safe_addstr(stdscr, 9, 3, " " * max(w - 6, 0), color(C_NORM))
-        safe_addstr(stdscr, 9, 3,
-            f"✓  {total_label}  Complete!", color(C_OK) | curses.A_BOLD)
+        safe_addstr(stdscr, 9, 3, f"✓  {total_label}  Complete!", color(C_OK) | curses.A_BOLD)
         draw_progress_bar(stdscr, 10, 3, min(w - 8, 60), 1.0, "  100%")
         stdscr.refresh()
-        time.sleep(0.12)   # brief pause so user sees the completed bar
+        time.sleep(0.12)
 
     return not cancel_event.is_set()
 
+
+def do_scan_settings(stdscr) -> None:
+    options = ["Auto (Turbo → Console → Host)", "Turbo only", "Console only", "Host only"]
+    keys = ["auto", "turbo", "console", "host"]
+    current = state.get("scan_engine", "auto")
+    selected = cycle_input(stdscr, "Scan engine: ", 5, 3, options, options[keys.index(current)])
+    state["scan_engine"] = keys[options.index(selected)]
+    add_log(f"Scan engine set to {state['scan_engine']}")
+    message_box(stdscr, [f"Scan engine: {selected}"], "Scan Settings", C_OK)
 
 def do_scan_first(stdscr) -> None:
     stdscr.clear()
@@ -3219,22 +3442,12 @@ def do_scan_first(stdscr) -> None:
         if progress["truncated"] else []
     )
     if unknown_mode:
-        message_box(stdscr, trunc_lines + [
-            f"Snapshot taken: {len(results):,} candidates.",
-            "",
-            "Now trigger a change in-game (take damage, heal, etc.)",
-            "then use Next Scan (N) and choose a relational filter",
-            "(decreased / increased / unchanged / changed).",
-        ], "Snapshot Complete" + (" — TRUNCATED" if progress["truncated"] else ""),
-           C_WARN if progress["truncated"] else C_OK)
+        add_log(f"Snapshot complete — {len(results):,} candidates", "warn" if progress["truncated"] else "info")
+        do_show_results(stdscr)
     else:
-        message_box(stdscr, trunc_lines + [
-            f"Found {len(results)} results.",
-            "",
-            "Change the value in-game, then use Next Scan (N).",
-            "Once narrowed down, use Results (R) to pick an address.",
-        ], "Scan Complete" + (" — TRUNCATED" if progress["truncated"] else ""),
-           C_WARN if progress["truncated"] else C_OK)
+        add_log(f"First scan complete — {len(results):,} candidates", "warn" if progress["truncated"] else "info")
+        # Results is the primary workflow: go there immediately after a scan.
+        do_show_results(stdscr)
 
 
 def do_scan_next(stdscr) -> None:
@@ -3355,9 +3568,9 @@ def do_scan_next(stdscr) -> None:
             last_delta = state["scan_history"][-1]
             undo_hint  = (f"  (U to undo — restores "
                           f"{len(new_addrs) + len(last_delta[0]):,} candidates)")
-        message_box(stdscr,
-            [f"{len(new_addrs):,} candidates remain.", "", tip, undo_hint],
-            "Scan Complete", C_OK if len(new_addrs) <= 10 else C_WARN)
+        add_log(f"Next scan complete — {len(new_addrs):,} candidates remain",
+                "info" if len(new_addrs) <= 10 else "warn")
+        do_show_results(stdscr)
 
     else:
         # ── exact-value path (original behaviour) ────────────────────────────
@@ -3432,12 +3645,9 @@ def do_scan_next(stdscr) -> None:
             last_delta = state["scan_history"][-1]
             undo_hint  = (f"  (U to undo — restores "
                           f"{len(results) + len(last_delta[0]):,} candidates)")
-        message_box(stdscr,
-            ([f"⚠  More than {MAX_SCAN_RESULTS:,} results remain; showing the first cap.", ""]
-             if state["scan_truncated"] else []) +
-            [f"{len(results):,} results remain.", "", tip, undo_hint],
-            "Scan Complete" + (" — TRUNCATED" if state["scan_truncated"] else ""),
-            C_OK if len(results) <= 10 and not state["scan_truncated"] else C_WARN)
+        add_log(f"Next scan complete — {len(results):,} candidates remain",
+                "info" if len(results) <= 10 and not state["scan_truncated"] else "warn")
+        do_show_results(stdscr)
 
 
 # ── results screen ────────────────────────────────────────────────────────────
@@ -3485,15 +3695,64 @@ def _refresh_visible_locked(ip: str, pid: int, addrs: list, width: int,
             sock.close()
 
 
+
+def _results_more_menu(stdscr):
+    """Low-frequency Results actions, kept out of the primary action bar."""
+    options = [
+        ("Write Address", "write"),
+        ("Verify Pointer", "ptr_verify"),
+        ("Undo Scan", "undo_results"),
+        ("Flush Memory Maps", "flush_maps"),
+        ("Clear Results", "clear"),
+        ("Clear Scan History", "clear_history"),
+        ("Logs", "log"),
+    ]
+    sel = 0
+    while True:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        draw_border(stdscr, "RESULTS · MORE")
+        safe_addstr(stdscr, 2, 3, "Advanced actions", color(C_WARN))
+        visible = max(1, min(len(options), h - 7))
+        for i, (label, _) in enumerate(options[:visible]):
+            attr = color(C_SEL) | curses.A_BOLD if i == sel else color(C_NORM)
+            safe_addstr(stdscr, 4 + i, 4,
+                        ("▶ " if i == sel else "  ") + label,
+                        attr)
+        draw_statusbar(stdscr, [("↑↓", C_NORM), ("Enter run", C_OK),
+                                ("Esc", C_NORM)])
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key == curses.KEY_RESIZE:
+            curses.update_lines_cols()
+            continue
+        if key in (27, ord('q'), ord('Q')):
+            return
+        if key == curses.KEY_UP:
+            sel = max(0, sel - 1)
+        elif key == curses.KEY_DOWN:
+            sel = min(len(options) - 1, sel + 1)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            action = options[sel][1]
+            if action == "undo_results":
+                # Results already owns the undo stack; dispatching a separate
+                # screen would lose the selected context.  Perform one undo
+                # through the same path as U below by returning its action.
+                return "undo"
+            if action == "flush_maps":
+                return "flush_maps"
+            result = dispatch(stdscr, action)
+            if result == "proc":
+                return "proc"
+            return
+
+
 def do_show_results(stdscr) -> None:
     results = state["scan_results"]
     if len(results) == 0:
         return
     if state.get("scan_pid") not in (None, state["pid"]):
-        message_box(stdscr,
-            ["Scan results are from a different process.",
-             "Please run a new First Scan (S) for this process."],
-            "Stale Results", C_WARN)
+        add_log("Stale results blocked — PID changed; start a new First Scan", "warn")
         return
 
     sel               = 0
@@ -3506,6 +3765,7 @@ def do_show_results(stdscr) -> None:
     REFRESH_INTERVAL  = 2.0
     refresh_thread    = None
     refresh_cancel    = threading.Event()
+    value_filter      = None
 
     stdscr.nodelay(True)
     try:
@@ -3545,17 +3805,40 @@ def do_show_results(stdscr) -> None:
                 f"Type: {wlabel}   Process: {state['proc_name']} (PID {state['pid']}){trunc_warn}",
                 color(C_ERR) if trunc_warn else color(C_WARN))
             safe_addstr(stdscr, 3, 3,
-                "↑↓ navigate   Enter add cheat   D drop   U undo   M flush maps   Q back",
+                "↑↓/PgUp/PgDn navigate   G jump   F filter   Enter inspect   D drop   U undo   M more   Q back",
                 color(C_NORM))
 
-            for i, addr in enumerate(results[offset:offset + visible]):
-                idx    = offset + i
-                with cache_lock:
-                    vstr = val_cache.get(addr, "…")
+            split_view = w >= 92
+            list_right = (w // 2 - 2) if split_view else (w - 3)
+            shown = 0
+            for idx in range(offset, min(offset + visible, len(results))):
+                addr = results[idx]
+                with cache_lock: vstr = val_cache.get(addr, "…")
+                if value_filter is not None and vstr not in ("…", "?"):
+                    try:
+                        if int(vstr, 0) != value_filter: continue
+                    except ValueError: continue
                 marker = ">" if idx == sel else " "
-                line   = f"{marker} {idx+1:4d}   {hex(addr):<20}  current = {vstr}"
-                attr   = color(C_SEL) | curses.A_BOLD if idx == sel else color(C_NORM)
-                safe_addstr(stdscr, 5 + i, 2, line[:w - 4].ljust(w - 4), attr)
+                line = f"{marker} {idx+1:4d}  {hex(addr):<18} {vstr:>12}"
+                attr = color(C_SEL) | curses.A_BOLD if idx == sel else color(C_NORM)
+                safe_addstr(stdscr, 5 + shown, 2, line[:max(list_right-2, 1)].ljust(max(list_right-2, 1)), attr)
+                shown += 1
+                if shown >= visible: break
+
+            if split_view:
+                pane_x = w // 2 + 1
+                safe_addstr(stdscr, 4, pane_x, "SELECTED ADDRESS", color(C_TITLE) | curses.A_BOLD)
+                selected_addr = int(results[sel])
+                with cache_lock: selected_value = val_cache.get(selected_addr, "…")
+                safe_addstr(stdscr, 6, pane_x, f"Address   {hex(selected_addr)}", color(C_OK) | curses.A_BOLD)
+                safe_addstr(stdscr, 7, pane_x, f"Current   {selected_value}", color(C_WARN))
+                safe_addstr(stdscr, 8, pane_x, f"Type      {wlabel}", color(C_NORM))
+                safe_addstr(stdscr, 10, pane_x, "A  Apply value", color(C_OK))
+                safe_addstr(stdscr, 11, pane_x, "C  Create cheat", color(C_OK))
+                safe_addstr(stdscr, 12, pane_x, "P  Pointer scan", color(C_ACC))
+                safe_addstr(stdscr, 13, pane_x, "D  Drop result", color(C_ERR))
+                safe_addstr(stdscr, 15, pane_x, "N  Next scan", color(C_ACC))
+                safe_addstr(stdscr, 16, pane_x, "M  More actions", color(C_WARN))
 
             # Age = how long since the last completed refresh, not since it started
             data_age      = int(now - refresh_complete) if refresh_complete else 0
@@ -3567,14 +3850,13 @@ def do_show_results(stdscr) -> None:
             if stale:
                 age_label = f"⚠ stale (~{data_age}s)"
             draw_statusbar(stdscr, [
-                (f"{len(results)} results", C_WARN),
-                ("↑↓ navigate",   C_NORM),
-                ("Enter cheat",   C_OK),
-                ("D drop",        C_ERR),
-                ("U undo",        C_WARN),
-                ("M flush maps",  C_WARN),
-                (age_label,       C_ERR if stale else C_ACC if is_refreshing else C_NORM),
-                ("Q back",        C_NORM),
+                (f"{len(results):,} results", C_WARN),
+                ("↑↓/PgUp/PgDn", C_NORM),
+                ("Enter inspect", C_OK), ("A apply", C_OK), ("C cheat", C_OK),
+                ("P pointer", C_ACC), ("N next", C_ACC),
+                ("D drop", C_ERR), ("M more", C_WARN),
+                (age_label, C_ERR if stale else C_ACC if is_refreshing else C_NORM),
+                ("Q back", C_NORM),
             ])
             stdscr.refresh()
 
@@ -3592,13 +3874,115 @@ def do_show_results(stdscr) -> None:
                 sel -= 1
             elif key == curses.KEY_DOWN and sel < len(results) - 1:
                 sel += 1
-            elif key in (curses.KEY_ENTER, 10, 13):   # Issue #15: all Enter forms
+            elif key == curses.KEY_PPAGE:
+                sel = max(0, sel - visible)
+            elif key == curses.KEY_NPAGE:
+                sel = min(len(results)-1, sel + visible)
+            elif key in (ord('g'), ord('G')):
+                stdscr.nodelay(False)
+                idx_s = input_box(stdscr, "Jump to result index: ", h-2, 3, 12, str(sel+1))
+                stdscr.nodelay(True)
+                try: sel = max(0, min(int(idx_s)-1, len(results)-1))
+                except ValueError: pass
+            elif key in (ord('f'), ord('F')):
+                stdscr.nodelay(False)
+                fs = input_box(stdscr, "Live value filter (blank clears): ", h-2, 3, 24,
+                               "" if value_filter is None else str(value_filter))
+                stdscr.nodelay(True)
+                if not fs.strip(): value_filter = None
+                else:
+                    try: value_filter = int(fs, 0)
+                    except ValueError:
+                        message_box(stdscr, ["Enter decimal or hex (0x...)."], "Invalid Filter", C_ERR)
+                        continue
+                sel = 0; offset = 0
+            elif key in (ord('a'), ord('A')) and len(results) > 0:
+                stdscr.nodelay(False)
+                addr = int(results[sel])
+                try:
+                    value_s = input_box(stdscr, "Apply value: ", h-2, 3, 20)
+                    value = int(value_s, 0)
+                    width = state["scan_width"]
+                    if value < 0 or value > WIDTH_MAX[width]:
+                        raise ValueError(f"Value out of range for {WIDTH_LABEL[width]}")
+                    ack, verified, actual = _write_value_verified(state["ip"], state["pid"], addr, value, width)
+                    if ack and verified:
+                        add_log(f"Applied {value} → {hex(addr)} verified")
+                    elif ack and verified is None:
+                        add_log(f"Applied {value} → {hex(addr)} but read-back failed", "warn")
+                    elif ack:
+                        actual_val = struct.unpack(WIDTH_FMT[width], actual)[0]
+                        add_log(f"Write mismatch {hex(addr)}: wanted {value}, read {actual_val}", "error")
+                    else:
+                        add_log(f"Write rejected at {hex(addr)}", "error")
+                except Exception as exc:
+                    add_log(f"Apply failed at {hex(addr)}: {exc}", "error")
+                stdscr.nodelay(True)
+            elif key in (curses.KEY_ENTER, 10, 13):
+                stdscr.nodelay(False)
+                selected_addr = int(results[sel])
+                with cache_lock:
+                    selected_live = val_cache.get(selected_addr, "…")
+                _inspect_result(stdscr, selected_addr, selected_live)
+                stdscr.nodelay(True)
+                results = state["scan_results"]
+                with cache_lock:
+                    val_cache.clear()
+            elif key in (ord('c'), ord('C')) and len(results) > 0:
                 stdscr.nodelay(False)
                 _add_cheat_at(stdscr, results[sel])
                 stdscr.nodelay(True)
                 results = state["scan_results"]
                 with cache_lock:
                     val_cache.clear()
+            elif key in (ord('p'), ord('P')) and len(results) > 0:
+                stdscr.nodelay(False)
+                do_pointer_scan(stdscr, int(results[sel]))
+                stdscr.nodelay(True)
+                results = state["scan_results"]
+            elif key in (ord('n'), ord('N')):
+                stdscr.nodelay(False)
+                do_scan_next(stdscr)
+                return
+
+            elif key in (ord('m'), ord('M')):
+                stdscr.nodelay(False)
+                more_result = _results_more_menu(stdscr)
+                stdscr.nodelay(True)
+                if more_result == "proc":
+                    return "proc"
+                if more_result == "undo":
+                    if state["scan_history"]:
+                        entry = state["scan_history"].pop()
+                        removed_a, removed_v, prev_dropped, prev_truncated = entry
+                        cur_addrs = state["scan_results"]
+                        prev_addrs = np.union1d(cur_addrs, removed_a)
+                        if removed_v is not None and state.get("scan_values") is not None:
+                            cur_v = state["scan_values"]
+                            dtype = _NP_VALUE_DTYPE[state["scan_width"]]
+                            prev_vals = np.zeros(len(prev_addrs), dtype=dtype)
+                            prev_vals[np.searchsorted(prev_addrs, cur_addrs)] = cur_v
+                            prev_vals[np.searchsorted(prev_addrs, removed_a)] = removed_v
+                        else:
+                            prev_vals = state.get("scan_values")
+                        state["scan_results"] = prev_addrs
+                        state["scan_values"] = prev_vals
+                        state["scan_dropped"] = prev_dropped
+                        state["scan_truncated"] = prev_truncated
+                        results = state["scan_results"]
+                        sel = min(sel, max(0, len(results) - 1))
+                        offset = min(offset, max(0, len(results) - 1))
+                        add_log(f"Undo scan → {len(results):,} candidates remain")
+                    else:
+                        add_log("No scan history to undo", "warn")
+                elif more_result == "flush_maps":
+                    with _map_cache_lock:
+                        _map_cache.clear()
+                    add_log("Memory-map cache flushed")
+                results = state["scan_results"]
+                if len(results) == 0:
+                    break
+                continue
             elif key in (ord('d'), ord('D')):
                 dropped_idx = sel
                 dropped = results[sel]
@@ -3676,6 +4060,86 @@ def do_show_results(stdscr) -> None:
             refresh_thread.join(timeout=2.0)   # 1.5 s socket timeout + 0.5 s margin
 
 
+def _inspect_result(stdscr, addr: int, live_value: str = "…") -> None:
+    """Compact address inspector; keeps common actions one screen away."""
+    while True:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        draw_border(stdscr, "ADDRESS INSPECTOR")
+        width = state["scan_width"]
+        wlabel = WIDTH_LABEL.get(width, str(width))
+        safe_addstr(stdscr, 2, 3, f"Address   {hex(addr)}", color(C_OK) | curses.A_BOLD)
+        safe_addstr(stdscr, 3, 3, f"Current   {live_value}", color(C_WARN))
+        safe_addstr(stdscr, 4, 3, f"Type      {wlabel}", color(C_NORM))
+        safe_addstr(stdscr, 5, 3, f"Process   {state['proc_name']} (PID {state['pid']})", color(C_NORM))
+        safe_addstr(stdscr, 7, 3, "Actions", color(C_TITLE) | curses.A_BOLD)
+        safe_addstr(stdscr, 8, 5, "A  Apply value", color(C_OK))
+        safe_addstr(stdscr, 9, 5, "C  Create cheat", color(C_OK))
+        safe_addstr(stdscr, 10, 5, "P  Pointer scan", color(C_ACC))
+        safe_addstr(stdscr, 11, 5, "D  Drop result", color(C_ERR))
+        draw_statusbar(stdscr, [("A apply", C_OK), ("C cheat", C_OK), ("P pointer", C_ACC), ("D drop", C_ERR), ("Esc back", C_NORM)])
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key == curses.KEY_RESIZE:
+            curses.update_lines_cols(); continue
+        if key in (27, ord('q'), ord('Q')):
+            return
+        if key in (ord('a'), ord('A')):
+            value_s = input_box(stdscr, "Apply value: ", h - 2, 3, 20)
+            try:
+                value = int(value_s, 0)
+                if value < 0 or value > WIDTH_MAX[width]:
+                    raise ValueError(f"Value out of range for {WIDTH_LABEL[width]}")
+                ack, verified, actual = _write_value_verified(state["ip"], state["pid"], addr, value, width)
+                if ack and verified:
+                    add_log(f"Applied {value} → {hex(addr)} verified")
+                elif ack and verified is None:
+                    add_log(f"Applied {value} → {hex(addr)} but read-back failed", "warn")
+                elif ack:
+                    actual_val = struct.unpack(WIDTH_FMT[width], actual)[0]
+                    add_log(f"Write mismatch {hex(addr)}: wanted {value}, read {actual_val}", "error")
+                else:
+                    add_log(f"Write rejected at {hex(addr)}", "error")
+            except Exception as exc:
+                add_log(f"Apply failed at {hex(addr)}: {exc}", "error")
+            try:
+                raw = ps5_read(state["ip"], state["pid"], addr, width)
+                live_value = str(struct.unpack(WIDTH_FMT[width], raw)[0]) if len(raw) == width else "?"
+            except Exception:
+                live_value = "?"
+        elif key in (ord('c'), ord('C')):
+            _add_cheat_at(stdscr, addr)
+            return
+        elif key in (ord('p'), ord('P')):
+            do_pointer_scan(stdscr, addr)
+            return
+        elif key in (ord('d'), ord('D')):
+            old_results = state["scan_results"]
+            old_values = state.get("scan_values")
+            try:
+                drop_idx = int(np.searchsorted(old_results, addr))
+            except Exception:
+                drop_idx = -1
+            state["scan_results"] = _make_addr_array(a for a in old_results if int(a) != addr)
+            if old_values is not None and 0 <= drop_idx < len(old_values):
+                state["scan_values"] = np.delete(old_values, drop_idx)
+            add_log(f"Dropped result {hex(addr)}", "warn")
+            return
+
+
+def _write_value_verified(ip: str, pid: int, addr: int, value: int, width: int,
+                          cancel_event: Optional[threading.Event] = None) -> tuple:
+    """Validate, write, and verify one memory value using the standard write path."""
+    err = _validate_write_addr(addr)
+    if err:
+        raise ValueError(err)
+    map_err = _validate_addr_in_maps(ip, pid, addr, width)
+    if map_err:
+        raise ValueError(map_err)
+    data = struct.pack(WIDTH_FMT[width], value)
+    return ps5_write_verified(ip, pid, addr, data)
+
+
 def _add_cheat_at(stdscr, addr: int) -> None:
     stdscr.clear()
     draw_border(stdscr, "ADD CHEAT")
@@ -3714,34 +4178,12 @@ def _add_cheat_at(stdscr, addr: int) -> None:
         state["cheats"].append(entry)
         add_log(f"Added '{entry['name']}' @ {hex(addr)} = {val}")
 
-        # Immediately write the value so the in-game effect is instant.
-        # (Previously the user had to go to Cheat List and press A separately.)
-        data = struct.pack(WIDTH_FMT[scan_w], val)
-        ack, verified, actual = ps5_write_verified(state["ip"], state["pid"], addr, data)
-        if ack and verified:
-            write_status = f"✓ Written and verified ({val} → {hex(addr)})"
-            write_color  = C_OK
-            add_log(f"Immediate write '{entry['name']}' @ {hex(addr)} = {val} verified")
-        elif ack and verified is None:
-            write_status = "⚠ Write acknowledged but read-back failed"
-            write_color  = C_WARN
-            add_log(f"Immediate write '{entry['name']}' unverified", "warn")
-        elif ack:
-            actual_val   = struct.unpack(WIDTH_FMT[scan_w], actual)[0]
-            write_status = f"✗ Write did not stick (read back: {actual_val})"
-            write_color  = C_ERR
-            add_log(f"Immediate write mismatch '{entry['name']}': got {actual_val}", "error")
-        else:
-            write_status = "✗ Write rejected by ps5debug"
-            write_color  = C_ERR
-            add_log(f"Immediate write rejected for '{entry['name']}'", "error")
-
-        message_box(stdscr,
-            [f"  {entry['name']}", f"  {hex(addr)} = {val}  [{typ}]",
-             "", write_status],
-            "Cheat Added", write_color)
-    except ValueError:
-        message_box(stdscr, ["Invalid value — must be an integer."], "Error", C_ERR)
+        add_log(f"Created cheat '{entry['name']}' @ {hex(addr)} — not applied")
+        # Creation and application are deliberately separate actions.
+        # Apply from Cheat List (A) or Results (A) when the user explicitly asks.
+        return
+    except ValueError as exc:
+        message_box(stdscr, [f"Could not add/apply cheat: {exc}"], "Error", C_ERR)
 
 
 def do_write(stdscr) -> None:
@@ -3774,9 +4216,6 @@ def do_write(stdscr) -> None:
             state["ip"], state["pid"], addr, data)
         if ack and verified:
             add_log(f"Write {hex(addr)} = {val} verified")
-            message_box(stdscr,
-                        [f"Wrote {val} to {hex(addr)}", "Read-back verified."],
-                        "Write OK", C_OK)
         elif ack and verified is None:
             add_log(f"Write {hex(addr)} = {val} acknowledged; read-back failed", "warn")
             message_box(stdscr,
@@ -3819,6 +4258,47 @@ def _read_cheat_live_value(cheat: dict) -> str:
     except Exception:
         pass
     return "?"
+
+
+def _inspect_cheat(stdscr, idx: int) -> None:
+    """Read-only cheat inspector with explicit edit/apply/delete actions."""
+    while 0 <= idx < len(state["cheats"]):
+        c = state["cheats"][idx]
+        live = _read_cheat_live_value(c)
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        draw_border(stdscr, "CHEAT INSPECTOR")
+        safe_addstr(stdscr, 2, 3, c["name"], color(C_TITLE) | curses.A_BOLD)
+        is_pointer = "offsets" in c and c.get("offsets") is not None
+        addr_text = (hex(c["base"]) if isinstance(c.get("base"), int) else str(c.get("base"))) if is_pointer else hex(int(c["address"]))
+        safe_addstr(stdscr, 4, 3, f"Address   {addr_text}{' (pointer)' if is_pointer else ''}", color(C_OK))
+        safe_addstr(stdscr, 5, 3, f"Set       {c.get('value')}", color(C_NORM))
+        safe_addstr(stdscr, 6, 3, f"Live      {live}", color(C_OK) if str(live) == str(c.get('value')) else color(C_WARN))
+        safe_addstr(stdscr, 7, 3, f"Mode      {c.get('type')}", color(C_NORM))
+        safe_addstr(stdscr, 8, 3, f"Width     {WIDTH_LABEL.get(int(c.get('width', state['scan_width'])), c.get('width'))}", color(C_NORM))
+        if is_pointer:
+            offs = "+".join(hex(int(o, 0) if isinstance(o, str) else int(o)) for o in c.get("offsets", []))
+            safe_addstr(stdscr, 9, 3, f"Chain     {addr_text} + {offs}", color(C_ACC))
+        draw_statusbar(stdscr, [("A apply", C_OK), ("E edit", C_WARN), ("F freeze", C_ACC), ("D delete", C_ERR), ("Esc back", C_NORM)])
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key == curses.KEY_RESIZE:
+            curses.update_lines_cols(); continue
+        if key in (27, ord('q'), ord('Q')):
+            return
+        if key in (ord('a'), ord('A')):
+            _apply_cheat_once(stdscr, c)
+        elif key in (ord('e'), ord('E')):
+            _edit_cheat(stdscr, idx)
+        elif key in (ord('f'), ord('F')):
+            # Reuse the existing freeze manager; it can target this saved cheat.
+            do_freeze(stdscr)
+        elif key in (ord('d'), ord('D')):
+            if confirm_box(stdscr, f"Delete '{c['name']}'?", "Delete Cheat"):
+                name = c["name"]
+                del state["cheats"][idx]
+                add_log(f"Deleted cheat '{name}'", "warn")
+                return
 
 
 def do_cheat_list(stdscr) -> None:
@@ -3868,7 +4348,7 @@ def do_cheat_list(stdscr) -> None:
                     "No cheats yet — scan and add some!", color(C_WARN))
             else:
                 safe_addstr(stdscr, 2, 3,
-                    "↑↓ select   Enter edit   A apply once   D delete   Q back", color(C_NORM))
+                    "↑↓ select   Enter inspect   A apply once   D delete   Q back", color(C_NORM))
                 hdr = f"  {'Name':<26}  {'Address':<22}  {'Set':<8}  {'Live':<10}  Type"
                 safe_addstr(stdscr, 3, 2, hdr[:w - 4],
                             color(C_TITLE) | curses.A_UNDERLINE)
@@ -3907,7 +4387,7 @@ def do_cheat_list(stdscr) -> None:
 
             is_refreshing = refresh_thread is not None and refresh_thread.is_alive()
             draw_statusbar(stdscr, [
-                ("↑↓ navigate", C_NORM), ("Enter edit", C_OK),
+                ("↑↓ navigate", C_NORM), ("Enter inspect", C_OK),
                 ("A apply once", C_WARN), ("D delete", C_ERR),
                 ("⟳ live" if is_refreshing else "live values", C_ACC),
                 ("Q back", C_NORM),
@@ -3925,9 +4405,10 @@ def do_cheat_list(stdscr) -> None:
             elif key == curses.KEY_DOWN and sel < len(cheats) - 1: sel += 1
             elif key in (curses.KEY_ENTER, 10, 13) and cheats:
                 stdscr.nodelay(False)
-                _edit_cheat(stdscr, sel)
+                _inspect_cheat(stdscr, sel)
                 stdscr.nodelay(True)
                 cheats = state["cheats"]
+                sel = min(sel, max(0, len(cheats) - 1))
                 with cache_lock:
                     live_cache.clear()
             elif key in (ord('a'), ord('A')) and cheats:
@@ -4021,18 +4502,14 @@ def _apply_cheat_once(stdscr, cheat: dict) -> None:
 
     chain_note = f" (resolved {hex(addr)})" if is_pointer else ""
     if ack and verified:
-        add_log(f"Applied '{cheat['name']}' @ {hex(addr)} = {value} "
-                f"(verified){chain_note}")
-        message_box(stdscr,
-            [f"Applied '{cheat['name']}'.",
-             f"Address: {hex(addr)}{chain_note}",
-             "Read-back verified."],
-            "Cheat Applied", C_OK)
+        add_log(f"Applied '{cheat['name']}' @ {hex(addr)} = {value} (verified){chain_note}")
     elif ack and verified is None:
         add_log(f"Applied '{cheat['name']}' but read-back failed{chain_note}", "warn")
         message_box(stdscr, ["Write acknowledged, but read-back failed."],
                     "Apply Unverified", C_WARN)
     elif ack:
+        with _map_cache_lock:
+            _map_cache.clear()
         actual_value = struct.unpack(WIDTH_FMT[width], actual)[0]
         add_log(f"Apply mismatch '{cheat['name']}': read {actual_value}", "error")
         message_box(stdscr,
@@ -4074,9 +4551,91 @@ def _edit_cheat(stdscr, idx: int) -> None:
             new_val = c["value"]
     except ValueError:
         new_val = c["value"]
+    old_val = int(c["value"])
     state["cheats"][idx].update({"name": new_name, "value": new_val, "type": new_type})
+    apply_status = "Value unchanged."
+    apply_color = C_OK
+    if new_val != old_val:
+        try:
+            if is_pointer:
+                base = int(c["base"], 0) if isinstance(c["base"], str) else int(c["base"])
+                offsets = [int(o, 0) if isinstance(o, str) else int(o) for o in c["offsets"]]
+                ok_chain, target_addr, _ = _resolve_pointer_chain(state["ip"], state["pid"], base, offsets)
+                if not ok_chain:
+                    raise ValueError("pointer chain could not be resolved")
+                ack, verified, actual = _write_value_verified(state["ip"], state["pid"], target_addr, new_val, int(c["width"]))
+            else:
+                ack, verified, actual = _write_value_verified(state["ip"], state["pid"], int(c["address"]), new_val, int(c["width"]))
+            if ack and verified:
+                apply_status = f"Applied new value: {new_val} (verified)."
+            elif ack and verified is None:
+                apply_status = "Value saved; write acknowledged but read-back failed."
+                apply_color = C_WARN
+            elif ack and actual is not None:
+                actual_val = struct.unpack(WIDTH_FMT[int(c["width"])], actual)[0]
+                apply_status = f"Value saved, but memory read back {actual_val}."
+                apply_color = C_ERR
+            else:
+                apply_status = "Value saved, but the memory write was rejected."
+                apply_color = C_ERR
+        except Exception as exc:
+            apply_status = f"Value saved, but could not apply: {exc}"
+            apply_color = C_ERR
     add_log(f"Edited '{new_name}' val={new_val} type={new_type}")
-    message_box(stdscr, [f"Updated '{new_name}'"], "Saved", C_OK)
+    message_box(stdscr, [f"Updated '{new_name}'", apply_status], "Saved", apply_color)
+
+
+def _parse_int_field(value, field_name):
+    try:
+        return int(value, 0) if isinstance(value, str) else int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid {field_name}: {value!r}")
+
+
+def do_import(stdscr) -> None:
+    stdscr.clear()
+    draw_border(stdscr, "IMPORT CHEATS")
+    path = Path(input_box(stdscr, "JSON path: ", 4, 3, 70, str(Path.home()))).expanduser()
+    if not path.exists() or not path.is_file():
+        message_box(stdscr, [f"File not found: {path}"], "Import Failed", C_ERR)
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        items = data.get("cheatList", [])
+        if not isinstance(items, list): raise ValueError("cheatList is not an array")
+        imported = []
+        for c in items:
+            if not isinstance(c, dict) or not c.get("name"): continue
+            width = int(c.get("bytes", 4))
+            value = _parse_int_field(c.get("value", 0), "value")
+            if width not in WIDTH_MAX or not 0 <= value <= WIDTH_MAX[width]:
+                raise ValueError(f"Invalid width/value in '{c['name']}'")
+            e = {"name": str(c["name"]), "type": str(c.get("type", "write")),
+                 "value": value, "width": width, "pid": state["pid"],
+                 "process": state["proc_name"], "session": state["session"],
+                 "imported_from": str(path)}
+            if "base" in c:
+                e["base"] = _parse_int_field(c["base"], "base")
+                e["offsets"] = [_parse_int_field(x, "offset") for x in c.get("offsets", [])]
+                e["address"] = 0
+            elif "address" in c:
+                e["address"] = _parse_int_field(c["address"], "address")
+            else:
+                raise ValueError(f"'{e['name']}' has no address/base")
+            imported.append(e)
+        if not imported: raise ValueError("No usable cheats found")
+        if state["cheats"] and not confirm_box(stdscr,
+                f"Import {len(imported)} cheats and keep existing {len(state['cheats'])}?",
+                "Import Cheats"):
+            return
+        state["cheats"].extend(imported)
+        add_log(f"Imported {len(imported)} cheats from {path}")
+        message_box(stdscr, [f"Imported {len(imported)} cheats.",
+                             "They are bound to the current process/session."],
+                    "Import Complete", C_OK)
+    except Exception as exc:
+        add_log(f"Import failed: {exc}", "error")
+        message_box(stdscr, [f"Import failed: {exc}"], "Import Failed", C_ERR)
 
 
 def do_export(stdscr) -> None:
@@ -4152,150 +4711,90 @@ def do_export(stdscr) -> None:
 
 
 def do_freeze(stdscr) -> None:
+    """Freeze a manual address or resolve a saved pointer chain every tick."""
     global _freeze_thread
-    # Do not clear/reuse the shared stop signal while an older worker may still
-    # be blocked in a socket call.  _stop_freeze_worker retains its reference
-    # and leaves the signal asserted when the join timeout expires.
     _stop_freeze_worker()
     with _freeze_lock:
-        old_worker_alive = bool(_freeze_thread and _freeze_thread.is_alive())
-    if old_worker_alive:
-        add_log("New freeze blocked: previous worker is still shutting down", "error")
-        message_box(stdscr,
-            ["The previous freeze worker is still shutting down.",
-             "Wait for its network operation to finish, then try again."],
-            "Freeze Still Active", C_ERR)
-        return
-
-    stdscr.clear()
-    h, w = stdscr.getmaxyx()
-    draw_border(stdscr, "FREEZE ADDRESS")
-    safe_addstr(stdscr, 2, 3,
-        "Continuously write a value to lock it in memory.", color(C_WARN))
-    stdscr.refresh()
-    addr_s   = input_box(stdscr, "Address (hex)    : ", 4, 3, 20)
-    val_s    = input_box(stdscr, "Freeze value     : ", 6, 3, 20)
-    _wl      = [WIDTH_LABEL[ww] for ww in VALID_WIDTHS]
-    _ws      = cycle_input(stdscr, "Width            : ", 8, 3, _wl,
-                           WIDTH_LABEL.get(state["scan_width"], "uint32"))
-    width    = VALID_WIDTHS[_wl.index(_ws)]
-    sec_s    = input_box(stdscr, "Duration (secs)  : ", 10, 3, 6, "30")
-    intvl_s  = input_box(stdscr, "Interval (ms)    : ", 12, 3, 6, "200")
-
+        if _freeze_thread and _freeze_thread.is_alive():
+            message_box(stdscr, ["Previous freeze worker is still shutting down."],
+                        "Freeze Still Active", C_ERR)
+            return
+    stdscr.clear(); draw_border(stdscr, "FREEZE ADDRESS / CHEAT")
+    choices = ["Manual address"] + (["Saved cheat"] if state["cheats"] else [])
+    mode = cycle_input(stdscr, "Target            : ", 4, 3, choices, choices[0])
+    is_pointer = False; cheat = None; base = None; offsets = []
+    if mode == "Saved cheat":
+        names = [c.get("name", "Unnamed") for c in state["cheats"]]
+        selected = cycle_input(stdscr, "Cheat             : ", 6, 3, names, names[0])
+        cheat = state["cheats"][names.index(selected)]
+        if cheat.get("pid") != state["pid"] or cheat.get("session") != state["session"]:
+            message_box(stdscr, ["Selected cheat belongs to another process/session."], "Stale Cheat", C_ERR); return
+        width = int(cheat["width"]); val = int(cheat["value"])
+        is_pointer = "offsets" in cheat and cheat.get("offsets") is not None
+        if is_pointer:
+            base = int(cheat["base"],0) if isinstance(cheat["base"],str) else int(cheat["base"])
+            offsets = [int(x,0) if isinstance(x,str) else int(x) for x in cheat["offsets"]]
+            addr = 0
+        else: addr = int(cheat["address"])
+    else:
+        addr_s = input_box(stdscr, "Address (hex)    : ", 6, 3, 20)
+        val_s = input_box(stdscr, "Freeze value     : ", 8, 3, 20)
+        labels = [WIDTH_LABEL[x] for x in VALID_WIDTHS]
+        ws = cycle_input(stdscr, "Width            : ", 10, 3, labels, WIDTH_LABEL.get(state["scan_width"],"uint32"))
+        width = VALID_WIDTHS[labels.index(ws)]
+        try:
+            addr = int(addr_s,0); val = int(val_s,0)
+            err = _validate_write_addr(addr)
+            if err: raise ValueError(err)
+            if not 0 <= val <= WIDTH_MAX[width]: raise ValueError("Value out of range")
+        except Exception as exc:
+            message_box(stdscr,[f"Bad input: {exc}"],"Error",C_ERR); return
     try:
-        addr     = int(addr_s, 0)
-        err      = _validate_write_addr(addr)
-        if err:
-            raise ValueError(err)
-        val      = int(val_s, 0)
-        secs     = max(1, int(sec_s))
-        interval = max(50, int(intvl_s)) / 1000.0
-        if val < 0 or val > WIDTH_MAX[width]:
-            raise ValueError(f"Value out of range for {WIDTH_LABEL[width]}")
+        sec = max(1,int(input_box(stdscr,"Duration (secs)  : ",12,3,6,"30")))
+        interval = max(50,int(input_box(stdscr,"Interval (ms)    : ",14,3,6,"200")))/1000.0
         data = struct.pack(WIDTH_FMT[width], val)
     except Exception as exc:
-        message_box(stdscr, [f"Bad input: {exc}"], "Error", C_ERR)
-        return
-
-    # Issue #10/#11: validate address is in a writable mapped region of the
-    # CURRENT process at the moment the freeze is started.  If the game
-    # restarted (new PID, new memory layout) this catches the stale address
-    # before a single write reaches the wrong process.
-    map_err = _validate_addr_in_maps(state["ip"], state["pid"], addr, width)
-    if map_err:
-        if not confirm_box(stdscr, f"{map_err}\nFreeze anyway?", "Unmapped Address"):
-            return
-
-    safe_addstr(stdscr, 15, 3,
-        f"Freezing {hex(addr)} = {val} for {secs}s  (every {int(interval*1000)}ms)",
-        color(C_WARN) | curses.A_BOLD)
-    safe_addstr(stdscr, 16, 3, "Press Q or Esc to stop early.", color(C_NORM))
-    stdscr.refresh()
-
-    # Run the write loop in a background thread so the UI redraws responsively.
-    # Issues #7/#8/#9: register with the global freeze tracker so the worker
-    # can be stopped externally (process change, reconnect) without needing
-    # a reference to this closure's local stop_event.
-    # Issue #13: snapshot pid at start; worker checks it hasn't changed each
-    # tick so it stops itself if the user switches processes mid-freeze.
-    frozen_pid  = state["pid"]
-    frozen_ip   = state["ip"]
-    stop_event  = threading.Event()   # local stop (Q key / deadline)
-    write_errors = [0]
-    deadline    = time.time() + secs
-
+        message_box(stdscr,[f"Bad input: {exc}"],"Error",C_ERR); return
+    frozen_ip, frozen_pid = state["ip"], state["pid"]
+    stop_event = threading.Event(); errors=[0]; deadline=time.time()+sec
     def _freeze_worker():
         while time.time() < deadline:
-            # Issue #7/#8: honour both the local and global stop events.
-            if stop_event.is_set() or _freeze_stop.is_set():
-                break
-            # Issue #13: abort if process or IP changed under us.
-            if state["pid"] != frozen_pid or state["ip"] != frozen_ip:
-                add_log("Freeze aborted — process or connection changed", "warn")
-                break
-            if not ps5_write(frozen_ip, frozen_pid, addr, data,
-                             cancel_event=_freeze_stop, timeout=1.0):
-                if _freeze_stop.is_set():
-                    break
-                write_errors[0] += 1
-            # Check both stop signals during the interval.  A user-provided
-            # long interval must not let this worker survive a process change.
-            sleep_until = time.time() + interval
-            while time.time() < sleep_until:
-                if stop_event.wait(min(0.1, sleep_until - time.time())):
-                    break
-                if _freeze_stop.is_set():
-                    break
-
-    # Issue #7: register globally before starting the thread.
+            if stop_event.is_set() or _freeze_stop.is_set(): break
+            if state["ip"] != frozen_ip or state["pid"] != frozen_pid:
+                add_log("Freeze aborted — process or connection changed","warn"); break
+            target = addr
+            if is_pointer:
+                ok,target,_ = _resolve_pointer_chain(frozen_ip,frozen_pid,base,offsets)
+                if not ok:
+                    add_log("Pointer freeze: chain broken — retrying next tick","warn")
+                    if stop_event.wait(interval) or _freeze_stop.is_set(): break
+                    continue
+            if _validate_addr_in_maps(frozen_ip,frozen_pid,target,width,10.0):
+                with _map_cache_lock: _map_cache.clear()
+                if stop_event.wait(interval) or _freeze_stop.is_set(): break
+                continue
+            if not ps5_write(frozen_ip,frozen_pid,target,data,cancel_event=_freeze_stop,timeout=1.0):
+                errors[0]+=1
+                with _map_cache_lock: _map_cache.clear()
+            if stop_event.wait(interval) or _freeze_stop.is_set(): break
     with _freeze_lock:
-        _freeze_stop.clear()
-        worker = threading.Thread(target=_freeze_worker, daemon=True)
-        _freeze_thread = worker
-    worker.start()
-
-    stdscr.nodelay(True)
+        _freeze_stop.clear(); worker=threading.Thread(target=_freeze_worker,daemon=True); _freeze_thread=worker
+    worker.start(); stdscr.nodelay(True)
     try:
         while worker.is_alive():
-            h, w      = stdscr.getmaxyx()   # Issue #1: re-read on resize
-            elapsed   = time.time() - (deadline - secs)
-            frac      = min(elapsed / secs, 1.0)
-            remaining = max(0, int(deadline - time.time()))
-            safe_addstr(stdscr, 18, 3, f"Time left: {remaining:3d}s  ", color(C_OK))
-            draw_progress_bar(stdscr, 19, 3, min(w - 8, 50), frac,
-                              f"  {int(frac * 100)}%")
-            if write_errors[0]:
-                safe_addstr(stdscr, 20, 3,
-                    f"Write errors: {write_errors[0]}  (connection issue?)",
-                    color(C_ERR))
-            stdscr.refresh()
-            time.sleep(0.1)
-            k = stdscr.getch()
-            if k == curses.KEY_RESIZE:       # absorb resize, restore full frame
-                curses.update_lines_cols()
-                stdscr.clear()
-                draw_border(stdscr, "FREEZE ADDRESS")
-                safe_addstr(stdscr, 2, 3,
-                    "Continuously write a value to lock it in memory.", color(C_WARN))
-                safe_addstr(stdscr, 15, 3,
-                    f"Freezing {hex(addr)} = {val} for {secs}s  "
-                    f"(every {int(interval*1000)}ms)",
-                    color(C_WARN) | curses.A_BOLD)
-                safe_addstr(stdscr, 16, 3, "Press Q or Esc to stop early.", color(C_NORM))
-            elif k in (ord('q'), ord('Q'), 27):   # Issue #15: Esc also stops
-                stop_event.set()
-                break
+            h,w=stdscr.getmaxyx(); frac=min((time.time()-(deadline-sec))/sec,1.0)
+            safe_addstr(stdscr,20,3,f"Time left: {max(0,int(deadline-time.time())):3d}s",color(C_OK))
+            draw_progress_bar(stdscr,21,3,min(max(w-8,10),50),frac,f"  {int(frac*100)}%")
+            if errors[0]: safe_addstr(stdscr,22,3,f"Write errors: {errors[0]}",color(C_ERR))
+            stdscr.refresh(); k=stdscr.getch()
+            if k==curses.KEY_RESIZE: curses.update_lines_cols(); stdscr.clear(); draw_border(stdscr,"FREEZE ADDRESS / CHEAT")
+            elif k in (ord('q'),ord('Q'),27): stop_event.set(); break
+            time.sleep(.05)
     finally:
-        stdscr.nodelay(False)
-        stop_event.set()
-        worker.join(timeout=interval + 1.0)
-        # Issue #7: deregister from global tracker after local join completes.
+        stdscr.nodelay(False); stop_event.set(); worker.join(timeout=interval+1.0)
         with _freeze_lock:
-            if _freeze_thread is worker:
-                _freeze_thread = None
-
-    add_log(f"Freeze done {hex(addr)} = {val}")
-    message_box(stdscr, ["Freeze complete."], "Done", C_OK)
+            if _freeze_thread is worker: _freeze_thread=None
+    message_box(stdscr,["Freeze complete."],"Done",C_OK)
 
 
 def do_ptr_verify_manual(stdscr) -> None:
@@ -4370,7 +4869,7 @@ def do_ptr_verify_manual(stdscr) -> None:
     do_pointer_chain_verify(stdscr, candidate, target)
 
 
-def do_pointer_scan(stdscr) -> None:
+def do_pointer_scan(stdscr, target_addr: Optional[int] = None) -> None:
     """
     Guided pointer-scan wizard.
 
@@ -4399,9 +4898,9 @@ def do_pointer_scan(stdscr) -> None:
     stdscr.refresh()
 
     scan_results = state["scan_results"]
-    target_addr  = None
-
-    if len(scan_results) > 0:
+    if target_addr is not None:
+        target_addr = int(target_addr)
+    if target_addr is None and len(scan_results) > 0:
         # Offer the results list as selectable options
         sel    = 0
         offset = 0
@@ -4888,14 +5387,23 @@ def do_log(stdscr) -> None:
             safe_addstr(stdscr, 3 + i, 3, line[:w - 6], color(cp))
         draw_statusbar(stdscr, [
             (f"{offset+1}-{min(offset+visible,len(snap))}/{len(snap)}", C_WARN),
-            ("↑↓ scroll", C_NORM), ("Q back", C_NORM),
+            ("↑↓/PgUp/PgDn", C_NORM), ("S save", C_OK), ("Q back", C_NORM),
         ])
         stdscr.refresh()
         key = stdscr.getch()
-        if key == curses.KEY_UP    and offset > 0:              offset -= 1
-        elif key == curses.KEY_DOWN and offset < len(snap) - 1: offset += 1
-        elif key in (ord('q'), ord('Q')):
-            break
+        if key == curses.KEY_UP and offset > 0: offset -= 1
+        elif key == curses.KEY_DOWN and offset < max(0, len(snap)-1): offset += 1
+        elif key == curses.KEY_PPAGE: offset = max(0, offset - visible)
+        elif key == curses.KEY_NPAGE: offset = min(max(0, len(snap)-visible), offset + visible)
+        elif key in (ord('s'), ord('S')):
+            fname = Path.home() / f"rdx-debug-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+            try:
+                with fname.open('w', encoding='utf-8') as f:
+                    for e in snap: f.write(f"[{e['ts']}] [{e['level'].upper()[:4]}]  {e['msg']}\n")
+                message_box(stdscr, [f"Log saved to {fname}"], "Saved", C_OK)
+            except OSError as exc:
+                message_box(stdscr, [f"Could not save log: {exc}"], "Save Failed", C_ERR)
+        elif key in (ord('q'), ord('Q'), 27): break
 
 
 # ── main loop ─────────────────────────────────────────────────────────────────

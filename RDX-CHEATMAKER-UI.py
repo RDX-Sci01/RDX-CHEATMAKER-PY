@@ -11,6 +11,7 @@ import array as _array
 import bisect
 import curses
 import gc
+import heapq
 import os
 import queue as _queue
 import re
@@ -18,6 +19,7 @@ import socket
 import struct
 import json
 import threading
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional   # keep 3.8/3.9 compatibility (no X|Y union syntax)
@@ -217,6 +219,7 @@ CMD_TURBO_START = 0xBDAACC11
 CMD_TURBO_COUNT = 0xBDAACC12
 CMD_TURBO_GET   = 0xBDAACC13
 CMD_TURBO_END   = 0xBDAACC14
+CMD_REGION_CLASSIFY = 0xBDAACC16
 PROC_AUTH_MAGIC = 0xBB40E64D
 # STATUS_SUCCESS / STATUS_ERROR: bit-swapped wire values produced by the server's
 # net_send_int32() helper.  Clients compare raw wire bytes directly.
@@ -245,7 +248,7 @@ _HEAP_NAME_HINTS  = frozenset({"", "anon", "heap", "stack", "scePthread",
 
 # Maximum pointer-chain depth.  Chains longer than 6 are almost never seen
 # in retail titles and exponential scan cost grows quickly beyond this.
-MAX_CHAIN_DEPTH   = 6
+MAX_CHAIN_DEPTH   = 8
 
 # How many pointer-scan results to keep per depth level before filtering.
 # Raising this finds more candidates but uses more RAM and takes longer.
@@ -377,10 +380,27 @@ _WRITE_MAP_CACHE_TTL = 10.0          # shorter TTL for writes/freezes
 _pointer_index_cache = {}
 _pointer_index_lock = threading.RLock()
 _PTR_INDEX_CHUNK = 0x2000000          # 32 MiB
-_PTR_RESOLVE_OFFSET_MAX = 0x200
-_PTR_RESOLVE_OFFSET_STEP = 8
-_PTR_RESOLVE_MAX_HITS = 128
+_PTR_RESOLVE_OFFSET_MAX = 0x2000   # ±8 KiB maximum field-offset search
+_PTR_RESOLVE_OFFSET_TIERS = (0x100, 0x400, 0x1000, 0x2000)
+_PTR_RESOLVE_OFFSET_STEP = 4      # common 32-bit structure-field alignment
+_PTR_RESOLVE_MAX_HITS = 192       # deterministic candidate window per target
 _PTR_RESOLVE_MAX_NODES = 2500
+_PTR_RESOLVE_MAX_FOUND = 96
+_PTR_FAST_DIRECT_RANGE = 0x100
+_PTR_FAST_DIRECT_HITS = 24
+
+# Bounded streaming pointer scanner.  These limits are separate from the
+# reverse-index resolver above and must remain defined for pointer_chain_scan.
+_PTR_STRUCT_MAX = 0x1000             # interval matching keeps wide offsets cheap
+_PTR_STRUCT_STEP = 4
+_PTR_CHUNK = 0x2000000              # 32 MiB network reads
+_PTR_BEAM_MAX = 12_000              # heap targets carried to the next depth
+_PTR_SEARCH_TARGET_MAX = 4_096      # bounded deep-pass value set
+_PTR_DEPTH_DEFAULT = 3
+_PTR_DISK_INDEX_THRESHOLD = 0x40000000  # 1 GiB readable memory
+_PTR_DISK_SHARD_BYTES = 0x2000000       # 32 MiB per sorted disk shard
+_PTR_DISK_WORKERS = 6                    # persistent parallel reader/indexers
+_pointer_region_class_cache = {}         # map fingerprint -> classified rows
 
 # Issues #7/#8/#9/#10: track the active freeze worker globally so it can be
 # stopped when the user changes process or reconnects.  Without this the old
@@ -522,6 +542,49 @@ def ps5_auth_scanner(ip: str) -> None:
     finally:
         s.close()
 
+def ps5_classify_regions(ip: str, pid: int, max_regions: int = 8192,
+                         probe_bytes: int = 0x10000) -> list:
+    """Return ps5debug-NG's read-throughput classification for process maps.
+
+    This read-only authenticated command identifies uncached/GPU-backed ranges
+    which are unsuitable for pointer indexing.  An unsupported payload simply
+    raises; callers deliberately retain the normal map-based fallback.
+    """
+    s = ps5_connect(ip)
+    try:
+        body = struct.pack("<II", PROC_AUTH_MAGIC, 2)
+        s.sendall(cmd_header(CMD_PROC_AUTH, len(body)) + body)
+        if not check_ok(s):
+            raise RuntimeError("region classifier authentication rejected")
+        length = struct.unpack("<H", recv_exact(s, 2))[0]
+        if length <= 0 or length > 256:
+            raise RuntimeError(f"invalid auth challenge length: {length}")
+        challenge = recv_exact(s, length)
+        key = _auth_keystream(length)
+        s.sendall(bytes(a ^ b for a, b in zip(challenge, key)))
+        if not check_ok(s):
+            raise RuntimeError("region classifier auth response rejected")
+
+        request = struct.pack("<IIII", int(pid), int(max_regions),
+                              int(probe_bytes), 0)
+        s.sendall(cmd_header(CMD_REGION_CLASSIFY, len(request)) + request)
+        if not check_ok(s):
+            raise RuntimeError("region classifier unavailable")
+        count = struct.unpack("<I", recv_exact(s, 4))[0]
+        if count > max_regions:
+            raise RuntimeError(f"invalid region classifier count: {count}")
+        records = []
+        for _ in range(count):
+            start, end, prot, flags, mbps, _reserved = struct.unpack(
+                "<QQIIII", recv_exact(s, 32))
+            records.append({"start": start, "end": end, "prot": prot,
+                            "flags": flags, "mbps": mbps})
+        if not check_ok(s):
+            raise RuntimeError("region classifier final status failed")
+        return records
+    finally:
+        s.close()
+
 def ps5_turboscan_caps(ip: str) -> tuple:
     """Return (version, engines, max_threads) from the read-only capability probe."""
     s = ps5_connect(ip)
@@ -542,17 +605,33 @@ def _recv_exact_cancel(s: socket.socket, n: int,
     pos = 0
     old_timeout = s.gettimeout()
     s.settimeout(0.5)
+    transfer_started = time.monotonic()
+    last_progress = time.monotonic()
+    inactivity_limit = 15.0
+    # Even a connection that trickles a few bytes must not hold the scanner
+    # forever.  Allow roughly 1 MiB/s plus setup slack; normal LAN reads are
+    # substantially faster and therefore unaffected.
+    total_limit = max(15.0, (n / 1048576.0) + 10.0)
     try:
         while pos < n:
             if cancel_event and cancel_event.is_set():
                 raise InterruptedError("scan cancelled")
+            if time.monotonic() - transfer_started >= total_limit:
+                raise TimeoutError(
+                    f"PS5 read exceeded {total_limit:.0f}s after "
+                    f"{pos:,}/{n:,} bytes")
             try:
                 got = s.recv_into(view[pos:], n - pos)
             except socket.timeout:
+                if time.monotonic() - last_progress >= inactivity_limit:
+                    raise TimeoutError(
+                        f"PS5 read stalled for {inactivity_limit:.0f}s "
+                        f"after {pos:,}/{n:,} bytes")
                 continue
             if not got:
                 raise ConnectionError("PS5 disconnected")
             pos += got
+            last_progress = time.monotonic()
     finally:
         s.settimeout(old_timeout)
     return bytes(buf)
@@ -881,7 +960,9 @@ def ps5_proc_list(ip: str) -> list:
         procs = []
         for _ in range(count):
             raw  = recv_exact(s, PROC_ENTRY_SIZE)
-            name = raw[:32].rstrip(b'\x00').decode('utf-8', errors='replace')
+            # Protocol names are fixed-width C strings.  Bytes after the first
+            # NUL are padding and may contain stale data from the server struct.
+            name = raw[:32].split(b'\x00', 1)[0].decode('utf-8', errors='replace')
             pid  = struct.unpack_from("<i", raw, 32)[0]
             procs.append({"pid": pid, "name": name})
         return procs
@@ -899,7 +980,7 @@ def ps5_maps(ip: str, pid: int) -> list:
         maps = []
         for _ in range(count):
             raw   = recv_exact(s, MAP_ENTRY_SIZE)
-            name  = raw[:32].rstrip(b'\x00').decode('utf-8', errors='replace')
+            name  = raw[:32].split(b'\x00', 1)[0].decode('utf-8', errors='replace')
             start = struct.unpack_from("<Q", raw, 32)[0]
             end   = struct.unpack_from("<Q", raw, 40)[0]
             # offset field (bytes 48-55) consumed but not stored
@@ -997,6 +1078,10 @@ _DEBUG_DBREG_OFFSET = 0x420
 _DEBUG_TRACE_TIMEOUT = 10.0
 _DEBUG_TRACE_MAX_HITS = 8
 _DEBUG_TRACE_WP_INDEX = None
+# Disabled after live testing exposed a console-crashing attach/watchpoint
+# lifecycle.  Keep the implementation for protocol work, but never enter it
+# from a production resolver until it has an explicit capability/safety gate.
+_DEBUG_TRACE_ENABLED = False
 
 # FreeBSD/amd64 struct reg: 15 GP registers followed by trap/segment fields.
 _REG_OFFSETS = {
@@ -1108,24 +1193,20 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
     Change-triggered resolver:
       1) attach debugger;
       2) install a read/write hardware watchpoint on target;
-      3) write a distinctive temporary value;
-      4) wait for a real target-process access;
+      3) wait for a real target-process access;
       5) capture RIP/registers and decode the memory operand;
       6) restore the original bytes and detach.
 
     Returns a trace dictionary.  It never leaves the probe value installed.
     """
+    if not _DEBUG_TRACE_ENABLED:
+        raise RuntimeError(
+            "hardware-watchpoint tracing is disabled: unsafe debugger lifecycle")
     target_addr = int(target_addr)
     width = int(width)
     original = ps5_read(ip, pid, target_addr, width)
     if len(original) != width:
         raise RuntimeError("could not read original target value")
-
-    mask = WIDTH_MAX[width]
-    probe = (int.from_bytes(original, "little") ^ (0x5A5A5A5A5A5A5A5A & mask))
-    if probe == int.from_bytes(original, "little"):
-        probe = (probe + 1) & mask
-    probe_bytes = struct.pack(WIDTH_FMT[width], probe)
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1156,12 +1237,10 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
         if wp_index is None:
             raise RuntimeError("no free hardware watchpoint slot")
 
-        # The attach command resumes the target. Stop it before changing the
-        # probe so our own write cannot be mistaken for the game's access.
+        # Stop briefly while installing DR7.  Do not write a probe value here:
+        # restoring one later can overwrite a legitimate in-game inventory
+        # change made while the trace is active.
         _debug_continue(cmd, 1)
-        if not ps5_write(ip, pid, target_addr, probe_bytes):
-            raise RuntimeError("probe write was rejected")
-
         # DR7 length encoding: 0=1 byte, 1=2 bytes, 2=8 bytes, 3=4 bytes.
         wp_length = {1: 0, 2: 1, 4: 3, 8: 2}.get(width)
         if wp_length is None:
@@ -1187,6 +1266,9 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
             candidate = _debug_parse_event(packet)
             dr6 = int(candidate["dbregs"][6])
             if not (dr6 & (1 << int(wp_index))):
+                # Every debug event stops the target.  Ignoring an unrelated
+                # event without resuming leaves the game visibly frozen.
+                _debug_continue(cmd, 0)
                 continue
             hits += 1
             regs = candidate["regs"]
@@ -1199,6 +1281,7 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
                 last_reason = f"disassembly failed: {exc}"
             if not decoded or not (int(decoded["kind"]) & 0x10):
                 last_reason = "watchpoint hit but accessor instruction was not decoded"
+                _debug_continue(cmd, 0)
                 continue
             event = candidate
             insn = decoded
@@ -1242,7 +1325,6 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
         return {
             "success": True,
             "target": target_addr,
-            "probe": probe,
             "rip": rip,
             "base_reg": base_name or f"reg#{base_reg_id}",
             "base_value": base_val,
@@ -1255,17 +1337,12 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
             "lwpid": int(event["lwpid"]),
         }
     finally:
-        # Clear the watchpoint before restoring the original value. Otherwise
-        # the restore write itself can generate another debug stop.
+        # Clear the watchpoint before detaching.
         if cmd is not None and wp_index is not None:
             try:
                 _debug_clear_watchpoint(cmd, wp_index)
             except Exception:
                 pass
-        try:
-            ps5_write(ip, pid, target_addr, original)
-        except Exception as exc:
-            add_log(f"Trace restore failed @ {hex(target_addr)}: {exc}", "error")
         if cmd is not None:
             if attached:
                 try:
@@ -1307,7 +1384,7 @@ def _resolve_trace_first(ip: str, pid: int, target_addr: int,
     base_target = int(trace["base_value"])
     candidates = pointer_chain_scan(
         ip, pid, base_target,
-        max_depth=min(3, MAX_CHAIN_DEPTH),
+        max_depth=min(5, MAX_CHAIN_DEPTH),
         cancel_event=cancel_event,
         progress_cb=progress_cb,
     )
@@ -1673,6 +1750,11 @@ class _ScanSocket:
                 except Exception: pass
                 self._s = None
                 self._from_pool = False
+                # The caller can immediately retry this range with a smaller
+                # chunk. Repeating the same oversized, slow transfer here only
+                # multiplies the stall duration.
+                if isinstance(exc, TimeoutError):
+                    raise
                 if attempt == self.MAX_RETRIES - 1:
                     raise
                 delay = 0.1 * (attempt + 1)
@@ -2565,30 +2647,45 @@ _ADDR_MIN = 0x0000_0000_0000_0001
 _ADDR_MAX = 0x0000_7FFF_FFFF_FFFF
 
 def _is_static_region(region: dict) -> bool:
-    """
-    Heuristic: return True when a map entry looks like a static/module segment
-    rather than a heap or anonymous allocation.
+    """Return True only for plausible persistent/module-backed regions.
 
-    Criteria (any one is sufficient):
-      • address below _STATIC_ADDR_MAX  (module segments load low)
-      • region name is a known module or game binary  (non-empty, not a hint)
-      • region is NOT writable but IS readable  (typical for .data/.rodata)
-
-    The combination catches the vast majority of static segments while
-    excluding stack, heap, and large anonymous mmaps.
+    Avoid treating arbitrary named anonymous mappings as permanent roots.
+    Writable anonymous/heap/stack regions remain transient candidates unless
+    the map name clearly identifies a module-backed image.
     """
-    name  = region.get("name", "")
-    start = region.get("start", 0)
-    prot  = region.get("prot", 0)
-    PROT_READ  = 0x1
-    PROT_WRITE = 0x2
-    if start < _STATIC_ADDR_MAX:
-        return True
-    if name and name not in _HEAP_NAME_HINTS:
-        return True
-    if (prot & PROT_READ) and not (prot & PROT_WRITE):
-        return True
-    return False
+    name = str(region.get("name", "") or "").strip()
+    start = int(region.get("start", 0))
+    prot = int(region.get("prot", 0))
+    PROT_READ, PROT_WRITE, PROT_EXEC = 0x1, 0x2, 0x4
+
+    low_name = name.lower()
+    transient_prefixes = ("[heap", "[stack", "[anon", "anon", "heap", "stack",
+                           "scepthread", "scelibcinternal")
+    if low_name.startswith(transient_prefixes) or low_name in {"", "anon"}:
+        return bool((prot & PROT_READ) and not (prot & PROT_WRITE)
+                    and start < _STATIC_ADDR_MAX)
+
+    # Executable mappings and named non-writable image mappings are strong
+    # module/static signals. Named writable module .data/.bss mappings are also
+    # accepted because they are commonly where global pointers live.
+    if name and (prot & PROT_READ):
+        if prot & PROT_EXEC:
+            return True
+        if not (prot & PROT_WRITE):
+            return True
+        # Writable named image mapping: require a module-like name rather than
+        # an arbitrary allocation label.
+        module_like = (low_name == "executable" or
+                       ".elf" in low_name or ".prx" in low_name or
+                       ".sprx" in low_name or "/" in name or
+                       low_name.endswith((".bin", ".self", ".so")))
+        if module_like:
+            return True
+
+    # Low, readable, non-writable anonymous mappings can still be image-backed
+    # segments when the debugger omits the name.
+    return bool(start < _STATIC_ADDR_MAX and (prot & PROT_READ)
+                and not (prot & PROT_WRITE))
 
 
 def ps5_read_pointer(ip: str, pid: int, addr: int) -> int:
@@ -2689,6 +2786,90 @@ def _module_info_for_addr(addr: int, maps: list) -> tuple:
     return (name, int(containing["start"]), int(addr - containing["start"]))
 
 
+def _build_region_lookup(maps: list):
+    """Build a binary-searchable region table once per resolver run."""
+    rows = sorted(
+        (int(r.get("start", 0)), int(r.get("end", 0)), r)
+        for r in maps if int(r.get("end", 0)) > int(r.get("start", 0))
+    )
+    starts = [x[0] for x in rows]
+    return starts, rows
+
+
+def _region_for_addr(addr: int, region_starts: list, region_rows: list):
+    """O(log n) memory-map ownership lookup."""
+    i = bisect.bisect_right(region_starts, int(addr)) - 1
+    if i >= 0:
+        start, end, region = region_rows[i]
+        if start <= int(addr) < end:
+            return region
+    return None
+
+
+def _region_priority(region: dict) -> int:
+    """Higher score means more likely to contain a useful persistent pointer."""
+    prot = int(region.get("prot", 0))
+    name = str(region.get("name", "") or "")
+    if _is_static_region(region):
+        return 100 + (20 if prot & 0x4 else 0) + (10 if name else 0)
+    if name and name not in _HEAP_NAME_HINTS and (prot & 0x2):
+        return 70
+    if prot & 0x2:
+        return 45
+    if name in _HEAP_NAME_HINTS:
+        return 20
+    return 10
+
+
+def _fast_direct_pointer_hits(ip: str, pid: int, target: int, maps: list,
+                              cancel_event=None, max_hits: int = _PTR_FAST_DIRECT_HITS) -> list:
+    """Cheap first pass: find direct target-near pointers without building the full index."""
+    readable = [r for r in _pointer_readable_regions(maps) if _is_static_region(r)]
+    readable.sort(key=lambda r: (-_region_priority(r), int(r["start"])))
+    low = max(_ADDR_MIN, int(target) - _PTR_FAST_DIRECT_RANGE)
+    high = min(_ADDR_MAX, int(target) + _PTR_FAST_DIRECT_RANGE)
+    starts = np.asarray([int(r["start"]) for r in maps], dtype=np.uint64)
+    ends = np.asarray([int(r["end"]) for r in maps], dtype=np.uint64)
+    hits = []
+    sock = _ScanSocket(ip, pid)
+    try:
+        for region in readable:
+            if cancel_event and cancel_event.is_set():
+                break
+            rs, re_ = int(region["start"]), int(region["end"])
+            pos = rs + ((-rs) % 8)
+            while pos < re_ and len(hits) < max_hits:
+                size = min(_PTR_INDEX_CHUNK, re_ - pos)
+                size -= size % 8
+                if size < 8:
+                    break
+                try:
+                    raw = sock.read(pos, size, cancel_event)
+                except Exception:
+                    pos += size
+                    continue
+                trim = len(raw) - (len(raw) % 8)
+                if trim >= 8:
+                    a = np.frombuffer(raw[:trim], dtype=np.uint64)
+                    mask = (a >= np.uint64(low)) & (a <= np.uint64(high))
+                    if mask.any():
+                        idxs = np.flatnonzero(mask)
+                        for j in idxs.tolist():
+                            value = int(a[j])
+                            delta = int(target) - value
+                            if delta % _PTR_RESOLVE_OFFSET_STEP:
+                                continue
+                            holder = pos + j * 8
+                            hits.append((holder, delta, region))
+                            if len(hits) >= max_hits:
+                                break
+                pos += size
+    finally:
+        sock.close()
+    hits.sort(key=lambda x: (-_region_priority(x[2]), abs(x[1]), x[0]))
+    return hits[:max_hits]
+
+
 class _ReversePointerIndex:
     """Compact reverse pointer index: pointer value -> holder addresses.
 
@@ -2704,6 +2885,7 @@ class _ReversePointerIndex:
         self.fingerprint = _pointer_map_fingerprint(maps)
         self.values = np.empty(0, dtype=np.uint64)
         self.holders = np.empty(0, dtype=np.uint64)
+        self.holder_priority = np.empty(0, dtype=np.uint8)
         self.total_bytes = 0
         self.done_bytes = 0
         self._build(cancel_event, progress_cb)
@@ -2712,8 +2894,14 @@ class _ReversePointerIndex:
         readable = _pointer_readable_regions(self.maps)
         if not readable:
             return
-        starts = np.asarray([int(r["start"]) for r in self.maps], dtype=np.uint64)
-        ends = np.asarray([int(r["end"]) for r in self.maps], dtype=np.uint64)
+        # ps5debug map order is not guaranteed.  searchsorted requires sorted
+        # starts; using the raw map order can silently discard valid pointers.
+        lookup_maps = sorted(
+            (r for r in self.maps if int(r.get("end", 0)) > int(r.get("start", 0))),
+            key=lambda r: int(r["start"])
+        )
+        starts = np.asarray([int(r["start"]) for r in lookup_maps], dtype=np.uint64)
+        ends = np.asarray([int(r["end"]) for r in lookup_maps], dtype=np.uint64)
         total = max(sum(int(r["end"]) - int(r["start"]) for r in readable), 1)
         vals_parts, holder_parts = [], []
         sock = _ScanSocket(self.ip, self.pid)
@@ -2764,36 +2952,285 @@ class _ReversePointerIndex:
         finally:
             sock.close()
         if vals_parts:
+            # Concatenation allocates the final arrays; release each family of
+            # chunk arrays immediately instead of retaining both chunk lists
+            # throughout priority construction and sorting.
             self.values = np.concatenate(vals_parts)
+            vals_parts.clear()
             self.holders = np.concatenate(holder_parts)
+            holder_parts.clear()
+            gc.collect()
+            # Cache holder-region priority once.  Querying a dense pointer
+            # range must not discard a good module/static pointer merely
+            # because many heap pointers occur at smaller offsets.
+            map_priority = np.fromiter(
+                (_region_priority(r) for r in lookup_maps),
+                dtype=np.uint8, count=len(lookup_maps))
+            holder_map = np.searchsorted(starts, self.holders, side="right") - 1
+            holder_map_i = holder_map.astype(np.int64, copy=False)
+            valid = holder_map_i >= 0
+            hp = np.zeros(self.holders.shape, dtype=np.uint8)
+            if valid.any():
+                vi = np.where(valid, holder_map_i, 0)
+                inside = valid & (self.holders < ends[vi])
+                hp[inside] = map_priority[vi[inside]]
+            self.holder_priority = hp
             order = np.argsort(self.values, kind="mergesort")
             self.values = self.values[order]
             self.holders = self.holders[order]
+            self.holder_priority = self.holder_priority[order]
         add_log(f"Reverse pointer index built: {len(self.values):,} pointers, "
                 f"{self.done_bytes / 1048576:.1f} MiB scanned")
 
     def query(self, target: int, max_offset: int = _PTR_RESOLVE_OFFSET_MAX,
               step: int = _PTR_RESOLVE_OFFSET_STEP,
               max_hits: int = _PTR_RESOLVE_MAX_HITS) -> list:
-        """Return (holder, offset) where *holder contains target-offset*."""
+        """Return (holder, offset) for values in [target-max_offset, target].
+
+        The old implementation performed one binary search per 8-byte offset.
+        That becomes expensive with an 8 KiB window.  This version performs one
+        range lookup and derives the offset directly from the matched pointer
+        value, which keeps the larger search window cheap.
+        """
         if self.values.size == 0:
             return []
+        target = int(target)
+        max_offset = max(0, int(max_offset))
+        step = max(1, int(step))
+        max_hits = max(1, int(max_hits))
+        # Search on both sides of the target.  A valid field offset may be
+        # positive OR negative: target = pointer_value + signed_offset.
+        low = max(_ADDR_MIN, target - max_offset)
+        high = min(_ADDR_MAX, target + max_offset)
+        if low > high:
+            return []
+        lo = int(np.searchsorted(self.values, np.uint64(low), side="left"))
+        hi = int(np.searchsorted(self.values, np.uint64(high), side="right"))
+        if hi <= lo:
+            return []
+
+        values = self.values[lo:hi]
+        holders = self.holders[lo:hi]
+        priorities = self.holder_priority[lo:hi]
+        # Filter alignment first, then rank candidates by region quality before
+        # distance.  This prevents a dense heap from hiding a useful module root.
+        deltas = np.asarray(target, dtype=np.int64) - values.astype(np.int64, copy=False)
+        mask = (np.abs(deltas) <= max_offset) & ((deltas % step) == 0)
+        if not mask.any():
+            return []
+        idxs = np.flatnonzero(mask)
+        # Stable deterministic ordering: better region, shorter offset, holder.
+        idxs = sorted(idxs.tolist(),
+                      key=lambda i: (-int(priorities[i]), abs(int(deltas[i])),
+                                     int(deltas[i]) < 0, int(holders[i])))[:max_hits]
         out = []
         seen = set()
-        for off in range(0, max_offset + 1, step):
-            wanted = int(target) - off
-            if wanted < _ADDR_MIN:
+        for i in idxs:
+            holder = int(holders[i])
+            delta = int(deltas[i])
+            key = (holder, delta)
+            if key not in seen:
+                seen.add(key)
+                out.append((holder, delta))
+        return out
+
+
+class _DiskReversePointerIndex:
+    """Shard-backed reverse index for processes too large to retain in RAM.
+
+    Each shard is independently sorted and stored as two ``.npy`` arrays.
+    Queries binary-search every memory-mapped value shard and globally rank the
+    small union of hits.  Peak construction memory is bounded by one shard.
+    """
+    def __init__(self, ip: str, pid: int, maps: list, cancel_event=None,
+                 progress_cb=None):
+        self.ip = ip
+        self.pid = pid
+        self.maps = maps
+        self.fingerprint = _pointer_map_fingerprint(maps)
+        self.total_bytes = 0
+        self.done_bytes = 0
+        self.shards = []
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="rdx_ptr_"))
+        try:
+            self._build(cancel_event, progress_cb)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        """Close mapped shards and remove this index's private temporary files."""
+        self.shards.clear()
+        try:
+            for path in self._tmpdir.iterdir():
+                path.unlink(missing_ok=True)
+            self._tmpdir.rmdir()
+        except Exception:
+            pass
+
+    def _build(self, cancel_event=None, progress_cb=None):
+        readable = _coalesce_pointer_regions(_pointer_readable_regions(self.maps))
+        lookup_maps = sorted(
+            (r for r in self.maps if int(r.get("end", 0)) > int(r.get("start", 0))),
+            key=lambda r: int(r["start"]))
+        starts = np.asarray([int(r["start"]) for r in lookup_maps], dtype=np.uint64)
+        ends = np.asarray([int(r["end"]) for r in lookup_maps], dtype=np.uint64)
+        total = max(sum(int(r["end"]) - int(r["start"]) for r in readable), 1)
+        self.total_bytes = total
+        tasks = _queue.Queue()
+        shard_no = 0
+        for region in readable:
+            pos = int(region["start"]) + ((-int(region["start"])) % 8)
+            region_end = int(region["end"])
+            while pos < region_end:
+                size = min(_PTR_DISK_SHARD_BYTES, region_end - pos)
+                size -= size % 8
+                if size < 8:
+                    break
+                tasks.put((shard_no, pos, size))
+                shard_no += 1
+                pos += size
+
+        requested_workers = min(_PTR_DISK_WORKERS, max(tasks.qsize(), 1))
+        result_lock = threading.Lock()
+        fatal_errors = []
+
+        # Establish readers before queueing sentinels.  Previously, if every
+        # worker failed during connection, Queue.join() waited forever because
+        # no thread remained to acknowledge the queued scan tasks.
+        reader_sockets = []
+        for _ in range(requested_workers):
+            try:
+                reader_sockets.append(_ScanSocket(self.ip, self.pid))
+            except Exception as exc:
+                fatal_errors.append((None, exc))
+        if not reader_sockets:
+            raise ConnectionError(f"disk pointer index could not connect: "
+                                  f"{fatal_errors[0][1]}")
+        for _ in reader_sockets:
+            tasks.put(None)
+
+        def _worker(sock):
+            try:
+                while True:
+                    task = tasks.get()
+                    try:
+                        if task is None:
+                            return
+                        number, pos, size = task
+                        if cancel_event and cancel_event.is_set():
+                            continue
+                        raw = sock.read(pos, size, cancel_event)
+                        trim = len(raw) - (len(raw) % 8)
+                        paths = []
+                        if trim >= 8:
+                            values = np.frombuffer(raw[:trim], dtype=np.uint64)
+                            plausible = (values >= _ADDR_MIN) & (values <= _ADDR_MAX)
+                            map_idx = np.searchsorted(starts, values, side="right") - 1
+                            map_idx_i = map_idx.astype(np.int64, copy=False)
+                            valid = map_idx_i >= 0
+                            if valid.any():
+                                safe_idx = np.where(valid, map_idx_i, 0)
+                                plausible &= valid & (values < ends[safe_idx])
+                            hit_idx = np.flatnonzero(plausible)
+                            if hit_idx.size:
+                                kept_values = values[hit_idx].copy()
+                                kept_holders = (np.uint64(pos) +
+                                    hit_idx.astype(np.uint64, copy=False) * np.uint64(8))
+                                # Partition by the pointer's upper 32 bits.  A
+                                # graph query then opens only the address family
+                                # containing its target instead of every shard.
+                                prefixes = kept_values >> np.uint64(32)
+                                for prefix in np.unique(prefixes).tolist():
+                                    group = prefixes == np.uint64(prefix)
+                                    group_values = kept_values[group]
+                                    group_holders = kept_holders[group]
+                                    order = np.argsort(group_values, kind="mergesort")
+                                    value_path = self._tmpdir / (
+                                        f"v{number:05d}_{int(prefix):08x}.npy")
+                                    holder_path = self._tmpdir / (
+                                        f"h{number:05d}_{int(prefix):08x}.npy")
+                                    np.save(value_path, group_values[order],
+                                            allow_pickle=False)
+                                    np.save(holder_path, group_holders[order],
+                                            allow_pickle=False)
+                                    paths.append((int(prefix), value_path,
+                                                  holder_path))
+                        with result_lock:
+                            if paths:
+                                self.shards.extend(paths)
+                            self.done_bytes += size
+                            if progress_cb:
+                                progress_cb(self.done_bytes, total)
+                    except InterruptedError:
+                        if cancel_event:
+                            cancel_event.set()
+                    except Exception as exc:
+                        with result_lock:
+                            fatal_errors.append((task, exc))
+                            if task is not None:
+                                self.done_bytes += task[2]
+                    finally:
+                        tasks.task_done()
+            finally:
+                sock.close()
+
+        workers = [threading.Thread(target=_worker, args=(sock,), daemon=True)
+                   for sock in reader_sockets]
+        for worker in workers:
+            worker.start()
+        tasks.join()
+        for worker in workers:
+            worker.join()
+        self.shards.sort(key=lambda shard: (shard[0], shard[1].name))
+        if fatal_errors and not self.shards and not (cancel_event and cancel_event.is_set()):
+            raise ConnectionError(f"disk pointer index failed: {fatal_errors[0][1]}")
+        for task, exc in fatal_errors[:8]:
+            where = hex(task[1]) if task is not None else "connect"
+            add_log(f"Disk pointer index error @ {where}: {exc}", "warn")
+        add_log(f"Disk pointer index built: {len(self.shards):,} shards, "
+                f"{self.done_bytes / 1048576:.1f} MiB scanned")
+
+    def query(self, target: int, max_offset: int = _PTR_RESOLVE_OFFSET_MAX,
+              step: int = _PTR_RESOLVE_OFFSET_STEP,
+              max_hits: int = _PTR_RESOLVE_MAX_HITS) -> list:
+        target = int(target)
+        low = max(_ADDR_MIN, target - max(0, int(max_offset)))
+        high = min(_ADDR_MAX, target + max(0, int(max_offset)))
+        candidates = []
+        region_starts, region_rows = _build_region_lookup(self.maps)
+        wanted_prefixes = set(range(low >> 32, (high >> 32) + 1))
+        for prefix, value_path, holder_path in self.shards:
+            if prefix not in wanted_prefixes:
                 continue
-            lo = int(np.searchsorted(self.values, np.uint64(wanted), side="left"))
-            hi = int(np.searchsorted(self.values, np.uint64(wanted), side="right"))
-            for holder in self.holders[lo:hi].tolist():
-                holder = int(holder)
-                if holder in seen:
-                    continue
-                seen.add(holder)
-                out.append((holder, off))
-                if len(out) >= max_hits:
-                    return out
+            values = np.load(value_path, mmap_mode="r", allow_pickle=False)
+            lo = int(np.searchsorted(values, np.uint64(low), side="left"))
+            hi = int(np.searchsorted(values, np.uint64(high), side="right"))
+            if hi <= lo:
+                continue
+            holders = np.load(holder_path, mmap_mode="r", allow_pickle=False)
+            local = []
+            for value, holder in zip(values[lo:hi].tolist(), holders[lo:hi].tolist()):
+                delta = target - int(value)
+                if abs(delta) <= max_offset and delta % max(1, int(step)) == 0:
+                    local.append((int(holder), delta))
+            if len(local) > max_hits:
+                local.sort(key=lambda item: (
+                    -_region_priority(_region_for_addr(
+                        item[0], region_starts, region_rows) or {}),
+                    abs(item[1]), item[1] < 0, item[0]))
+                del local[max_hits:]
+            candidates.extend(local)
+        candidates.sort(key=lambda item: (
+            -_region_priority(_region_for_addr(item[0], region_starts, region_rows) or {}),
+            abs(item[1]), item[1] < 0, item[0]))
+        out, seen = [], set()
+        for item in candidates:
+            if item not in seen:
+                seen.add(item)
+                out.append(item)
+                if len(out) >= max(1, int(max_hits)):
+                    break
         return out
 
 
@@ -2802,16 +3239,48 @@ def _get_reverse_pointer_index(ip: str, pid: int, cancel_event=None,
     """Get or build the cached reverse pointer index for the current map layout."""
     maps = _get_maps_cached(ip, pid)
     fp = _pointer_map_fingerprint(maps)
-    key = (ip, int(pid))
+    if fp not in _pointer_region_class_cache:
+        try:
+            classified = ps5_classify_regions(ip, pid)
+            if len(_pointer_region_class_cache) >= 4:
+                _pointer_region_class_cache.clear()
+            _pointer_region_class_cache[fp] = classified
+            uncached_mib = sum(
+                max(0, int(r["end"]) - int(r["start"]))
+                for r in classified if int(r.get("flags", 0)) & 1
+            ) / 1048576
+            add_log(f"Region classifier: {len(classified):,} ranges; "
+                    f"{uncached_mib:,.1f} MiB uncached/GPU memory excluded")
+            if len(classified) == 8192:
+                add_log("Region classifier reached the payload's 8,192-row cap; "
+                        "unreported maps retain normal safe fallback handling",
+                        "warn")
+        except Exception as exc:
+            _pointer_region_class_cache[fp] = []
+            add_log(f"Region classifier unavailable; using map safeguards: {exc}",
+                    "warn")
+    key = (ip, int(pid), int(state.get("session", 0)))
     with _pointer_index_lock:
         cached = _pointer_index_cache.get(key)
         if cached and cached[0] == fp:
             return cached[1], maps, False
-    idx = _ReversePointerIndex(ip, pid, maps, cancel_event, progress_cb)
+    readable_bytes = sum(
+        int(r["end"]) - int(r["start"])
+        for r in _pointer_readable_regions(maps))
+    index_type = (_DiskReversePointerIndex
+                  if readable_bytes >= _PTR_DISK_INDEX_THRESHOLD
+                  else _ReversePointerIndex)
+    idx = index_type(ip, pid, maps, cancel_event, progress_cb)
+    if cancel_event and cancel_event.is_set():
+        if hasattr(idx, "close"):
+            idx.close()
+        return idx, maps, True
     with _pointer_index_lock:
         # A later builder may have won the race; keep the first completed index.
         cached = _pointer_index_cache.get(key)
         if cached and cached[0] == fp:
+            if hasattr(idx, "close"):
+                idx.close()
             return cached[1], maps, False
         _pointer_index_cache[key] = (fp, idx)
     return idx, maps, True
@@ -2820,24 +3289,137 @@ def _get_reverse_pointer_index(ip: str, pid: int, cancel_event=None,
 def _invalidate_pointer_index(ip=None, pid=None):
     with _pointer_index_lock:
         if ip is None and pid is None:
+            for _, idx in _pointer_index_cache.values():
+                if hasattr(idx, "close"):
+                    idx.close()
             _pointer_index_cache.clear()
             return
-        _pointer_index_cache.pop((ip, int(pid)), None)
+        for key in list(_pointer_index_cache):
+            if isinstance(key, tuple) and len(key) >= 2 and key[0] == ip and int(key[1]) == int(pid):
+                entry = _pointer_index_cache.pop(key, None)
+                if entry and hasattr(entry[1], "close"):
+                    entry[1].close()
+
+
+def _candidate_confidence(c: dict) -> int:
+    """Convert resolver evidence into a stable 0..100 user-facing confidence."""
+    if not c.get("verified"):
+        return 0
+    depth = max(1, int(c.get("depth", 1)))
+    conf = 62
+    if c.get("module_name"):
+        conf += 18
+    if c.get("static"):
+        conf += 8
+    conf += max(0, 8 - depth * 2)
+    offsets = [int(x) for x in c.get("offsets", [])]
+    if offsets:
+        aligned = sum(1 for x in offsets if x % _PTR_RESOLVE_OFFSET_STEP == 0)
+        reasonable = sum(1 for x in offsets if abs(x) <= 0x400)
+        conf += round(2 * aligned / len(offsets))
+        conf += round(2 * reasonable / len(offsets))
+    return max(0, min(100, int(conf)))
+
+
+def _verify_candidate_twice(ip: str, pid: int, candidate: dict, target_addr: int,
+                            cancel_event=None) -> bool:
+    """Require two fresh pointer-chain resolutions before accepting a candidate."""
+    if cancel_event and cancel_event.is_set():
+        return False
+    base = int(candidate.get("base", 0))
+    offsets = [int(x) for x in candidate.get("offsets", [])]
+    ok1, resolved1, steps1 = _resolve_pointer_chain(
+        ip, pid, base, offsets, int(candidate.get("terminal_offset", 0)))
+    if not (ok1 and int(resolved1) == int(target_addr)):
+        candidate["verified"] = False
+        candidate["resolved"] = int(resolved1 or 0)
+        candidate["steps"] = steps1
+        return False
+    # Fresh map/read pass: do not rely on the first read or cached result.
+    time.sleep(0.01)
+    if cancel_event and cancel_event.is_set():
+        return False
+    ok2, resolved2, steps2 = _resolve_pointer_chain(
+        ip, pid, base, offsets, int(candidate.get("terminal_offset", 0)))
+    verified = bool(ok2 and int(resolved2) == int(target_addr))
+    candidate["verified"] = verified
+    candidate["resolved"] = int(resolved2 or 0)
+    candidate["steps"] = steps2
+    candidate["verification_passes"] = 2 if verified else 1
+    return verified
 
 
 def _resolve_permanent_candidates(ip: str, pid: int, target_addr: int,
-                                  max_depth: int = 5, cancel_event=None,
-                                  progress_cb=None) -> dict:
-    """Reverse-trace a known temporary address to stable module/static roots."""
-    max_depth = max(1, min(int(max_depth), 6))
+                                   max_depth: int = 5, cancel_event=None,
+                                   progress_cb=None) -> dict:
+    """Resolve a dynamic address using a fast direct pass, then a priority-guided graph."""
+    max_depth = max(1, min(int(max_depth), MAX_CHAIN_DEPTH))
+    maps = _get_maps_cached(ip, pid)
+    region_starts, region_rows = _build_region_lookup(maps)
+
+    # Fast path: a direct reference is common and avoids constructing millions
+    # of index entries when the target is already held by a stable object.
+    direct = _fast_direct_pointer_hits(ip, pid, int(target_addr), maps, cancel_event)
+    fast_candidates = []
+    for holder, off, region in direct:
+        if not _is_static_region(region):
+            continue
+        module_name, module_base, module_rel = _module_info_for_addr(holder, maps)
+        c = {
+            "base": holder, "offsets": [off], "depth": 1,
+            "region": region.get("name", "") or "static", "static": True,
+            "module_name": module_name or "main", "module_base": module_base,
+            "module_relative_offset": module_rel, "score": 0.0, "verified": False,
+        }
+        if _verify_candidate_twice(ip, pid, c, int(target_addr), cancel_event):
+            c["score"] = 220 + (35 if int(region.get("prot", 0)) & 0x4 else 0)
+            c["confidence"] = _candidate_confidence(c)
+            fast_candidates.append(c)
+    if fast_candidates:
+        fast_candidates.sort(key=lambda c: -c["score"])
+        return {"candidates": fast_candidates, "index_built": False,
+                "maps": maps, "method": "fast-direct"}
+
+    # Before constructing a multi-gigabyte exhaustive index, walk the natural
+    # object locality: modules first, then the address family containing each
+    # discovered parent.  This is the common-case algorithm used by practical
+    # pointer scanners and reuses the exhaustive index only when locality fails.
+    local_hits = pointer_chain_scan(
+        ip, pid, int(target_addr), max_depth=max_depth,
+        cancel_event=cancel_event, progress_cb=progress_cb)
+    local_candidates = []
+    for hit in local_hits:
+        if not hit.get("static"):
+            continue
+        holder = int(hit["base"])
+        module_name, module_base, module_rel = _module_info_for_addr(holder, maps)
+        candidate = dict(hit)
+        candidate.update({
+            "module_name": module_name or "main",
+            "module_base": module_base,
+            "module_relative_offset": module_rel,
+            "score": float(210 - 7 * int(hit.get("depth", 1))),
+            "verified": False,
+        })
+        if _verify_candidate_twice(
+                ip, pid, candidate, int(target_addr), cancel_event):
+            candidate["confidence"] = _candidate_confidence(candidate)
+            local_candidates.append(candidate)
+    if local_candidates:
+        local_candidates.sort(key=lambda c: (-c["score"], c["base"]))
+        return {"candidates": local_candidates, "index_built": False,
+                "maps": maps, "method": "locality-first"}
+
     index, maps, built = _get_reverse_pointer_index(
         ip, pid, cancel_event, progress_cb)
     if cancel_event and cancel_event.is_set():
         return {"candidates": [], "index_built": built, "maps": maps}
 
-    # Queue entries are (current_target, reverse_edges, visited_nodes).
-    # reverse_edges are [(holder, offset, region), ...] from target backwards.
-    queue = [(int(target_addr), [], {int(target_addr)})]
+    # Priority queue: higher-quality regions, shorter offsets and shorter chains
+    # are expanded first. This replaces list.pop(0), which is O(n).
+    queue = []
+    serial = 0
+    heapq.heappush(queue, (0, 0, serial, int(target_addr), [], {int(target_addr)}))
     found = []
     best_depth_for_node = {}
     processed = 0
@@ -2845,107 +3427,181 @@ def _resolve_permanent_candidates(ip: str, pid: int, target_addr: int,
     while queue and processed < _PTR_RESOLVE_MAX_NODES:
         if cancel_event and cancel_event.is_set():
             break
-        current, rev_edges, visited = queue.pop(0)
+        _, _, _, current, rev_edges, visited = heapq.heappop(queue)
         depth = len(rev_edges) + 1
         if depth > max_depth:
             continue
-        hits = index.query(current)
+
+        # Deterministic search: every node uses the same full offset window.
+        # Do not stop early because a nearby heap reference happened to exist;
+        # that can hide a valid module/static root farther from the target.
+        hits = index.query(current, _PTR_RESOLVE_OFFSET_MAX,
+                           _PTR_RESOLVE_OFFSET_STEP, _PTR_RESOLVE_MAX_HITS)
+
         for holder, off in hits:
             if holder in visited:
                 continue
-            region = next((r for r in maps
-                           if int(r["start"]) <= holder < int(r["end"])), None)
+            region = _region_for_addr(holder, region_starts, region_rows)
             if region is None:
                 continue
             is_static = _is_static_region(region)
             edge = (holder, off, region)
             new_rev = rev_edges + [edge]
             if is_static:
-                # Reverse order gives root -> target offsets.
                 chain = [e[1] for e in reversed(new_rev)]
                 module_name, module_base, module_rel = _module_info_for_addr(holder, maps)
-                aligned = sum(1 for x in chain if x % 8 == 0)
-                reasonable = sum(1 for x in chain if 0 <= x <= 0x200)
-                stable = bool(region.get("name")) or not (int(region.get("prot", 0)) & 0x2)
-                score = 100 + 60 + max(0, 35 - len(chain) * 7)
-                score += int(12 * aligned / max(len(chain), 1))
-                score += int(8 * reasonable / max(len(chain), 1))
-                score += 12 if stable else 0
-                cand = {
-                    "base": holder,
-                    "offsets": chain,
-                    "depth": len(chain),
-                    "region": region.get("name", "") or "static",
-                    "static": True,
+                aligned = sum(1 for x in chain if int(x) % 8 == 0)
+                reasonable = sum(1 for x in chain if abs(int(x)) <= 0x400)
+                prot = int(region.get("prot", 0))
+                name = str(region.get("name", "") or "")
+                executable_root = bool(prot & 0x4) or name.startswith("executable")
+                named_module = bool(name) and name not in _HEAP_NAME_HINTS
+                score = 150 + max(0, 50 - len(chain) * 7)
+                score += 35 if executable_root else 0
+                score += 20 if named_module else 0
+                score += int(14 * aligned / max(len(chain), 1))
+                score += int(12 * reasonable / max(len(chain), 1))
+                score -= min(abs(int(off)) // 0x400, 12)
+                found.append({
+                    "base": holder, "offsets": chain, "depth": len(chain),
+                    "region": name or "static", "static": True,
                     "module_name": module_name or "main",
                     "module_base": module_base,
                     "module_relative_offset": module_rel,
-                    "score": float(score),
-                    "verified": False,
-                }
-                found.append(cand)
+                    "score": float(score), "verified": False,
+                })
+                if len(found) >= _PTR_RESOLVE_MAX_FOUND:
+                    break
             elif depth < max_depth:
-                # Prefer shorter paths to the same holder; this is a small beam
-                # only, because the index itself is cached and cheap to query.
                 old = best_depth_for_node.get(holder)
                 if old is None or len(new_rev) < old:
                     best_depth_for_node[holder] = len(new_rev)
-                    queue.append((holder, new_rev, visited | {holder}))
+                    serial += 1
+                    priority = (
+                        -_region_priority(region),
+                        abs(int(off)) + len(new_rev) * 64,
+                        serial, holder, new_rev, visited | {holder}
+                    )
+                    if len(queue) < _PTR_RESOLVE_MAX_NODES:
+                        heapq.heappush(queue, priority)
             processed += 1
+        if len(found) >= _PTR_RESOLVE_MAX_FOUND:
+            break
         if progress_cb:
             progress_cb(processed, max(_PTR_RESOLVE_MAX_NODES, 1))
 
-    # Deduplicate by permanent representation and verify every candidate live.
     unique = {}
     for c in found:
         key = (c["module_name"], c["module_relative_offset"], tuple(c["offsets"]))
         old = unique.get(key)
         if old is None or c["score"] > old["score"]:
             unique[key] = c
-    candidates = list(unique.values())
+    candidates = sorted(unique.values(), key=lambda c: -c["score"])
+
+    def verify_batch(items):
+        verified_count = 0
+        for c in items:
+            if cancel_event and cancel_event.is_set():
+                break
+            if _verify_candidate_twice(ip, pid, c, int(target_addr), cancel_event):
+                verified_count += 1
+        return verified_count
+
+    # Verify candidates in deterministic batches.  The old fixed [:32] slice
+    # silently ignored valid lower-ranked chains. Stop once the UI has enough
+    # verified alternatives, otherwise exhaust the bounded candidate list.
+    verified_total = 0
+    for batch_start in range(0, len(candidates), 32):
+        verified_total += verify_batch(candidates[batch_start:batch_start + 32])
+        if verified_total >= 8 or (cancel_event and cancel_event.is_set()):
+            break
+
+    # Heap/object pointers can move while the map layout remains unchanged. If
+    # the cached index yielded no verified result, rebuild it once and retry.
+    if (not any(c.get("verified") for c in candidates) and
+            not built and not (cancel_event and cancel_event.is_set())):
+        add_log("No verified chain from cached pointer index; rebuilding once", "warn")
+        _invalidate_pointer_index(ip, pid)
+        fresh_index, fresh_maps, fresh_built = _get_reverse_pointer_index(
+            ip, pid, cancel_event, progress_cb)
+        if fresh_index is not None:
+            # Re-run the graph search against the fresh index by temporarily
+            # using the same deterministic traversal logic. Keep this bounded
+            # and avoid recursively calling the whole resolver.
+            maps = fresh_maps
+            region_starts, region_rows = _build_region_lookup(maps)
+            queue = [(0, 0, 0, int(target_addr), [], {int(target_addr)})]
+            fresh_found = []
+            best_depth_for_node = {}
+            serial2 = 0
+            processed2 = 0
+            while queue and processed2 < _PTR_RESOLVE_MAX_NODES:
+                if cancel_event and cancel_event.is_set():
+                    break
+                _, _, _, current, rev_edges, visited = heapq.heappop(queue)
+                depth = len(rev_edges) + 1
+                if depth > max_depth:
+                    continue
+                hits = fresh_index.query(current, _PTR_RESOLVE_OFFSET_MAX,
+                                         _PTR_RESOLVE_OFFSET_STEP, _PTR_RESOLVE_MAX_HITS)
+                for holder, off in hits:
+                    if holder in visited:
+                        continue
+                    region = _region_for_addr(holder, region_starts, region_rows)
+                    if region is None:
+                        continue
+                    new_rev = rev_edges + [(holder, off, region)]
+                    if _is_static_region(region):
+                        chain = [e[1] for e in reversed(new_rev)]
+                        mn, mb, mr = _module_info_for_addr(holder, maps)
+                        fresh_found.append({
+                            "base": holder, "offsets": chain, "depth": len(chain),
+                            "region": region.get("name", "") or "static", "static": True,
+                            "module_name": mn, "module_base": mb,
+                            "module_relative_offset": mr, "score": 0.0,
+                            "verified": False,
+                        })
+                    elif depth < max_depth:
+                        old = best_depth_for_node.get(holder)
+                        if old is None or len(new_rev) < old:
+                            best_depth_for_node[holder] = len(new_rev)
+                            serial2 += 1
+                            heapq.heappush(queue, (
+                                -_region_priority(region),
+                                abs(int(off)) + len(new_rev) * 64, serial2,
+                                holder, new_rev, visited | {holder}))
+                    processed2 += 1
+                    if len(fresh_found) >= _PTR_RESOLVE_MAX_FOUND:
+                        break
+                if len(fresh_found) >= _PTR_RESOLVE_MAX_FOUND:
+                    break
+            candidates = fresh_found
+            built = fresh_built
+            verified_total = 0
+            for batch_start in range(0, len(candidates), 32):
+                verified_total += verify_batch(
+                    candidates[batch_start:batch_start + 32])
+                if verified_total >= 8 or (cancel_event and cancel_event.is_set()):
+                    break
 
     for c in candidates:
-        if cancel_event and cancel_event.is_set():
-            break
-        ok, resolved, steps = _resolve_pointer_chain(ip, pid, c["base"], c["offsets"])
-        c["verified"] = bool(ok and resolved == int(target_addr))
-        c["resolved"] = int(resolved) if ok else 0
-        c["steps"] = steps
-        if c["verified"]:
-            c["score"] += 100
+        c["confidence"] = _candidate_confidence(c)
 
-    candidates.sort(key=lambda c: (-int(c["verified"]), -c["score"],
-                                   c["depth"], c["module_name"],
-                                   c["module_relative_offset"]))
-    for i, c in enumerate(candidates):
-        c["rank"] = i + 1
-    return {"candidates": candidates, "index_built": built, "maps": maps}
-
-
-# ── Dedicated pointer scanner ────────────────────────────────────────────────
-#
-# Pointer scanning is deliberately implemented as a STREAMING / BEAM search.
-# The previous implementation loaded every readable 8-byte slot from the PS5
-# into two giant NumPy arrays at every depth.  On a title with several GB of
-# mapped memory that meant several GB of RAM and another full network pass for
-# every depth, even when the first level had no useful hit.
-#
-# The scanner below keeps only the addresses that can participate in a chain and
-# processes memory in chunks.  It also tests struct offsets at EVERY depth: a
-# chain such as
-#
-#   static -> heap + 0x20 -> heap + 0x58 -> value
-#
-# is otherwise impossible to discover if the non-zero offset occurs after level
-# 1.  A bounded beam prevents a noisy game from exploding into millions of
-# possible chains.
-
-_PTR_STRUCT_MAX       = 0x200
-_PTR_STRUCT_STEP      = 8
-_PTR_CHUNK             = 0x2000000       # 32 MiB network reads
-_PTR_BEAM_MAX          = 12_000          # heap targets carried to next depth
-_PTR_SEARCH_TARGET_MAX = 200_000        # max unique target/offset values per pass
-_PTR_DEPTH_DEFAULT     = 4
+    # Single canonical ranking used for both the displayed winner and selection.
+    candidates.sort(key=lambda c: (
+        not bool(c.get("verified")),
+        not bool(c.get("module_name")),
+        int(c.get("depth", 99)),
+        -_region_priority(_region_for_addr(int(c.get("base", 0)), region_starts, region_rows) or {}),
+        sum(0 if int(x) % 8 == 0 else 1 for x in c.get("offsets", [])),
+        sum(abs(int(x)) for x in c.get("offsets", [])),
+        str(c.get("module_name", "")),
+        int(c.get("module_relative_offset", 0)),
+        tuple(int(x) for x in c.get("offsets", [])),
+        int(c.get("base", 0)),
+    ))
+    return {"candidates": candidates, "index_built": built,
+            "maps": maps, "method": "reverse-index"}
 
 
 def _pointer_readable_regions(maps: list) -> list:
@@ -2954,6 +3610,12 @@ def _pointer_readable_regions(maps: list) -> list:
     PROT_EXEC = 0x4
     MAX_REGION = 0x40000000  # 1 GiB; avoid obvious GPU/VM reservations
     out = []
+    classified = _pointer_region_class_cache.get(_pointer_map_fingerprint(maps), [])
+    uncached = sorted(
+        (int(row["start"]), int(row["end"])) for row in classified
+        if int(row.get("flags", 0)) & 1 and int(row["end"]) > int(row["start"])
+    )
+    uncached_starts = [row[0] for row in uncached]
     for r in maps:
         start, end = int(r.get("start", 0)), int(r.get("end", 0))
         prot = int(r.get("prot", 0))
@@ -2963,6 +3625,17 @@ def _pointer_readable_regions(maps: list) -> list:
             continue
         if end - start > MAX_REGION:
             continue
+        name = str(r.get("name", "") or "")
+        if name.startswith("libSce"):
+            continue
+        # Never discard a module/static root.  For anonymous writable memory,
+        # however, an overlap with an explicitly uncached classifier row means
+        # GPU/Garlic backing: reads are exceptionally slow and cannot contain a
+        # stable CPU pointer chain.
+        if not _is_static_region(r) and uncached:
+            ui = bisect.bisect_left(uncached_starts, end)
+            if ui > 0 and start < uncached[ui - 1][1]:
+                continue
         out.append(r)
     # Static/module regions first.  This lets a useful short chain be surfaced
     # quickly, while heap regions are still searched when they are needed to
@@ -2971,8 +3644,34 @@ def _pointer_readable_regions(maps: list) -> list:
     return out
 
 
+def _coalesce_pointer_regions(regions: list) -> list:
+    """Merge adjacent scan ranges to avoid one network request per tiny map.
+
+    PS5 games commonly expose thousands of contiguous 64 KiB mappings.  Their
+    individual names/protections are still retained in the original map table
+    used to classify hits; these rows are only transport ranges.
+    """
+    # Preserve the caller's priority order (static roots first).  Sorting here
+    # used to silently undo _pointer_readable_regions()'s smart ordering and
+    # made the scanner trawl low-value heaps before module roots.
+    ordered = list(regions)
+    merged = []
+    for region in ordered:
+        start, end = int(region["start"]), int(region["end"])
+        is_static = bool(_is_static_region(region))
+        if end <= start:
+            continue
+        if (merged and start == merged[-1]["end"] and
+                is_static == merged[-1]["static"]):
+            merged[-1]["end"] = end
+        else:
+            merged.append({"start": start, "end": end,
+                           "static": is_static})
+    return merged
+
+
 def _pointer_scan_chunk(sock: _ScanSocket, start: int, size: int,
-                        search_arr: np.ndarray, search_val_map: dict,
+                        target_arr: np.ndarray, target_chains: dict,
                         maps_sorted: list, map_starts: np.ndarray,
                         map_ends: np.ndarray, cancel_event=None):
     """Read one chunk and return matching (holder, target, offset, chain) hits."""
@@ -2981,7 +3680,26 @@ def _pointer_scan_chunk(sock: _ScanSocket, start: int, size: int,
     if trim < 8:
         return []
     vals = np.frombuffer(raw[:trim], dtype=np.uint64)
-    mask = np.isin(vals, search_arr)
+    # Match pointer values to target *ranges* instead of enumerating every
+    # target-offset value. The nearest sorted target is sufficient to decide
+    # whether at least one target lies within the signed offset window; exact
+    # target/chain combinations are expanded only for the tiny set of hits.
+    positions = np.searchsorted(target_arr, vals, side="left")
+    mask = np.zeros(vals.shape, dtype=bool)
+    right = positions < target_arr.size
+    if right.any():
+        ri = positions[right]
+        rv = vals[right]
+        rd = target_arr[ri].astype(np.int64) - rv.astype(np.int64)
+        mask[right] |= (np.abs(rd) <= _PTR_STRUCT_MAX) & (
+            (rd % _PTR_STRUCT_STEP) == 0)
+    left = positions > 0
+    if left.any():
+        li = positions[left] - 1
+        lv = vals[left]
+        ld = target_arr[li].astype(np.int64) - lv.astype(np.int64)
+        mask[left] |= (np.abs(ld) <= _PTR_STRUCT_MAX) & (
+            (ld % _PTR_STRUCT_STEP) == 0)
     indices = np.flatnonzero(mask)
     if not len(indices):
         return []
@@ -2991,8 +3709,19 @@ def _pointer_scan_chunk(sock: _ScanSocket, start: int, size: int,
     # Usually only a tiny number of slots match a pointer target.  Keep the
     # Python work limited to those hits rather than iterating over the chunk.
     for idx, holder_u in zip(indices.tolist(), holders.tolist()):
-        sv = np.uint64(vals[idx])
-        for target, soff, chain in search_val_map.get(sv, ()):
+        value = int(vals[idx])
+        lo = int(np.searchsorted(target_arr,
+                                 np.uint64(max(_ADDR_MIN, value - _PTR_STRUCT_MAX)),
+                                 side="left"))
+        hi = int(np.searchsorted(target_arr,
+                                 np.uint64(min(_ADDR_MAX, value + _PTR_STRUCT_MAX)),
+                                 side="right"))
+        for target_u in target_arr[lo:hi].tolist():
+            target = int(target_u)
+            soff = target - value
+            if soff % _PTR_STRUCT_STEP:
+                continue
+            chain = target_chains[target]
             # A pointer holder itself must be inside a mapped region.
             mi = int(np.searchsorted(map_starts, holder_u, side="right") - 1)
             if mi < 0 or holder_u >= int(map_ends[mi]):
@@ -3037,7 +3766,8 @@ def pointer_chain_scan(ip: str, pid: int,
         add_log("Pointer scan: memory map is empty", "warn")
         return []
 
-    readable = _pointer_readable_regions(maps)
+    readable_maps = _pointer_readable_regions(maps)
+    readable = _coalesce_pointer_regions(readable_maps)
     if not readable:
         add_log("Pointer scan: no readable data regions", "warn")
         return []
@@ -3063,63 +3793,74 @@ def pointer_chain_scan(ip: str, pid: int,
             current_targets = dict(list(current_targets.items())[:_PTR_BEAM_MAX])
             add_log(f"Depth {depth}: beam capped at {_PTR_BEAM_MAX:,} targets", "warn")
 
-        sweep_offsets = range(0, _PTR_STRUCT_MAX + 1, _PTR_STRUCT_STEP)
-        search_val_map = {}
-        for tgt, chain in current_targets.items():
-            for soff in sweep_offsets:
-                sv = int(tgt) - int(soff)
-                if not (_ADDR_MIN <= sv <= _ADDR_MAX):
-                    continue
-                search_val_map.setdefault(np.uint64(sv), []).append(
-                    (int(tgt), int(soff), chain))
-
-        # If the beam is still too large, keep exact matches rather than turning
-        # one depth into an enormous np.isin lookup.  A later explicit deep scan
-        # can widen the beam without freezing the UI for minutes.
-        if len(search_val_map) > _PTR_SEARCH_TARGET_MAX:
-            exact = {}
-            for tgt, chain in current_targets.items():
-                exact[np.uint64(tgt)] = [(int(tgt), 0, chain)]
-            search_val_map = exact
-            add_log(f"Depth {depth}: target set too large; using exact-pointer pass",
-                    "warn")
-
-        search_arr = np.fromiter(search_val_map.keys(), dtype=np.uint64)
+        target_arr = np.sort(np.fromiter(current_targets.keys(), dtype=np.uint64))
         next_targets = {}
         static_hits = 0
         heap_hits = 0
         depth_done = 0
 
         add_log(f"Pointer scan depth {depth}: {len(current_targets):,} targets, "
-                f"{len(search_arr):,} pointer values")
+                f"interval-matched ±{hex(_PTR_STRUCT_MAX)}")
 
         sock = None
         try:
             sock = _ScanSocket(ip, pid)
-            for region in readable:
+            target_prefixes = {int(tgt) >> 32 for tgt in current_targets}
+            depth_regions = sorted(
+                readable,
+                key=lambda r: (
+                    not bool(r.get("static")),
+                    (int(r["start"]) >> 32) not in target_prefixes,
+                    int(r["start"])))
+            for region in depth_regions:
                 if cancel_event and cancel_event.is_set():
+                    break
+                # On the final level only static holders can produce a
+                # permanent chain. Heap holders cannot be expanded again, so
+                # reading them is both useless and potentially hundreds of MiB.
+                if depth == max_depth and not region.get("static"):
+                    add_log(f"Depth {depth}: static-root pass complete; "
+                            "skipping terminal heap scan")
+                    break
+                is_local = (int(region["start"]) >> 32) in target_prefixes
+                if (not region.get("static") and not is_local and next_targets):
+                    add_log(f"Depth {depth}: local heap produced "
+                            f"{len(next_targets):,} parents; deferring unrelated "
+                            "address families")
                     break
                 rstart, rend = int(region["start"]), int(region["end"])
                 start = rstart + ((-rstart) % 8)
+                chunk_limit = _PTR_CHUNK
                 while start < rend:
                     if cancel_event and cancel_event.is_set():
                         break
-                    size = min(_PTR_CHUNK, rend - start)
+                    size = min(chunk_limit, rend - start)
                     size -= size % 8
                     if size < 8:
                         break
                     try:
                         hits = _pointer_scan_chunk(
-                            sock, start, size, search_arr, search_val_map,
+                            sock, start, size, target_arr, current_targets,
                             maps_sorted, map_starts, map_ends, cancel_event)
                     except Exception as exc:
                         add_log(f"ptr scan read err @ {hex(start)}: {exc}", "warn")
+                        if size > 0x100000:
+                            chunk_limit = max(0x100000, size // 2)
+                            add_log(f"Retrying {hex(start)} with "
+                                    f"{chunk_limit / 1048576:.0f} MiB chunks",
+                                    "warn")
+                            continue
                         start += size
                         depth_done += size
                         continue
 
                     for holder, target, soff, old_chain, is_static, rname in hits:
-                        new_chain = list(old_chain) + [soff]
+                        # The search walks backward (target -> holder), while
+                        # resolution walks forward (static root -> target).
+                        # Each newly discovered outer offset therefore belongs
+                        # at the front. Appending produced invalid chains for
+                        # every depth greater than one.
+                        new_chain = [soff] + list(old_chain)
                         if is_static:
                             candidates.append({
                                 "base": holder,
@@ -3146,6 +3887,8 @@ def pointer_chain_scan(ip: str, pid: int,
 
                     start += size
                     depth_done += size
+                    if chunk_limit < _PTR_CHUNK:
+                        chunk_limit = min(_PTR_CHUNK, chunk_limit * 2)
                     if progress_cb:
                         # Map the whole pass into this depth's slice.  This is
                         # real progress, unlike the old spinner/heartbeat.
@@ -3158,11 +3901,28 @@ def pointer_chain_scan(ip: str, pid: int,
         add_log(f"Depth {depth}: {static_hits} static, {heap_hits} heap expansions")
         current_targets = next_targets
 
-        # Static candidates are the useful output.  Once one exists at a short
-        # depth, do not force the user to wait through unrelated deeper passes.
-        if candidates and any(c["static"] and c["depth"] == depth for c in candidates):
+        # A broad signed-offset sweep can produce a static coincidence whose
+        # heap object changes before the pass ends.  Never stop on an unverified
+        # hit: resolve each fresh chain twice and discard stale candidates.
+        depth_static = [c for c in candidates
+                        if c["static"] and c["depth"] == depth]
+        verified_static = []
+        for candidate in depth_static:
+            if _verify_candidate_twice(
+                    ip, pid, candidate, int(target_addr), cancel_event):
+                verified_static.append(candidate)
+        if depth_static:
+            stale_ids = {id(c) for c in depth_static if c not in verified_static}
+            candidates = [c for c in candidates if id(c) not in stale_ids]
+            if stale_ids:
+                add_log(f"Depth {depth}: rejected {len(stale_ids)} stale static "
+                        "candidate(s)", "warn")
+
+        # Once a verified static root exists at a short depth, avoid unrelated
+        # deeper passes.
+        if verified_static:
             add_log(f"Pointer scan found {sum(1 for c in candidates if c['static'])} "
-                    f"static candidate(s) at depth {depth}")
+                    f"verified static candidate(s) at depth {depth}")
             break
 
     candidates.sort(key=lambda c: (not c["static"], c["depth"], c["base"]))
@@ -3558,7 +4318,12 @@ def screen_connect(stdscr) -> str:
         return screen_proc_select(stdscr, procs)
     except Exception as e:
         safe_addstr(stdscr, 8, 3, f"X Failed: {e}".ljust(60), color(C_ERR))
-        safe_addstr(stdscr, 10, 3, "Press any key to retry.", color(C_NORM))
+        safe_addstr(stdscr, 10, 3,
+                    "Reminder: start the ps5debug payload on your console,",
+                    color(C_WARN) | curses.A_BOLD)
+        safe_addstr(stdscr, 11, 3,
+                    "then verify the PS5 IP address and try again.", color(C_WARN))
+        safe_addstr(stdscr, 13, 3, "Press any key to retry.", color(C_NORM))
         stdscr.refresh()
         stdscr.getch()
         return "connect"
@@ -3746,16 +4511,12 @@ def _main_menu_entries():
     palette instead of competing with the scan/results/cheat workflow.
     """
     return [
-        ("S", "First Scan",  "scan_first",  C_NORM),
-        ("N", "Next Scan",   "scan_next",   C_NORM),
-        ("R", "Results",     "results",     C_ACC),
-        ("C", "Cheat List",  "cheat_list",  C_NORM),
-        ("P", "Pointer Scan", "pointer_scan", C_ACC),
-        ("I", "Import Cheats", "import",    C_OK),
-        ("E", "Export Cheats", "export",    C_OK),
-        ("T", "Settings",    "scan_settings", C_ACC),
-        ("L", "Logs",        "log",         C_NORM),
-        ("Q", "Quit",        None,           C_ERR),
+        ("S", "First Scan", "scan_first", C_NORM),
+        ("N", "Next Scan",  "scan_next",  C_NORM),
+        ("R", "Results",    "results",    C_ACC),
+        ("C", "Cheats",     "cheat_list", C_NORM),
+        ("T", "Settings",   "scan_settings", C_ACC),
+        ("Q", "Quit",       None,          C_ERR),
     ]
 
 
@@ -3774,8 +4535,8 @@ def screen_main(stdscr):
         # expose low-frequency destructive/debug utilities here.
         sections = [
             ("SCAN", 0, 3),
-            ("CHEATS", 3, 2),
-            ("TOOLS", 5, 4),
+            ("CHEATS", 3, 1),
+            ("SETUP", 4, 2),
         ]
         if w >= 78:
             col_x = [3, max(25, w // 3), max(50, (2 * w) // 3)]
@@ -3788,8 +4549,8 @@ def screen_main(stdscr):
                         continue
                     key, label, _, cp = menu[i]
                     unavailable = (
-                        (label == "Next Scan" and not state["scan_results"]) or
-                        (label == "Results" and not state["scan_results"]) or
+                        (label == "Next Scan" and len(state["scan_results"]) == 0) or
+                        (label == "Results" and len(state["scan_results"]) == 0) or
                         (label == "Export Cheats" and not state["cheats"])
                     )
                     attr = (color(C_SEL) | curses.A_BOLD if i == sel else
@@ -3800,8 +4561,8 @@ def screen_main(stdscr):
             safe_addstr(stdscr, 5, 3, "WORKFLOW", color(C_TITLE) | curses.A_BOLD)
             for i, (key, label, _, cp) in enumerate(menu):
                 unavailable = (
-                    (label == "Next Scan" and not state["scan_results"]) or
-                    (label == "Results" and not state["scan_results"]) or
+                    (label == "Next Scan" and len(state["scan_results"]) == 0) or
+                    (label == "Results" and len(state["scan_results"]) == 0) or
                     (label == "Export Cheats" and not state["cheats"])
                 )
                 attr = (color(C_SEL) | curses.A_BOLD if i == sel else
@@ -3839,8 +4600,15 @@ def screen_main(stdscr):
         elif key == ord('?'):
             do_help(stdscr)
         else:
-            for k, _, action, _ in menu:
+            for k, label, action, _ in menu:
                 if key in (ord(k.lower()), ord(k.upper())):
+                    unavailable = (
+                        (label == "Next Scan" and len(state["scan_results"]) == 0) or
+                        (label == "Results" and len(state["scan_results"]) == 0)
+                    )
+                    if unavailable:
+                        add_log(f"{label} is unavailable until a scan is complete", "warn")
+                        break
                     if action is None:
                         return None
                     result = dispatch(stdscr, action)
@@ -3853,10 +4621,10 @@ def do_help(stdscr) -> None:
         "Navigation   ↑↓ Select   Enter Run   Esc Back   Q Quit",
         "Global       / Command Palette   ? Help",
         "Scanning     S First Scan   N Next Scan   R Results",
-        "Results      A Apply   C Cheat   P Pointer   N Next   M More",
+        "Results      A Apply   C Cheat   P Pointer   R Permanent",
         "Cheats       Enter Inspect   A Apply   D Delete",
-        "Pointer      E Edit   T Test   S Save Cheat",
-        "Tools        I Import   E Export   T Settings   L Logs",
+        "Advanced     / Command Palette → import/export/logs/pointer tools",
+        "Setup        T Settings",
         "",
         "Routine success messages stay in the status line;",
         "errors and destructive operations remain modal.",
@@ -4398,6 +5166,10 @@ def _refresh_visible_locked(ip: str, pid: int, addrs: list, width: int,
 def _results_more_menu(stdscr):
     """Low-frequency Results actions, kept out of the primary action bar."""
     options = [
+        ("Explore Values Near This Item", "nearby_browse"),
+        ("Find a Nearby Item by Changing It", "nearby"),
+        ("Preview Selected Value", "preview"),
+        ("Find Matching Nearby Item (Group Test)", "batch_preview"),
         ("Write Address", "write"),
         ("Verify Pointer", "ptr_verify"),
         ("Undo Scan", "undo_results"),
@@ -4440,10 +5212,451 @@ def _results_more_menu(stdscr):
                 return "undo"
             if action == "flush_maps":
                 return "flush_maps"
+            if action == "nearby":
+                return "nearby"
+            if action == "nearby_browse":
+                return "nearby_browse"
+            if action == "preview":
+                return "preview"
+            if action == "batch_preview":
+                return "batch_preview"
             result = dispatch(stdscr, action)
             if result == "proc":
                 return "proc"
             return
+
+
+def _snapshot_anchor_window(ip: str, pid: int, anchor: int, width: int,
+                            radius: int) -> tuple:
+    """Snapshot aligned values near an anchor, clipped to its readable map."""
+    maps = _get_maps_cached(ip, pid)
+    owner = next((r for r in maps if int(r["start"]) <= int(anchor) < int(r["end"])),
+                 None)
+    if owner is None or not (int(owner.get("prot", 0)) & 1):
+        raise ValueError("anchor is not inside a readable memory map")
+    radius = max(width, min(int(radius), 0x10000))
+    start = max(int(owner["start"]), int(anchor) - radius)
+    end = min(int(owner["end"]), int(anchor) + radius + width)
+    start += (-start) % width
+    length = end - start
+    length -= length % width
+    if length < width:
+        raise ValueError("anchor window is smaller than one value")
+    raw = ps5_read(ip, pid, start, length)
+    values = np.frombuffer(raw, dtype=_NP_VALUE_DTYPE[width]).copy()
+    addresses = (np.uint64(start) +
+                 np.arange(values.size, dtype=np.uint64) * np.uint64(width))
+    return addresses, values
+
+
+def do_browse_nearby(stdscr, anchor: int) -> None:
+    """Populate Results with plausible nearby values without requiring a change."""
+    width = int(state.get("scan_width", 4))
+    try:
+        addresses, values = _snapshot_anchor_window(
+            state["ip"], int(state["pid"]), int(anchor), width, 0x400)
+    except Exception as exc:
+        message_box(stdscr, [f"Could not inspect nearby values: {exc}"],
+                    "Nearby Candidates", C_ERR)
+        return
+    # Inventory counts/counters are normally nonzero and modest. Keep the
+    # ceiling generous, exclude the known anchor, and cap the visual trial list
+    # so ordinary users are not handed hundreds of meaningless fields.
+    plausible = (values > 0) & (values <= min(WIDTH_MAX[width], 999999))
+    plausible &= addresses != np.uint64(anchor)
+    candidate_addr = addresses[plausible]
+    candidate_values = values[plausible]
+    if not len(candidate_addr):
+        message_box(stdscr, ["No plausible nearby item values were found."],
+                    "Nearby Candidates", C_WARN)
+        return
+    order = np.argsort(np.abs(candidate_addr.astype(np.int64) - int(anchor)))
+    order = order[:256]
+    candidate_addr = candidate_addr[order].copy()
+    candidate_values = candidate_values[order].copy()
+    if not confirm_box(
+            stdscr,
+            f"Found {len(candidate_addr):,} nearby candidates. Open them for safe visual preview?",
+            "Nearby Candidates"):
+        return
+    state["scan_results"] = candidate_addr
+    state["scan_values"] = candidate_values
+    state["scan_pid"] = state["pid"]
+    state["scan_unknown"] = False
+    state["scan_truncated"] = False
+    state["scan_dropped"] = set()
+    state["scan_history"].clear()
+    add_log(f"Nearby browse @ {hex(int(anchor))}: "
+            f"{len(candidate_addr):,} plausible candidates")
+
+
+def do_discover_nearby(stdscr, anchor: int) -> None:
+    """Find neighboring fields that change after an anchored item change."""
+    width = int(state.get("scan_width", 4))
+    stdscr.clear()
+    draw_border(stdscr, "ANCHORED GROUP DISCOVERY")
+    radius_text = input_box(stdscr, "Radius (hex): ", 3, 3,
+                            width=12, default="0x400")
+    try:
+        radius = int(radius_text, 0)
+    except ValueError:
+        message_box(stdscr, ["Invalid radius."], "Error", C_ERR)
+        return
+    try:
+        before_addr, before_val = _snapshot_anchor_window(
+            state["ip"], int(state["pid"]), int(anchor), width, radius)
+    except Exception as exc:
+        message_box(stdscr, [f"Could not snapshot anchor: {exc}"],
+                    "Nearby Discovery", C_ERR)
+        return
+
+    message_box(stdscr, [
+        f"Captured {len(before_addr):,} nearby {WIDTH_LABEL[width]} fields.",
+        f"Anchor: {hex(int(anchor))}   Radius: ±{hex(radius)}",
+        "Change Red-Item, Green-Item, or another nearby item now.",
+        "Do not change Blue-Item during this comparison.",
+        "Press any key here only after the in-game change.",
+    ], "Nearby Baseline", C_WARN)
+    try:
+        after_addr, after_val = _snapshot_anchor_window(
+            state["ip"], int(state["pid"]), int(anchor), width, radius)
+    except Exception as exc:
+        message_box(stdscr, [f"Could not read comparison snapshot: {exc}"],
+                    "Nearby Discovery", C_ERR)
+        return
+    if not np.array_equal(before_addr, after_addr):
+        message_box(stdscr, ["The containing memory map changed; retry after the game settles."],
+                    "Nearby Discovery", C_ERR)
+        return
+    changed = before_val != after_val
+    changed_addr = before_addr[changed].copy()
+    old_values = before_val[changed].copy()
+    new_values = after_val[changed].copy()
+    if not len(changed_addr):
+        message_box(stdscr, ["No nearby aligned values changed.",
+                             "Try a larger radius or verify the item changed."],
+                    "Nearby Discovery", C_WARN)
+        return
+    order = np.argsort(np.abs(changed_addr.astype(np.int64) - int(anchor)))
+    changed_addr, old_values, new_values = (
+        changed_addr[order], old_values[order], new_values[order])
+    lines = [f"{len(changed_addr):,} nearby fields changed:"]
+    for addr, old, new in zip(changed_addr[:18], old_values[:18], new_values[:18]):
+        lines.append(f"{hex(int(addr))}  {int(old)} → {int(new)}  "
+                     f"({int(addr) - int(anchor):+#x})")
+    if len(changed_addr) > 18:
+        lines.append(f"…and {len(changed_addr) - 18:,} more")
+    message_box(stdscr, lines, "Nearby Candidates", C_OK)
+    if confirm_box(stdscr, "Replace Results with these nearby candidates?",
+                   "Nearby Discovery"):
+        state["scan_results"] = changed_addr
+        state["scan_values"] = new_values
+        state["scan_pid"] = state["pid"]
+        state["scan_unknown"] = False
+        state["scan_truncated"] = False
+        state["scan_dropped"] = set()
+        state["scan_history"].clear()
+        add_log(f"Anchored discovery @ {hex(int(anchor))}: "
+                f"{len(changed_addr):,} nearby candidates")
+
+
+def do_preview_candidate(stdscr, address: int) -> None:
+    """Temporarily change one candidate, then always restore its original value."""
+    width = int(state.get("scan_width", 4))
+    validation = _validate_addr_in_maps(
+        state["ip"], int(state["pid"]), int(address), width,
+        ttl_override=0.0)
+    if validation:
+        message_box(stdscr, [validation], "Preview Blocked", C_ERR)
+        return
+    try:
+        original_raw = ps5_read(state["ip"], int(state["pid"]),
+                                int(address), width)
+        original = struct.unpack(WIDTH_FMT[width], original_raw)[0]
+    except Exception as exc:
+        message_box(stdscr, [f"Could not read the original value: {exc}"],
+                    "Preview Blocked", C_ERR)
+        return
+
+    stdscr.clear()
+    draw_border(stdscr, "SAFE CANDIDATE PREVIEW")
+    safe_addstr(stdscr, 2, 3, f"Current value: {original}", color(C_NORM))
+    preview_text = input_box(stdscr, "Temporary value: ", 4, 3,
+                             width=24, default=str(original + 1))
+    try:
+        preview = int(preview_text, 0)
+        if not 0 <= preview <= WIDTH_MAX[width]:
+            raise ValueError
+    except ValueError:
+        message_box(stdscr, [f"Enter a value from 0 to {WIDTH_MAX[width]}."],
+                    "Invalid Preview", C_ERR)
+        return
+    if preview == original:
+        message_box(stdscr, ["The preview value must differ from the original."],
+                    "Invalid Preview", C_WARN)
+        return
+
+    try:
+        acknowledged, verified, actual = _write_value_verified(
+            state["ip"], int(state["pid"]), int(address), preview, width)
+        if not (acknowledged and verified):
+            raise RuntimeError(f"write verification returned {actual}")
+    except Exception as exc:
+        message_box(stdscr, [f"Preview write failed: {exc}",
+                             "The original value was not intentionally changed."],
+                    "Preview Failed", C_ERR)
+        return
+
+    identified = False
+    restore_error = None
+    try:
+        identified = confirm_box(
+            stdscr,
+            f"Temporary value {preview} is active. Did the intended in-game item change?",
+            "Inspect the Game")
+    finally:
+        try:
+            acknowledged, verified, actual = _write_value_verified(
+                state["ip"], int(state["pid"]), int(address), original, width)
+            if not (acknowledged and verified):
+                restore_error = f"restore verification returned {actual}"
+        except Exception as exc:
+            restore_error = str(exc)
+
+    if restore_error:
+        add_log(f"URGENT: preview restore failed @ {hex(int(address))}: "
+                f"{restore_error}", "error")
+        message_box(stdscr, [
+            "Automatic restore FAILED.",
+            f"Address: {hex(int(address))}",
+            f"Expected original value: {original}",
+            f"Error: {restore_error}",
+            "Do not preview another candidate until this is corrected.",
+        ], "Restore Failed", C_ERR)
+        return
+
+    add_log(f"Preview restored {hex(int(address))} to {original}")
+    if identified:
+        message_box(stdscr, ["Candidate confirmed and original value restored.",
+                             "Name the discovered item on the next screen."],
+                    "Item Identified", C_OK)
+        _add_cheat_at(stdscr, int(address))
+    else:
+        message_box(stdscr, ["Original value restored.",
+                             "Select another nearby candidate to continue."],
+                    "Candidate Rejected", C_NORM)
+
+
+def do_batch_preview_matching(stdscr) -> None:
+    """Temporarily rewrite matching Results as one verified transaction."""
+    width = int(state.get("scan_width", 4))
+    results = state.get("scan_results")
+    if results is None or len(results) == 0:
+        message_box(stdscr, ["There are no nearby Results to preview."],
+                    "Batch Preview", C_WARN)
+        return
+
+    stdscr.clear()
+    draw_border(stdscr, "TRANSACTIONAL BATCH PREVIEW")
+    match_text = input_box(stdscr, "Current value to match: ", 3, 3,
+                           width=20, default="1")
+    replacement_text = input_box(stdscr, "Temporary replacement: ", 5, 3,
+                                 width=20, default="3")
+    try:
+        match_value = int(match_text, 0)
+        replacement = int(replacement_text, 0)
+        if not (0 <= match_value <= WIDTH_MAX[width] and
+                0 <= replacement <= WIDTH_MAX[width]):
+            raise ValueError
+        if match_value == replacement:
+            raise ValueError
+    except ValueError:
+        message_box(stdscr, [f"Enter two different values from 0 to {WIDTH_MAX[width]}."],
+                    "Invalid Batch Preview", C_ERR)
+        return
+
+    originals = []
+    rejected = []
+    result_addrs = sorted({int(raw_addr) for raw_addr in results})
+    try:
+        maps = _get_maps_cached(state["ip"], int(state["pid"]), ttl_override=0.0)
+        first, last = result_addrs[0], result_addrs[-1]
+        owner = next((m for m in maps
+                      if int(m["start"]) <= first and last + width <= int(m["end"])),
+                     None)
+        if owner is None or not (int(owner.get("prot", 0)) & 2):
+            raise RuntimeError("nearby Results are not inside one writable memory map")
+        span = last - first + width
+        if span > 0x20000:
+            raise RuntimeError("nearby Results span is unexpectedly large")
+        live_raw = ps5_read(state["ip"], int(state["pid"]), first, span)
+        if len(live_raw) != span:
+            raise RuntimeError("partial nearby snapshot")
+        for addr in result_addrs:
+            offset = addr - first
+            live = struct.unpack_from(WIDTH_FMT[width], live_raw, offset)[0]
+            if live == match_value:
+                originals.append((addr, live))
+    except Exception as exc:
+        message_box(stdscr, [f"Could not capture a safe live snapshot: {exc}"],
+                    "Batch Preview Blocked", C_ERR)
+        return
+
+    # A broad nearby window can contain flags and object metadata.  Keep the
+    # transaction bounded so rollback remains quick even on a weak connection.
+    if len(originals) > 64:
+        message_box(stdscr, [
+            f"{len(originals):,} matching fields exceed the safe batch limit of 64.",
+            "Narrow Results or preview smaller groups first.",
+        ], "Batch Preview Blocked", C_ERR)
+        return
+    if not originals:
+        message_box(stdscr, [f"No live Results currently equal {match_value}."],
+                    "Batch Preview", C_WARN)
+        return
+    if not confirm_box(stdscr,
+            f"Temporarily change {len(originals)} nearby fields from "
+            f"{match_value} to {replacement}, then restore all of them?",
+            "Confirm Batch Preview"):
+        return
+
+    written = []
+    write_error = None
+    identified = False
+    try:
+        for addr, original in originals:
+            ack, verified, actual = _write_value_verified(
+                state["ip"], int(state["pid"]), addr, replacement, width)
+            if not (ack and verified):
+                raise RuntimeError(
+                    f"write verification failed at {hex(addr)}: {actual}")
+            written.append((addr, original))
+        identified = confirm_box(stdscr,
+            f"{len(written)} matching fields are temporarily {replacement}. "
+            "Did any intended in-game item change?",
+            "Inspect the Game")
+    except Exception as exc:
+        write_error = str(exc)
+    finally:
+        unresolved = []
+        for addr, original in reversed(written):
+            restored = False
+            last_error = "unknown restore error"
+            for _attempt in range(3):
+                try:
+                    ack, verified, actual = _write_value_verified(
+                        state["ip"], int(state["pid"]), addr, original, width)
+                    if ack and verified:
+                        restored = True
+                        break
+                    last_error = f"verification returned {actual}"
+                except Exception as exc:
+                    last_error = str(exc)
+            if not restored:
+                unresolved.append((addr, original, last_error))
+
+    if unresolved:
+        for addr, original, error in unresolved:
+            add_log(f"URGENT: batch restore failed @ {hex(addr)} to "
+                    f"{original}: {error}", "error")
+        lines = ["Automatic batch restore FAILED for:"]
+        lines.extend(f"{hex(addr)} → {original}: {error}"
+                     for addr, original, error in unresolved[:8])
+        lines.append("Do not run another preview until these are corrected.")
+        message_box(stdscr, lines, "Batch Restore Failed", C_ERR)
+        return
+    if write_error:
+        message_box(stdscr, [f"Batch stopped: {write_error}",
+                             f"Restored all {len(written)} changed fields."],
+                    "Batch Preview Rolled Back", C_ERR)
+        return
+    add_log(f"Batch preview restored {len(written)} fields "
+            f"({match_value} → {replacement} → {match_value})")
+    note = (f"Skipped {len(rejected)} unreadable/non-writable Results."
+            if rejected else "All selected fields were writable and verified.")
+    message_box(stdscr, [f"Restored all {len(written)} fields to {match_value}.", note],
+                "Batch Preview Complete", C_OK)
+    if identified and len(originals) > 1 and confirm_box(
+            stdscr,
+            "The item is in this group. Isolate its exact address now?",
+            "Guided Isolation"):
+        _isolate_matching_group(stdscr, originals, replacement, width)
+
+
+def _preview_group_once(stdscr, candidates: list, replacement: int,
+                        width: int) -> tuple:
+    """Preview one candidate group and restore it; return (changed, error)."""
+    written = []
+    changed = False
+    failure = None
+    try:
+        for addr, original in candidates:
+            ack, verified, actual = _write_value_verified(
+                state["ip"], int(state["pid"]), int(addr), replacement, width)
+            if not (ack and verified):
+                raise RuntimeError(f"write verification failed at {hex(int(addr))}: {actual}")
+            written.append((int(addr), original))
+        changed = confirm_box(
+            stdscr,
+            f"Testing {len(candidates)} possible fields at value {replacement}. "
+            "Did the same item change?",
+            "Guided Isolation")
+    except Exception as exc:
+        failure = str(exc)
+    finally:
+        unresolved = []
+        for addr, original in reversed(written):
+            restored = False
+            last_error = "unknown restore error"
+            for _attempt in range(3):
+                try:
+                    ack, verified, actual = _write_value_verified(
+                        state["ip"], int(state["pid"]), addr, original, width)
+                    if ack and verified:
+                        restored = True
+                        break
+                    last_error = f"verification returned {actual}"
+                except Exception as exc:
+                    last_error = str(exc)
+            if not restored:
+                unresolved.append(f"{hex(addr)}: {last_error}")
+        if unresolved:
+            failure = "restore failed — " + "; ".join(unresolved[:4])
+    return changed, failure
+
+
+def _isolate_matching_group(stdscr, candidates: list, replacement: int,
+                            width: int) -> None:
+    """Binary-search a confirmed group with reversible visual previews."""
+    remaining = list(candidates)
+    while len(remaining) > 1:
+        test_group = remaining[:(len(remaining) + 1) // 2]
+        changed, failure = _preview_group_once(
+            stdscr, test_group, replacement, width)
+        if failure:
+            add_log(f"Guided isolation stopped: {failure}", "error")
+            message_box(stdscr, [failure,
+                                 "Isolation stopped; no further group was tested."],
+                        "Isolation Stopped", C_ERR)
+            return
+        tested = {int(addr) for addr, _ in test_group}
+        remaining = (test_group if changed else
+                     [item for item in remaining if int(item[0]) not in tested])
+        if not remaining:
+            message_box(stdscr, [
+                "The visual answers were inconsistent; no candidate remains.",
+                "Retry when the item count is visible and the game is settled.",
+            ], "Isolation Inconclusive", C_WARN)
+            return
+    address, original = remaining[0]
+    message_box(stdscr, [
+        "Exact nearby item field identified.",
+        f"Address: {hex(int(address))}",
+        f"Current value: {original}",
+        "The original value is restored.",
+    ], "Item Identified", C_OK)
+    if confirm_box(stdscr, "Save this address as a cheat now?", "Save Item"):
+        _add_cheat_at(stdscr, int(address))
 
 
 def do_show_results(stdscr) -> None:
@@ -4656,6 +5869,26 @@ def do_show_results(stdscr) -> None:
                 stdscr.nodelay(True)
                 if more_result == "proc":
                     return "proc"
+                if more_result == "nearby":
+                    stdscr.nodelay(False)
+                    do_discover_nearby(stdscr, int(results[sel]))
+                    stdscr.nodelay(True)
+                    results = state["scan_results"]
+                if more_result == "nearby_browse":
+                    stdscr.nodelay(False)
+                    do_browse_nearby(stdscr, int(results[sel]))
+                    stdscr.nodelay(True)
+                    results = state["scan_results"]
+                if more_result == "preview":
+                    stdscr.nodelay(False)
+                    do_preview_candidate(stdscr, int(results[sel]))
+                    stdscr.nodelay(True)
+                    results = state["scan_results"]
+                if more_result == "batch_preview":
+                    stdscr.nodelay(False)
+                    do_batch_preview_matching(stdscr)
+                    stdscr.nodelay(True)
+                    results = state["scan_results"]
                 if more_result == "undo":
                     if state["scan_history"]:
                         entry = state["scan_history"].pop()
@@ -5322,11 +6555,33 @@ def do_import(stdscr) -> None:
                  "process": state["proc_name"], "session": state["session"],
                  "imported_from": str(path)}
             if "base" in c:
-                e["base"] = _parse_int_field(c["base"], "base")
-                e["offsets"] = [_parse_int_field(x, "offset") for x in c.get("offsets", [])]
+                base = _parse_int_field(c["base"], "base")
+                if not (_ADDR_MIN <= base <= _ADDR_MAX):
+                    raise ValueError(f"'{e['name']}' has an invalid base address")
+                raw_offsets = c.get("offsets", [])
+                if not isinstance(raw_offsets, list) or not (1 <= len(raw_offsets) <= MAX_CHAIN_DEPTH):
+                    raise ValueError(f"'{e['name']}' has an invalid pointer depth")
+                offsets = [_parse_int_field(x, "offset") for x in raw_offsets]
+                if any(abs(x) > _PTR_RESOLVE_OFFSET_MAX for x in offsets):
+                    raise ValueError(f"'{e['name']}' has an unreasonable pointer offset")
+                e["base"] = base
+                e["offsets"] = offsets
                 e["address"] = 0
+                if c.get("module_name") is not None:
+                    module_name = str(c.get("module_name")).strip()
+                    if not module_name or len(module_name) > 512:
+                        raise ValueError(f"'{e['name']}' has an invalid module name")
+                    e["module_name"] = module_name
+                if c.get("module_relative_offset") is not None:
+                    mrel = _parse_int_field(c["module_relative_offset"], "module relative offset")
+                    if mrel < 0 or mrel > _ADDR_MAX:
+                        raise ValueError(f"'{e['name']}' has an invalid module-relative offset")
+                    e["module_relative_offset"] = mrel
             elif "address" in c:
-                e["address"] = _parse_int_field(c["address"], "address")
+                address = _parse_int_field(c["address"], "address")
+                if not (_ADDR_MIN <= address <= _ADDR_MAX):
+                    raise ValueError(f"'{e['name']}' has an invalid address")
+                e["address"] = address
             else:
                 raise ValueError(f"'{e['name']}' has no address/base")
             imported.append(e)
@@ -5463,6 +6718,7 @@ def do_freeze(stdscr) -> None:
     except Exception as exc:
         message_box(stdscr,[f"Bad input: {exc}"],"Error",C_ERR); return
     frozen_ip, frozen_pid = state["ip"], state["pid"]
+    frozen_session = state["session"]
     stop_event = threading.Event(); errors=[0]; deadline=time.time()+sec
     def _freeze_worker():
         while time.time() < deadline:
@@ -5470,14 +6726,24 @@ def do_freeze(stdscr) -> None:
             if state["ip"] != frozen_ip or state["pid"] != frozen_pid:
                 add_log("Freeze aborted — process or connection changed","warn"); break
             target = addr
+            if state.get("session") != frozen_session:
+                add_log("Freeze aborted — session changed", "warn"); break
             if is_pointer:
+                try:
+                    base_now = _runtime_pointer_base(cheat)
+                except Exception as exc:
+                    add_log(f"Pointer freeze: module unavailable — {exc}", "warn")
+                    break
                 ok,target,_ = _resolve_pointer_chain(
-                    frozen_ip, frozen_pid, base, offsets, int(cheat.get("terminal_offset", 0)))
+                    frozen_ip, frozen_pid, base_now, offsets, int(cheat.get("terminal_offset", 0)))
                 if not ok:
                     add_log("Pointer freeze: chain broken — retrying next tick","warn")
                     if stop_event.wait(interval) or _freeze_stop.is_set(): break
                     continue
-            if _validate_addr_in_maps(frozen_ip,frozen_pid,target,width,10.0):
+            validation_error = _validate_addr_in_maps(frozen_ip,frozen_pid,target,width,10.0)
+            if validation_error is not None:
+                errors[0] += 1
+                add_log(f"Freeze write blocked: {validation_error}", "warn")
                 with _map_cache_lock: _map_cache.clear()
                 if stop_event.wait(interval) or _freeze_stop.is_set(): break
                 continue
@@ -5578,7 +6844,7 @@ def do_ptr_verify_manual(stdscr) -> None:
 
 
 def do_resolve_permanent(stdscr, target_addr: int) -> None:
-    """Trace-first temporary -> permanent resolver with pointer-scan fallback."""
+    """Resolve a known temporary address to the best verified permanent chain."""
     target_addr = int(target_addr)
     if not (_ADDR_MIN <= target_addr <= _ADDR_MAX):
         message_box(stdscr, [f"Invalid target address: {hex(target_addr)}"],
@@ -5591,27 +6857,10 @@ def do_resolve_permanent(stdscr, target_addr: int) -> None:
 
     def run():
         try:
-            width = int(state.get("scan_width", 4))
-            # First choice: change the value and catch the real accessor.
-            try:
-                result = _resolve_trace_first(
-                    state["ip"], state["pid"], target_addr, width,
-                    cancel_event=cancel_event,
-                    progress_cb=lambda d, t: progress.update(
-                        done=d, total=max(int(t), 1)))
-                if result.get("candidates"):
-                    progress["results"] = result
-                    progress["built"] = False
-                    return
-                add_log("Trace produced no stable pointer root; using cached reverse resolver",
-                        "warn")
-            except Exception as exc:
-                add_log(f"Change-triggered trace unavailable: {exc}", "warn")
-
-            # Existing robust fallback.
             progress["results"] = _resolve_permanent_candidates(
                 state["ip"], state["pid"], target_addr,
-                max_depth=5, cancel_event=cancel_event,
+                max_depth=min(6, MAX_CHAIN_DEPTH),
+                cancel_event=cancel_event,
                 progress_cb=lambda d, t: progress.update(
                     done=d, total=max(int(t), 1)))
             progress["built"] = bool(progress["results"].get("index_built"))
@@ -5620,100 +6869,66 @@ def do_resolve_permanent(stdscr, target_addr: int) -> None:
 
     ok = _run_scan_with_progress(
         stdscr, run,
-        "Tracing dynamic address — perform the normal in-game action that uses it…",
+        "Finding a stable location…",
         cancel_event, progress)
     if not ok:
         add_log("Permanent resolver cancelled", "warn")
         return
     if progress["error"]:
-        message_box(stdscr, [f"Resolver error: {progress['error']}"],
-                    "Resolver Failed", C_ERR)
+        message_box(stdscr, ["Could not find a permanent location.",
+                             str(progress["error"])],
+                    "Resolve Failed", C_ERR)
         return
 
     data = progress["results"] or {}
-    candidates = data.get("candidates", [])
-    trace = data.get("trace")
+    candidates = [c for c in data.get("candidates", []) if c.get("verified")]
     if not candidates:
-        extra = []
-        if trace:
-            extra = [
-                f"Accessor: {hex(int(trace.get('rip', 0)))}",
-                f"Access: {trace.get('access_mode', 'readwrite')}",
-                f"Base: {trace.get('base_reg', '?')} = "
-                f"{hex(int(trace.get('base_value', 0)))}",
-                f"Final offset: {hex(int(trace.get('final_offset', 0)))}",
-                "",
-            ]
         message_box(
             stdscr,
-            [f"Temporary: {hex(target_addr)}", ""] + extra +
-            ["No verified module/static pointer chain was found.",
-             "If the value is event-driven, repeat Resolve and perform the normal",
-             "in-game action that reads/writes this value while tracing is active."],
-            "No Permanent Address", C_WARN)
+            ["No stable location was found.",
+             "Try again after the value has been used in-game."],
+            "Permanent Location Not Found", C_WARN)
         return
 
+    # Keep only the strongest verified choices; the user should choose between
+    # a few meaningful alternatives, not inspect raw pointer-search output.
+    candidates = candidates[:8]
     sel = 0
     while True:
         stdscr.clear()
         h, w = stdscr.getmaxyx()
-        draw_border(stdscr, "RESOLVE PERMANENT ADDRESS")
-        safe_addstr(stdscr, 2, 3, f"Temporary: {hex(target_addr)}",
-                    color(C_WARN) | curses.A_BOLD)
-        method = data.get("method", "reverse-index")
-        safe_addstr(stdscr, 3, 3,
-                    f"Method: {method}   Candidates: {len(candidates)}",
-                    color(C_OK) if method == "change-triggered" else color(C_NORM))
-
-        if trace:
-            safe_addstr(
-                stdscr, 4, 3,
-                f"Accessor {hex(int(trace['rip']))}  "
-                f"{trace.get('base_reg','?')}={hex(int(trace.get('base_value',0)))}  "
-                f"offset={hex(int(trace.get('final_offset',0)))}",
-                color(C_ACC))
-        else:
-            safe_addstr(stdscr, 4, 3,
-                        f"Reverse index: {'built now' if progress['built'] else 'cached'}",
-                        color(C_NORM))
-
-        visible = max(1, h - 11)
-        start_i = max(0, min(sel, len(candidates) - visible))
-        for i, c in enumerate(candidates[start_i:start_i + visible]):
-            idx = start_i + i
-            verified = "✓ VERIFIED" if c.get("verified") else "✗ unverified"
-            mod = c.get("module_name") or "main"
-            rel = hex(int(c.get("module_relative_offset", 0)))
-            offs = "+".join(hex(int(x)) for x in c["offsets"])
-            terminal = int(c.get("terminal_offset", 0))
-            chain_text = offs + (f" + {hex(terminal)} [field]" if terminal else "")
-            line = (f"{'>' if idx == sel else ' '} {idx+1:2d} "
-                    f"{verified:<11} score {c['score']:5.1f} "
-                    f"{mod[:18]} + {rel} [{chain_text}]")
-            safe_addstr(
-                stdscr, 6 + i, 2, line[:max(w - 4, 1)].ljust(max(w - 4, 1)),
-                color(C_SEL) | curses.A_BOLD if idx == sel else
-                (color(C_OK) if c.get("verified") else color(C_NORM)))
+        draw_border(stdscr, "PERMANENT LOCATION")
+        safe_addstr(stdscr, 2, 3, "Your temporary address was found.",
+                    color(C_NORM))
+        safe_addstr(stdscr, 3, 3, f"Temporary: {hex(target_addr)}",
+                    color(C_WARN))
+        safe_addstr(stdscr, 5, 3, "BEST MATCH", color(C_TITLE) | curses.A_BOLD)
 
         c = candidates[sel]
-        row = 7 + min(visible, len(candidates))
-        if row < h - 3:
-            safe_addstr(stdscr, row, 3,
-                        f"Root: {c.get('module_name') or 'main'} + "
-                        f"{hex(int(c.get('module_relative_offset', 0)))}",
-                        color(C_OK) | curses.A_BOLD)
-            safe_addstr(stdscr, row + 1, 3,
-                        f"Chain: {' + '.join(hex(int(x)) for x in c['offsets'])}"
-                        f"{(' + ' + hex(int(c.get('terminal_offset', 0))) + ' [field]' if c.get('terminal_offset') else '')}",
-                        color(C_WARN))
-            safe_addstr(stdscr, row + 2, 3,
-                        f"Verification: {'PASS' if c.get('verified') else 'FAIL'}  "
-                        f"Confidence: {c['score']:.1f}  Depth: {c['depth']}",
-                        color(C_OK) if c.get("verified") else color(C_ERR))
+        module = c.get("module_name") or "Game module"
+        rel = hex(int(c.get("module_relative_offset", 0)))
+        path = " → ".join(hex(int(x)) for x in c.get("offsets", []))
+        safe_addstr(stdscr, 6, 3, f"Permanent: {module} + {rel}",
+                    color(C_OK) | curses.A_BOLD)
+        safe_addstr(stdscr, 7, 3, f"Pointer path: {path or 'direct'}", color(C_WARN))
+        safe_addstr(stdscr, 8, 3, "Verification: ✓ Confirmed", color(C_OK))
+        safe_addstr(stdscr, 9, 3, f"Confidence: {int(c.get('confidence', 0))}%",
+                    color(C_OK))
+
+        if len(candidates) > 1:
+            safe_addstr(stdscr, 11, 3, "Other verified matches",
+                        color(C_TITLE) | curses.A_BOLD)
+            for i, alt in enumerate(candidates[1:5], 1):
+                a_mod = alt.get("module_name") or "Game module"
+                a_rel = hex(int(alt.get("module_relative_offset", 0)))
+                marker = ">" if i == sel else " "
+                line = f"{marker} {i+1}. {a_mod} + {a_rel}  ({int(alt.get('confidence', 0))}%)"
+                safe_addstr(stdscr, 12 + i - 1, 3, line[:max(w - 6, 1)],
+                            color(C_NORM))
 
         draw_statusbar(stdscr, [
-            ("↑↓ select", C_NORM), ("Enter verify/save", C_OK),
-            ("I rebuild index", C_WARN), ("Q back", C_NORM)])
+            ("↑↓ choose", C_NORM), ("Enter save", C_OK),
+            ("R search again", C_WARN), ("Q back", C_NORM)])
         stdscr.refresh()
         key = stdscr.getch()
         if key == curses.KEY_RESIZE:
@@ -5724,19 +6939,12 @@ def do_resolve_permanent(stdscr, target_addr: int) -> None:
         elif key == curses.KEY_DOWN:
             sel = min(len(candidates) - 1, sel + 1)
         elif key in (10, 13, curses.KEY_ENTER):
-            if not c.get("verified"):
-                message_box(stdscr,
-                            ["This chain failed live verification and cannot be saved."],
-                            "Not Verified", C_ERR)
-                continue
             c2 = dict(c)
-            c2["module_name"] = c.get("module_name") or "main"
-            c2["module_relative_offset"] = int(
-                c.get("module_relative_offset", 0))
+            c2["module_name"] = module
+            c2["module_relative_offset"] = int(c.get("module_relative_offset", 0))
             do_pointer_chain_verify(stdscr, c2, target_addr)
-        elif key in (ord('i'), ord('I')):
+        elif key in (ord('r'), ord('R')):
             _invalidate_pointer_index(state["ip"], state["pid"])
-            add_log("Reverse pointer index manually invalidated", "warn")
             return do_resolve_permanent(stdscr, target_addr)
         elif key in (ord('q'), ord('Q'), 27):
             return
@@ -6335,7 +7543,12 @@ def main(stdscr) -> None:
                 procs  = ps5_proc_list(state["ip"])
                 screen = screen_proc_select(stdscr, procs)
             except Exception as exc:
-                message_box(stdscr, [f"Error: {exc}"], "Connection Error", C_ERR)
+                message_box(stdscr, [
+                    f"Error: {exc}",
+                    "",
+                    "Reminder: make sure the ps5debug payload is running",
+                    "on your console, then verify its IP address.",
+                ], "Connection Error", C_ERR)
                 screen = "connect"
         else:
             break

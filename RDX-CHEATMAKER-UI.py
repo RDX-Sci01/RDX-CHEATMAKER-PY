@@ -4448,7 +4448,8 @@ def draw_progress_bar(win, y: int, x: int, bar_width: int,
         safe_addstr(win, y, x + bar_width + 1, label, color(C_WARN))
 
 def input_box(stdscr, prompt: str, y: int, x: int,
-              width: int = 30, default: str = "") -> str:
+              width: int = 30, default: str = "",
+              allow_cancel: bool = False) -> Optional[str]:
     h, w = stdscr.getmaxyx()
     if y < 0 or y >= h - 1:
         return default
@@ -4463,13 +4464,41 @@ def input_box(stdscr, prompt: str, y: int, x: int,
     stdscr.nodelay(False)
     stdscr.timeout(-1)       # block indefinitely while user types
     curses.cbreak()
-    curses.echo()
+    # getstr() cannot implement an immediate cancel: it line-buffers Esc/Q
+    # until Enter is pressed.  Cancellable numeric prompts therefore read one
+    # key at a time below.  Regular text prompts retain curses' normal editor.
+    curses.noecho() if allow_cancel else curses.echo()
     _safe_curs_set(1)
     safe_addstr(stdscr, y, px, " " * min(width, w - px))  # clear previous value
     safe_addstr(stdscr, y, px, default)
     stdscr.refresh()
     try:
-        val = stdscr.getstr(y, px, width).decode('utf-8').strip()
+        if allow_cancel:
+            chars = []
+            while True:
+                key = stdscr.getch()
+                if key in (27, ord('q'), ord('Q')):
+                    return None
+                if key in (curses.KEY_ENTER, 10, 13):
+                    break
+                if key in (curses.KEY_BACKSPACE, 8, 127):
+                    if chars:
+                        chars.pop()
+                        safe_addstr(stdscr, y, px, " " * min(width, w - px))
+                        safe_addstr(stdscr, y, px, "".join(chars))
+                        stdscr.refresh()
+                    continue
+                if 32 <= key <= 126 and len(chars) < width:
+                    if not chars:
+                        safe_addstr(stdscr, y, px,
+                                    " " * min(width, w - px))
+                    chars.append(chr(key))
+                    safe_addstr(stdscr, y, px, "".join(chars))
+                    stdscr.refresh()
+            raw = "".join(chars).encode("utf-8")
+        else:
+            raw = stdscr.getstr(y, px, width)
+        val = raw.decode('utf-8').strip()
     except Exception:
         val = default
     finally:
@@ -4481,7 +4510,7 @@ def input_box(stdscr, prompt: str, y: int, x: int,
     return val or default
 
 def cycle_input(stdscr, prompt: str, y: int, x: int,
-                options: list, default=None):
+                options: list, default=None, allow_cancel: bool = False):
     h, w = stdscr.getmaxyx()
     if y < 0 or y >= h - 1:
         return default if default is not None else options[0]
@@ -4497,6 +4526,8 @@ def cycle_input(stdscr, prompt: str, y: int, x: int,
             curses.update_lines_cols()
             h, w = stdscr.getmaxyx()
             continue
+        if allow_cancel and k in (27, ord('q'), ord('Q')):
+            return None
         if k in (ord('\t'), curses.KEY_RIGHT):
             idx = (idx + 1) % len(options)
         elif k == curses.KEY_LEFT:
@@ -5076,21 +5107,38 @@ def do_scan_first(stdscr) -> None:
         "Enter the current in-game value to search for.", color(C_WARN))
     stdscr.refresh()
 
-    val_s     = input_box(stdscr, "Value (blank = unknown): ", 4, 3, 20)
+    safe_addstr(stdscr, 12, 3, "Esc/Q cancels setup", color(C_NORM))
+    val_s = input_box(stdscr, "Value (blank = unknown): ", 4, 3, 20,
+                      allow_cancel=True)
+    if val_s is None:
+        add_log("First scan setup cancelled")
+        return
     unknown_mode = (val_s.strip() == "")
 
     _wlabels  = [WIDTH_LABEL[ww] for ww in VALID_WIDTHS]
     _wsel     = cycle_input(stdscr, "Scan width      : ", 6, 3, _wlabels,
-                            WIDTH_LABEL.get(state["scan_width"], "uint32"))
+                            WIDTH_LABEL.get(state["scan_width"], "uint32"),
+                            allow_cancel=True)
+    if _wsel is None:
+        add_log("First scan setup cancelled")
+        return
     width     = VALID_WIDTHS[_wlabels.index(_wsel)]
     align_lbl = cycle_input(stdscr, "Scan alignment  : ", 8, 3,
                             ["aligned (faster)", "unaligned (thorough)"],
-                            "aligned (faster)" if state["scan_aligned"] else "unaligned (thorough)")
+                            "aligned (faster)" if state["scan_aligned"] else "unaligned (thorough)",
+                            allow_cancel=True)
+    if align_lbl is None:
+        add_log("First scan setup cancelled")
+        return
     aligned = align_lbl.startswith("aligned")
     scope_lbl = cycle_input(stdscr, "Scan scope      : ", 10, 3,
                             ["writable only (fast)", "all readable (thorough)"],
                             "writable only (fast)" if state["scan_writable_only"]
-                            else "all readable (thorough)")
+                            else "all readable (thorough)",
+                            allow_cancel=True)
+    if scope_lbl is None:
+        add_log("First scan setup cancelled")
+        return
     writable_only = scope_lbl.startswith("writable")
 
     state["scan_width"]        = width
@@ -6470,12 +6518,25 @@ def do_write(stdscr) -> None:
     draw_border(stdscr, "WRITE TO ADDRESS")
     safe_addstr(stdscr, 2, 3,
         "Write a single value directly to a memory address.", color(C_WARN))
+    safe_addstr(stdscr, 10, 3, "Esc/Q cancels without writing", color(C_NORM))
     stdscr.refresh()
-    addr_s = input_box(stdscr, "Address (hex) : ", 4, 3, 20)
-    val_s  = input_box(stdscr, "Value         : ", 6, 3, 20)
+    addr_s = input_box(stdscr, "Address (hex) : ", 4, 3, 20,
+                       allow_cancel=True)
+    if addr_s is None:
+        add_log("Write setup cancelled")
+        return
+    val_s = input_box(stdscr, "Value         : ", 6, 3, 20,
+                      allow_cancel=True)
+    if val_s is None:
+        add_log("Write setup cancelled")
+        return
     _wl    = [WIDTH_LABEL[ww] for ww in VALID_WIDTHS]
     _ws    = cycle_input(stdscr, "Width         : ", 8, 3, _wl,
-                         WIDTH_LABEL.get(state["scan_width"], "uint32"))
+                         WIDTH_LABEL.get(state["scan_width"], "uint32"),
+                         allow_cancel=True)
+    if _ws is None:
+        add_log("Write setup cancelled")
+        return
     width  = VALID_WIDTHS[_wl.index(_ws)]
     try:
         addr = int(addr_s, 0)

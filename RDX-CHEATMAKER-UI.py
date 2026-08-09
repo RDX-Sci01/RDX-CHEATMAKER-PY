@@ -395,12 +395,16 @@ _PTR_STRUCT_MAX = 0x1000             # interval matching keeps wide offsets chea
 _PTR_STRUCT_STEP = 4
 _PTR_CHUNK = 0x2000000              # 32 MiB network reads
 _PTR_BEAM_MAX = 12_000              # heap targets carried to the next depth
+_PTR_VERIFY_MAX = 64                # bounded same-session network validations
+_PTR_VERIFY_PER_FAMILY = 2          # duplicate roots per converged heap path
 _PTR_SEARCH_TARGET_MAX = 4_096      # bounded deep-pass value set
 _PTR_DEPTH_DEFAULT = 3
 _PTR_DISK_INDEX_THRESHOLD = 0x40000000  # 1 GiB readable memory
 _PTR_DISK_SHARD_BYTES = 0x2000000       # 32 MiB per sorted disk shard
 _PTR_DISK_WORKERS = 6                    # persistent parallel reader/indexers
 _pointer_region_class_cache = {}         # map fingerprint -> classified rows
+_POINTER_PROVISIONAL_FILE = Path(__file__).with_name(
+    ".rdx-pointer-candidates.json")
 
 # Issues #7/#8/#9/#10: track the active freeze worker globally so it can be
 # stopped when the user changes process or reconnects.  Without this the old
@@ -1076,11 +1080,10 @@ _DEBUG_EVENT_SIZE = 0x4A0
 _DEBUG_REG_OFFSET = 0x30
 _DEBUG_DBREG_OFFSET = 0x420
 _DEBUG_TRACE_TIMEOUT = 10.0
-_DEBUG_TRACE_MAX_HITS = 8
+_DEBUG_TRACE_MAX_HITS = 1
 _DEBUG_TRACE_WP_INDEX = None
-# Disabled after live testing exposed a console-crashing attach/watchpoint
-# lifecycle.  Keep the implementation for protocol work, but never enter it
-# from a production resolver until it has an explicit capability/safety gate.
+# Never enter hardware tracing implicitly.  It is available only through the
+# explicitly confirmed, one-shot experimental UI action.
 _DEBUG_TRACE_ENABLED = False
 
 # FreeBSD/amd64 struct reg: 15 GP registers followed by trap/segment fields.
@@ -1188,7 +1191,8 @@ def _debug_disasm(s: socket.socket, pid: int, address: int,
     return out
 
 def _trace_temporary_access(ip: str, pid: int, target_addr: int,
-                            width: int, timeout: float = _DEBUG_TRACE_TIMEOUT) -> dict:
+                            width: int, timeout: float = _DEBUG_TRACE_TIMEOUT,
+                            experimental: bool = False) -> dict:
     """
     Change-triggered resolver:
       1) attach debugger;
@@ -1199,7 +1203,7 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
 
     Returns a trace dictionary.  It never leaves the probe value installed.
     """
-    if not _DEBUG_TRACE_ENABLED:
+    if not (_DEBUG_TRACE_ENABLED or experimental):
         raise RuntimeError(
             "hardware-watchpoint tracing is disabled: unsafe debugger lifecycle")
     target_addr = int(target_addr)
@@ -1218,6 +1222,7 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
     event_sock = None
     attached = False
     wp_index = None
+    target_stopped = False
     try:
         cmd = ps5_connect(ip, timeout=10.0)
         body = struct.pack("<I", int(pid))
@@ -1241,12 +1246,15 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
         # restoring one later can overwrite a legitimate in-game inventory
         # change made while the trace is active.
         _debug_continue(cmd, 1)
+        target_stopped = True
         # DR7 length encoding: 0=1 byte, 1=2 bytes, 2=8 bytes, 3=4 bytes.
         wp_length = {1: 0, 2: 1, 4: 3, 8: 2}.get(width)
         if wp_length is None:
             raise RuntimeError(f"unsupported watchpoint width: {width}")
-        _debug_set_watchpoint(cmd, wp_index, target_addr, wp_length, 3)
+        # Write-only (DR7 RW=01) avoids stopping on harmless UI/inventory reads.
+        _debug_set_watchpoint(cmd, wp_index, target_addr, wp_length, 1)
         _debug_continue(cmd, 0)
+        target_stopped = False
 
         # Collect a few genuine target accesses.  The first hit is not always
         # the useful accessor (for example a housekeeping read), so keep trying
@@ -1264,24 +1272,35 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
             except socket.timeout:
                 break
             candidate = _debug_parse_event(packet)
+            target_stopped = True
             dr6 = int(candidate["dbregs"][6])
             if not (dr6 & (1 << int(wp_index))):
                 # Every debug event stops the target.  Ignoring an unrelated
                 # event without resuming leaves the game visibly frozen.
                 _debug_continue(cmd, 0)
+                target_stopped = False
                 continue
             hits += 1
             regs = candidate["regs"]
             rip = int(regs["rip"])
             try:
                 insns = _debug_disasm(cmd, pid, max(rip - 8, _ADDR_MIN), 32, 16)
-                decoded = next((x for x in insns if int(x["addr"]) == rip), None)
+                # x86 data-breakpoint #DB is reported after the memory
+                # instruction.  Prefer an instruction ending at event RIP;
+                # retain addr==RIP as a compatibility fallback.
+                decoded = next((x for x in reversed(insns)
+                                if int(x["addr"]) + int(x["length"]) == rip
+                                and (int(x["kind"]) & 0x10)), None)
+                if decoded is None:
+                    decoded = next((x for x in insns
+                                    if int(x["addr"]) == rip), None)
             except Exception as exc:
                 decoded = None
                 last_reason = f"disassembly failed: {exc}"
             if not decoded or not (int(decoded["kind"]) & 0x10):
                 last_reason = "watchpoint hit but accessor instruction was not decoded"
                 _debug_continue(cmd, 0)
+                target_stopped = False
                 continue
             event = candidate
             insn = decoded
@@ -1302,7 +1321,7 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
         # pointers, so they are reported but not used as permanent pointer roots.
         index_val = int(regs.get(index_name, 0)) if index_name else 0
         if base_reg_id == _ZYDIS_RIP:
-            base_val = rip
+            base_val = int(insn["addr"]) + int(insn["length"])
             base_name = "rip"
         elif base_name:
             base_val = int(regs[base_name])
@@ -1341,6 +1360,14 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
         if cmd is not None and wp_index is not None:
             try:
                 _debug_clear_watchpoint(cmd, wp_index)
+            except Exception:
+                pass
+        # A captured/exception event leaves the process stopped.  Resume
+        # explicitly even though DETACH also performs a full resume teardown.
+        if cmd is not None and attached and target_stopped:
+            try:
+                _debug_continue(cmd, 0)
+                target_stopped = False
             except Exception:
                 pass
         if cmd is not None:
@@ -3673,33 +3700,45 @@ def _coalesce_pointer_regions(regions: list) -> list:
 def _pointer_scan_chunk(sock: _ScanSocket, start: int, size: int,
                         target_arr: np.ndarray, target_chains: dict,
                         maps_sorted: list, map_starts: np.ndarray,
-                        map_ends: np.ndarray, cancel_event=None):
+                        map_ends: np.ndarray, cancel_event=None,
+                        diagnostic: Optional[dict] = None):
     """Read one chunk and return matching (holder, target, offset, chain) hits."""
     raw = sock.read(start, size, cancel_event)
     trim = len(raw) - (len(raw) % 8)
     if trim < 8:
         return []
     vals = np.frombuffer(raw[:trim], dtype=np.uint64)
+    if diagnostic is not None:
+        diagnostic["slots_scanned"] = diagnostic.get("slots_scanned", 0) + len(vals)
     # Match pointer values to target *ranges* instead of enumerating every
     # target-offset value. The nearest sorted target is sufficient to decide
     # whether at least one target lies within the signed offset window; exact
     # target/chain combinations are expanded only for the tiny set of hits.
     positions = np.searchsorted(target_arr, vals, side="left")
     mask = np.zeros(vals.shape, dtype=bool)
+    range_mask = np.zeros(vals.shape, dtype=bool)
     right = positions < target_arr.size
     if right.any():
         ri = positions[right]
         rv = vals[right]
         rd = target_arr[ri].astype(np.int64) - rv.astype(np.int64)
-        mask[right] |= (np.abs(rd) <= _PTR_STRUCT_MAX) & (
-            (rd % _PTR_STRUCT_STEP) == 0)
+        in_range = np.abs(rd) <= _PTR_STRUCT_MAX
+        range_mask[right] |= in_range
+        mask[right] |= in_range & ((rd % _PTR_STRUCT_STEP) == 0)
     left = positions > 0
     if left.any():
         li = positions[left] - 1
         lv = vals[left]
         ld = target_arr[li].astype(np.int64) - lv.astype(np.int64)
-        mask[left] |= (np.abs(ld) <= _PTR_STRUCT_MAX) & (
-            (ld % _PTR_STRUCT_STEP) == 0)
+        in_range = np.abs(ld) <= _PTR_STRUCT_MAX
+        range_mask[left] |= in_range
+        mask[left] |= in_range & ((ld % _PTR_STRUCT_STEP) == 0)
+    if diagnostic is not None:
+        raw_count = int(np.count_nonzero(range_mask))
+        aligned_count = int(np.count_nonzero(mask))
+        diagnostic["raw_range_matches"] = diagnostic.get("raw_range_matches", 0) + raw_count
+        diagnostic["alignment_rejected"] = diagnostic.get("alignment_rejected", 0) + max(0, raw_count - aligned_count)
+        diagnostic["aligned_matches"] = diagnostic.get("aligned_matches", 0) + aligned_count
     indices = np.flatnonzero(mask)
     if not len(indices):
         return []
@@ -3730,6 +3769,8 @@ def _pointer_scan_chunk(sock: _ScanSocket, start: int, size: int,
             hits.append((int(holder_u), int(target), int(soff), chain,
                          bool(_is_static_region(region)),
                          region.get("name", "") or "anon"))
+    if diagnostic is not None:
+        diagnostic["expanded_hits"] = diagnostic.get("expanded_hits", 0) + len(hits)
     return hits
 
 
@@ -3737,7 +3778,8 @@ def pointer_chain_scan(ip: str, pid: int,
                        target_addr: int,
                        max_depth: int = _PTR_DEPTH_DEFAULT,
                        cancel_event=None,
-                       progress_cb=None) -> list:
+                       progress_cb=None,
+                       diagnostic_report: Optional[dict] = None) -> list:
     """Find static pointer chains to ``target_addr`` without full-memory caching.
 
     The search works backwards from the temporary address.  At each level it
@@ -3767,6 +3809,27 @@ def pointer_chain_scan(ip: str, pid: int,
         return []
 
     readable_maps = _pointer_readable_regions(maps)
+    if diagnostic_report is not None:
+        readable_ids = {id(r) for r in readable_maps}
+        excluded = {"not_readable": 0, "execute_only": 0, "over_1gib": 0,
+                    "libsce": 0, "classified_uncached": 0, "other": 0}
+        for r in maps:
+            if id(r) in readable_ids:
+                continue
+            start, end = int(r.get("start", 0)), int(r.get("end", 0))
+            prot = int(r.get("prot", 0)); name = str(r.get("name", "") or "")
+            if end <= start or not (prot & 1): excluded["not_readable"] += 1
+            elif prot == 4: excluded["execute_only"] += 1
+            elif end - start > 0x40000000: excluded["over_1gib"] += 1
+            elif name.startswith("libSce"): excluded["libsce"] += 1
+            else: excluded["other"] += 1
+        diagnostic_report.update({
+            "target": int(target_addr), "maps_total": len(maps),
+            "maps_scanned": len(readable_maps), "excluded_regions": excluded,
+            "depths": [], "limits": {
+                "offset_max": _PTR_STRUCT_MAX, "offset_step": _PTR_STRUCT_STEP,
+                "beam_max": _PTR_BEAM_MAX, "max_depth": max_depth,
+            }})
     readable = _coalesce_pointer_regions(readable_maps)
     if not readable:
         add_log("Pointer scan: no readable data regions", "warn")
@@ -3789,7 +3852,9 @@ def pointer_chain_scan(ip: str, pid: int,
             break
 
         # Keep the beam bounded before multiplying by struct offsets.
+        pre_depth_beam_dropped = 0
         if len(current_targets) > _PTR_BEAM_MAX:
+            pre_depth_beam_dropped = len(current_targets) - _PTR_BEAM_MAX
             current_targets = dict(list(current_targets.items())[:_PTR_BEAM_MAX])
             add_log(f"Depth {depth}: beam capped at {_PTR_BEAM_MAX:,} targets", "warn")
 
@@ -3798,6 +3863,17 @@ def pointer_chain_scan(ip: str, pid: int,
         static_hits = 0
         heap_hits = 0
         depth_done = 0
+        depth_diag = {"depth": depth, "targets_entering": len(current_targets),
+                      "pre_depth_beam_dropped": pre_depth_beam_dropped,
+                      "slots_scanned": 0, "raw_range_matches": 0,
+                      "alignment_rejected": 0, "aligned_matches": 0,
+                      "expanded_hits": 0, "heap_hits": 0, "static_hits": 0,
+                      "parents_retained": 0, "beam_dropped": 0,
+                      "verification_failures": 0, "partial_chains": [],
+                      "read_failures": 0, "terminal_heap_regions_skipped": 0,
+                      "nonlocal_heap_regions_deferred": 0}
+        if diagnostic_report is not None:
+            diagnostic_report["depths"].append(depth_diag)
 
         add_log(f"Pointer scan depth {depth}: {len(current_targets):,} targets, "
                 f"interval-matched ±{hex(_PTR_STRUCT_MAX)}")
@@ -3819,11 +3895,15 @@ def pointer_chain_scan(ip: str, pid: int,
                 # permanent chain. Heap holders cannot be expanded again, so
                 # reading them is both useless and potentially hundreds of MiB.
                 if depth == max_depth and not region.get("static"):
+                    if diagnostic_report is not None:
+                        depth_diag["terminal_heap_regions_skipped"] += 1
                     add_log(f"Depth {depth}: static-root pass complete; "
                             "skipping terminal heap scan")
                     break
                 is_local = (int(region["start"]) >> 32) in target_prefixes
                 if (not region.get("static") and not is_local and next_targets):
+                    if diagnostic_report is not None:
+                        depth_diag["nonlocal_heap_regions_deferred"] += 1
                     add_log(f"Depth {depth}: local heap produced "
                             f"{len(next_targets):,} parents; deferring unrelated "
                             "address families")
@@ -3841,8 +3921,11 @@ def pointer_chain_scan(ip: str, pid: int,
                     try:
                         hits = _pointer_scan_chunk(
                             sock, start, size, target_arr, current_targets,
-                            maps_sorted, map_starts, map_ends, cancel_event)
+                            maps_sorted, map_starts, map_ends, cancel_event,
+                            depth_diag if diagnostic_report is not None else None)
                     except Exception as exc:
+                        if diagnostic_report is not None:
+                            depth_diag["read_failures"] += 1
                         add_log(f"ptr scan read err @ {hex(start)}: {exc}", "warn")
                         if size > 0x100000:
                             chunk_limit = max(0x100000, size // 2)
@@ -3868,14 +3951,31 @@ def pointer_chain_scan(ip: str, pid: int,
                                 "depth": depth,
                                 "region": rname,
                                 "static": True,
+                                "status": "provisional",
+                                # Static slots often converge on the exact same
+                                # heap parent.  Retain this key so verification
+                                # can collapse those duplicates first.
+                                "family_anchor": target,
                             })
                             static_hits += 1
+                            if diagnostic_report is not None and len(depth_diag["partial_chains"]) < 20:
+                                depth_diag["partial_chains"].append({
+                                    "kind": "static", "base": holder,
+                                    "target": target, "offsets": new_chain,
+                                    "region": rname})
                         elif depth < max_depth:
                             old = next_targets.get(holder)
                             if old is None or len(new_chain) < len(old):
                                 if len(next_targets) < _PTR_BEAM_MAX or old is not None:
                                     next_targets[holder] = new_chain
+                                elif diagnostic_report is not None:
+                                    depth_diag["beam_dropped"] += 1
                             heap_hits += 1
+                            if diagnostic_report is not None and len(depth_diag["partial_chains"]) < 20:
+                                depth_diag["partial_chains"].append({
+                                    "kind": "heap", "base": holder,
+                                    "target": target, "offsets": new_chain,
+                                    "region": rname})
                         else:
                             candidates.append({
                                 "base": holder,
@@ -3899,6 +3999,10 @@ def pointer_chain_scan(ip: str, pid: int,
                 sock.close()
 
         add_log(f"Depth {depth}: {static_hits} static, {heap_hits} heap expansions")
+        if diagnostic_report is not None:
+            depth_diag["static_hits"] = static_hits
+            depth_diag["heap_hits"] = heap_hits
+            depth_diag["parents_retained"] = len(next_targets)
         current_targets = next_targets
 
         # A broad signed-offset sweep can produce a static coincidence whose
@@ -3906,6 +4010,34 @@ def pointer_chain_scan(ip: str, pid: int,
         # hit: resolve each fresh chain twice and discard stale candidates.
         depth_static = [c for c in candidates
                         if c["static"] and c["depth"] == depth]
+        if len(depth_static) > _PTR_VERIFY_MAX:
+            families = {}
+            ranked = sorted(depth_static, key=lambda c: (
+                sum(1 for x in c.get("offsets", []) if int(x) % 8),
+                sum(abs(int(x)) for x in c.get("offsets", [])),
+                int(c.get("base", 0))))
+            selected = []
+            for candidate in ranked:
+                family = (int(candidate.get("family_anchor", 0)),
+                          tuple(int(x) for x in candidate.get("offsets", [])[1:]))
+                kept = families.get(family, 0)
+                if kept >= _PTR_VERIFY_PER_FAMILY:
+                    continue
+                families[family] = kept + 1
+                selected.append(candidate)
+                if len(selected) >= _PTR_VERIFY_MAX:
+                    break
+            selected_ids = {id(c) for c in selected}
+            pruned_ids = {id(c) for c in depth_static
+                          if id(c) not in selected_ids}
+            candidates = [c for c in candidates if id(c) not in pruned_ids]
+            if diagnostic_report is not None:
+                depth_diag["static_candidates_pruned"] = len(pruned_ids)
+                depth_diag["static_families_retained"] = len(families)
+            add_log(f"Depth {depth}: grouped {len(depth_static):,} static hits "
+                    f"into {len(families):,} families; verifying "
+                    f"{len(selected):,}")
+            depth_static = selected
         verified_static = []
         for candidate in depth_static:
             if _verify_candidate_twice(
@@ -3915,18 +4047,28 @@ def pointer_chain_scan(ip: str, pid: int,
             stale_ids = {id(c) for c in depth_static if c not in verified_static}
             candidates = [c for c in candidates if id(c) not in stale_ids]
             if stale_ids:
+                if diagnostic_report is not None:
+                    depth_diag["verification_failures"] = len(stale_ids)
                 add_log(f"Depth {depth}: rejected {len(stale_ids)} stale static "
                         "candidate(s)", "warn")
 
-        # Once a verified static root exists at a short depth, avoid unrelated
-        # deeper passes.
+        # Same-session verification only proves that a chain is internally
+        # consistent right now.  It does not prove reload stability: ordinary
+        # executable data slots can coincidentally lead into the current heap.
+        # Keep walking the retained heap frontier through the requested depth
+        # so shallow coincidences cannot hide a longer, stable chain.
         if verified_static:
             add_log(f"Pointer scan found {sum(1 for c in candidates if c['static'])} "
-                    f"verified static candidate(s) at depth {depth}")
-            break
+                    f"same-session candidate(s) at depth {depth}; "
+                    "continuing for deeper roots")
 
     candidates.sort(key=lambda c: (not c["static"], c["depth"], c["base"]))
     elapsed = max(time.monotonic() - started, 1e-9)
+    if diagnostic_report is not None:
+        diagnostic_report["elapsed_seconds"] = elapsed
+        diagnostic_report["candidates_returned"] = len(candidates)
+        diagnostic_report["static_candidates_returned"] = sum(
+            1 for c in candidates if c["static"])
     add_log(f"Pointer chain scan: {len(candidates)} candidates "
             f"({sum(1 for c in candidates if c['static'])} static) "
             f"in {elapsed:.1f}s")
@@ -3996,6 +4138,131 @@ def _runtime_pointer_base(cheat: dict) -> int:
     return int(base, 0) if isinstance(base, str) else int(base)
 
 
+def _pointer_module_base(maps: list, module_name: str) -> Optional[int]:
+    """Return the current base for a persisted pointer-root module."""
+    wanted = str(module_name or "main")
+    same = [r for r in maps if str(r.get("name", "") or "") == wanted]
+    if same:
+        return min(int(r["start"]) for r in same)
+    if wanted == "main":
+        static = [r for r in maps if _is_static_region(r)]
+        return min((int(r["start"]) for r in static), default=None)
+    return None
+
+
+def _save_pointer_provisionals(records: list,
+                               path: Optional[Path] = None) -> None:
+    """Atomically persist provisional chains for validation after a reload."""
+    dst = Path(path or _POINTER_PROVISIONAL_FILE)
+    payload = {"version": 1, "candidates": records}
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=dst.name + ".", dir=str(dst.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, dst)
+    finally:
+        try:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        except OSError:
+            pass
+
+
+def _load_pointer_provisionals(path: Optional[Path] = None) -> list:
+    src = Path(path or _POINTER_PROVISIONAL_FILE)
+    try:
+        data = json.loads(src.read_text(encoding="utf-8"))
+        if int(data.get("version", 0)) != 1:
+            return []
+        return [x for x in data.get("candidates", []) if isinstance(x, dict)]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def _make_pointer_provisionals(candidates: list, maps: list, pid: int,
+                               process: str, target_addr: int) -> list:
+    """Convert same-session hits into bounded, module-relative records."""
+    unique = {}
+    for candidate in candidates:
+        if not candidate.get("verified") or not candidate.get("static"):
+            continue
+        holder = int(candidate.get("base", 0))
+        module_name = candidate.get("module_name")
+        module_base = candidate.get("module_base")
+        module_rel = candidate.get("module_relative_offset")
+        if module_rel is None:
+            module_name, module_base, module_rel = _module_info_for_addr(holder, maps)
+        if module_rel is None:
+            continue
+        offsets = [int(x) for x in candidate.get("offsets", [])]
+        key = (str(module_name or "main"), int(module_rel), tuple(offsets),
+               int(candidate.get("terminal_offset", 0)))
+        record = {
+            "status": "provisional",
+            "module_name": str(module_name or "main"),
+            "module_relative_offset": int(module_rel),
+            "offsets": offsets,
+            "terminal_offset": int(candidate.get("terminal_offset", 0)),
+            "depth": len(offsets),
+            "observed_pid": int(pid),
+            "observed_process": str(process or ""),
+            "observed_target": int(target_addr),
+            "reload_survivals": 0,
+        }
+        unique[key] = record
+    # Prefer shorter paths and smaller offsets, and bound persistence so a
+    # noisy executable data section cannot create an unwieldy reload pass.
+    records = sorted(unique.values(), key=lambda c: (
+        c["depth"], sum(abs(int(x)) for x in c["offsets"]),
+        c["module_name"], c["module_relative_offset"]))
+    return records[:256]
+
+
+def _validate_pointer_provisionals(ip: str, pid: int, process: str,
+                                   target_addr: int, records: list,
+                                   maps: Optional[list] = None) -> dict:
+    """Rebase and validate saved chains; promotion requires a different PID."""
+    maps = maps if maps is not None else _get_maps_cached(ip, pid)
+    survivors, rejected = [], []
+    for saved in records:
+        candidate = dict(saved)
+        if str(saved.get("observed_process", "")) not in ("", str(process or "")):
+            candidate["rejection_reason"] = "different process"
+            rejected.append(candidate)
+            continue
+        if int(saved.get("observed_pid", pid)) == int(pid):
+            candidate["rejection_reason"] = "reload not detected"
+            rejected.append(candidate)
+            continue
+        module_base = _pointer_module_base(maps, saved.get("module_name", "main"))
+        if module_base is None:
+            candidate["rejection_reason"] = "module not mapped"
+            rejected.append(candidate)
+            continue
+        candidate["base"] = module_base + int(saved["module_relative_offset"])
+        candidate["static"] = True
+        candidate["region"] = saved.get("module_name", "main")
+        if _verify_candidate_twice(ip, pid, candidate, int(target_addr)):
+            survivals = int(saved.get("reload_survivals", 0)) + 1
+            candidate["reload_survivals"] = survivals
+            candidate["status"] = ("permanent" if survivals >= 2
+                                     else "provisional")
+            # A second survival must come from another actual game reload.
+            candidate["observed_pid"] = int(pid)
+            candidate["observed_process"] = str(process or "")
+            candidate["observed_target"] = int(target_addr)
+            candidate["confidence"] = _candidate_confidence(candidate)
+            survivors.append(candidate)
+        else:
+            candidate["status"] = "rejected"
+            candidate["rejection_reason"] = "chain changed after reload"
+            rejected.append(candidate)
+    return {"survivors": survivors, "rejected": rejected}
+
+
 def generate_cht(cheats: list, game_id: str, game_ver: str,
                  game_title: str, hex_values: bool = True) -> str:
     fmt_val = (lambda v: hex(v)) if hex_values else (lambda v: str(v))
@@ -4053,6 +4320,14 @@ def init_colors() -> None:
     curses.init_pair(4, curses.COLOR_RED,     -1)   # C_ERR
     curses.init_pair(5, curses.COLOR_WHITE,   -1)   # C_NORM
     curses.init_pair(6, curses.COLOR_MAGENTA, -1)   # C_ACC
+
+
+def _safe_curs_set(visibility: int) -> None:
+    """Best-effort cursor mode for terminals that reject curs_set()."""
+    try:
+        curses.curs_set(int(visibility))
+    except curses.error:
+        pass
     curses.init_pair(7, curses.COLOR_BLACK,   curses.COLOR_CYAN)  # C_SEL
     curses.init_pair(8, curses.COLOR_BLACK,   curses.COLOR_RED)   # C_DSEL
 
@@ -4189,7 +4464,7 @@ def input_box(stdscr, prompt: str, y: int, x: int,
     stdscr.timeout(-1)       # block indefinitely while user types
     curses.cbreak()
     curses.echo()
-    curses.curs_set(1)
+    _safe_curs_set(1)
     safe_addstr(stdscr, y, px, " " * min(width, w - px))  # clear previous value
     safe_addstr(stdscr, y, px, default)
     stdscr.refresh()
@@ -4199,7 +4474,7 @@ def input_box(stdscr, prompt: str, y: int, x: int,
         val = default
     finally:
         curses.noecho()
-        curses.curs_set(0)
+        _safe_curs_set(0)
         # Restore the 100 ms timeout set in main() so callers get expected
         # behaviour without having to remember to reset it themselves.
         stdscr.timeout(100)
@@ -4211,7 +4486,7 @@ def cycle_input(stdscr, prompt: str, y: int, x: int,
     if y < 0 or y >= h - 1:
         return default if default is not None else options[0]
     idx = options.index(default) if default in options else 0
-    curses.curs_set(0)
+    _safe_curs_set(0)
     while True:
         safe_addstr(stdscr, y, x, prompt, color(C_WARN) | curses.A_BOLD)
         hint = f"< {options[idx]} >  (Tab/arrows to change, Enter to confirm)"
@@ -5169,6 +5444,7 @@ def _results_more_menu(stdscr):
         ("Explore Values Near This Item", "nearby_browse"),
         ("Find a Nearby Item by Changing It", "nearby"),
         ("Preview Selected Value", "preview"),
+        ("Experimental: Trace Item Write", "trace_write"),
         ("Find Matching Nearby Item (Group Test)", "batch_preview"),
         ("Write Address", "write"),
         ("Verify Pointer", "ptr_verify"),
@@ -5218,6 +5494,8 @@ def _results_more_menu(stdscr):
                 return "nearby_browse"
             if action == "preview":
                 return "preview"
+            if action == "trace_write":
+                return "trace_write"
             if action == "batch_preview":
                 return "batch_preview"
             result = dispatch(stdscr, action)
@@ -5445,6 +5723,64 @@ def do_preview_candidate(stdscr, address: int) -> None:
         message_box(stdscr, ["Original value restored.",
                              "Select another nearby candidate to continue."],
                     "Candidate Rejected", C_NORM)
+
+
+def do_trace_item_write(stdscr, address: int) -> None:
+    """Run one explicitly confirmed write-only hardware watchpoint trace."""
+    width = int(state.get("scan_width", 4))
+    validation = _validate_addr_in_maps(
+        state["ip"], int(state["pid"]), int(address), width,
+        ttl_override=0.0)
+    if validation:
+        message_box(stdscr, [validation], "Trace Blocked", C_ERR)
+        return
+    if not confirm_box(stdscr,
+            "Experimental one-shot trace: the game may pause briefly. Continue?",
+            "Trace Item Write"):
+        return
+
+    stdscr.clear()
+    draw_border(stdscr, "EXPERIMENTAL ITEM-WRITE TRACE")
+    safe_addstr(stdscr, 2, 3, f"Watching: {hex(int(address))}", color(C_WARN))
+    safe_addstr(stdscr, 4, 3, "The write-only watchpoint is being armed.",
+                color(C_NORM))
+    safe_addstr(stdscr, 5, 3, "Change this item exactly once in the game now.",
+                color(C_OK) | curses.A_BOLD)
+    safe_addstr(stdscr, 7, 3, "Timeout: 15 seconds. Cleanup always runs.",
+                color(C_WARN))
+    stdscr.refresh()
+    try:
+        trace = _trace_temporary_access(
+            state["ip"], int(state["pid"]), int(address), width,
+            timeout=15.0, experimental=True)
+    except Exception as exc:
+        add_log(f"Experimental item-write trace failed: {exc}", "warn")
+        message_box(stdscr, [
+            "No usable write event was captured.",
+            str(exc),
+            "The watchpoint was cleared and debugger teardown was requested.",
+        ], "Trace Finished", C_WARN)
+        return
+
+    state["last_access_trace"] = trace
+    insn = trace.get("instruction") or {}
+    instruction_addr = int(insn.get("addr", trace.get("rip", 0)))
+    base_name = str(trace.get("base_reg") or "unknown")
+    base_value = int(trace.get("base_value", 0))
+    final_offset = int(trace.get("final_offset", 0))
+    add_log(
+        f"Write trace captured target={hex(int(address))} "
+        f"instruction={hex(instruction_addr)} base={base_name}:"
+        f"{hex(base_value)} offset={final_offset:+#x}")
+    lines = [
+        "Write instruction captured successfully.",
+        f"Instruction: {hex(instruction_addr)}",
+        f"Object base: {base_name} = {hex(base_value)}",
+        f"Item-field offset: {final_offset:+#x}",
+        f"Access: {trace.get('access_mode', 'write')}",
+        "Watchpoint cleared; target resume and detach were requested.",
+    ]
+    message_box(stdscr, lines, "Item Write Captured", C_OK)
 
 
 def do_batch_preview_matching(stdscr) -> None:
@@ -5882,6 +6218,11 @@ def do_show_results(stdscr) -> None:
                 if more_result == "preview":
                     stdscr.nodelay(False)
                     do_preview_candidate(stdscr, int(results[sel]))
+                    stdscr.nodelay(True)
+                    results = state["scan_results"]
+                if more_result == "trace_write":
+                    stdscr.nodelay(False)
+                    do_trace_item_write(stdscr, int(results[sel]))
                     stdscr.nodelay(True)
                     results = state["scan_results"]
                 if more_result == "batch_preview":
@@ -6851,9 +7192,48 @@ def do_resolve_permanent(stdscr, target_addr: int) -> None:
                     "Resolve Permanent Address", C_ERR)
         return
 
+    # A chain cannot be called permanent from same-session reads.  If a prior
+    # search exists and the game PID changed, validate that saved set first.
+    saved = _load_pointer_provisionals()
+    reload_result = None
+    if saved and any(int(x.get("observed_pid", state["pid"])) != int(state["pid"])
+                     for x in saved):
+        try:
+            reload_result = _validate_pointer_provisionals(
+                state["ip"], state["pid"], state["proc_name"], target_addr,
+                saved)
+        except Exception as exc:
+            add_log(f"Reload pointer validation failed: {exc}", "warn")
+            reload_result = {"survivors": [], "rejected": saved}
+        add_log(f"Reload validation: {len(reload_result['survivors'])} survived, "
+                f"{len(reload_result['rejected'])} rejected")
+        # Do not repeatedly reconsider chains that already failed this reload.
+        _save_pointer_provisionals(reload_result["survivors"])
+
+    reload_survivors = (reload_result or {}).get("survivors", [])
+    promoted = [c for c in reload_survivors
+                if c.get("status") == "permanent"
+                and int(c.get("reload_survivals", 0)) >= 2]
+    if promoted:
+        data = {"candidates": promoted,
+                "method": "cross-reload-validation", "index_built": False}
+    else:
+        data = None
+
+    if reload_survivors and not promoted:
+        message_box(
+            stdscr,
+            [f"{len(reload_survivors)} chain(s) survived the first reload.",
+             "",
+             "They remain provisional until one more game reload.",
+             "Reload, isolate the address again, then choose",
+             "Resolve permanent for the final validation."],
+            "One More Reload Required", C_WARN)
+        return
+
     cancel_event = threading.Event()
     progress = {"done": 0, "total": _PTR_RESOLVE_MAX_NODES,
-                "results": None, "error": None, "built": False}
+                "results": data, "error": None, "built": False}
 
     def run():
         try:
@@ -6867,10 +7247,12 @@ def do_resolve_permanent(stdscr, target_addr: int) -> None:
         except Exception as exc:
             progress["error"] = str(exc)
 
-    ok = _run_scan_with_progress(
-        stdscr, run,
-        "Finding a stable location…",
-        cancel_event, progress)
+    ok = True
+    if data is None:
+        ok = _run_scan_with_progress(
+            stdscr, run,
+            "Finding provisional pointer chains…",
+            cancel_event, progress)
     if not ok:
         add_log("Permanent resolver cancelled", "warn")
         return
@@ -6888,6 +7270,22 @@ def do_resolve_permanent(stdscr, target_addr: int) -> None:
             ["No stable location was found.",
              "Try again after the value has been used in-game."],
             "Permanent Location Not Found", C_WARN)
+        return
+
+
+    if data.get("method") != "cross-reload-validation":
+        maps = data.get("maps") or _get_maps_cached(state["ip"], state["pid"])
+        provisional = _make_pointer_provisionals(
+            candidates, maps, state["pid"], state["proc_name"], target_addr)
+        _save_pointer_provisionals(provisional)
+        message_box(
+            stdscr,
+            [f"Saved {len(provisional)} provisional pointer chain(s).",
+             "",
+             "They are not permanent yet.",
+             "Reload the game, isolate the value's new address, then",
+             "choose Resolve permanent again to validate automatically."],
+            "Reload Validation Required", C_WARN)
         return
 
     # Keep only the strongest verified choices; the user should choose between
@@ -6911,7 +7309,7 @@ def do_resolve_permanent(stdscr, target_addr: int) -> None:
         safe_addstr(stdscr, 6, 3, f"Permanent: {module} + {rel}",
                     color(C_OK) | curses.A_BOLD)
         safe_addstr(stdscr, 7, 3, f"Pointer path: {path or 'direct'}", color(C_WARN))
-        safe_addstr(stdscr, 8, 3, "Verification: ✓ Confirmed", color(C_OK))
+        safe_addstr(stdscr, 8, 3, "Verification: ✓ Survived game reload", color(C_OK))
         safe_addstr(stdscr, 9, 3, f"Confidence: {int(c.get('confidence', 0))}%",
                     color(C_OK))
 
@@ -7379,6 +7777,14 @@ def do_pointer_chain_verify(stdscr, candidate: dict, original_target: int) -> No
 
         elif key in (ord('s'), ord('S')):
             # Save as pointer cheat
+            if candidate.get("status") == "provisional":
+                message_box(
+                    stdscr,
+                    ["This chain is provisional and cannot be saved yet.",
+                     "Reload the game, isolate the address again, and use",
+                     "Resolve permanent to perform cross-reload validation."],
+                    "Reload Validation Required", C_WARN)
+                continue
             offsets = _offsets[0]   # re-alias after any edits
             stdscr.clear()
             draw_border(stdscr, "SAVE POINTER CHEAT")
@@ -7499,7 +7905,7 @@ def do_log(stdscr) -> None:
 # ── main loop ─────────────────────────────────────────────────────────────────
 
 def main(stdscr) -> None:
-    curses.curs_set(0)
+    _safe_curs_set(0)
     curses.noecho()
     curses.cbreak()          # ensure cbreak regardless of wrapper state
     init_colors()

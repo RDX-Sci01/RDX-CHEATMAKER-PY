@@ -372,6 +372,16 @@ _map_cache_lock = threading.Lock()
 _MAP_CACHE_TTL  = 30.0               # general scan cache TTL
 _WRITE_MAP_CACHE_TTL = 10.0          # shorter TTL for writes/freezes
 
+# Smart temporary → permanent resolver cache.  The index is built once per
+# process/map layout and reused for subsequent temporary addresses.
+_pointer_index_cache = {}
+_pointer_index_lock = threading.RLock()
+_PTR_INDEX_CHUNK = 0x2000000          # 32 MiB
+_PTR_RESOLVE_OFFSET_MAX = 0x200
+_PTR_RESOLVE_OFFSET_STEP = 8
+_PTR_RESOLVE_MAX_HITS = 128
+_PTR_RESOLVE_MAX_NODES = 2500
+
 # Issues #7/#8/#9/#10: track the active freeze worker globally so it can be
 # stopped when the user changes process or reconnects.  Without this the old
 # worker keeps writing to an address in the previous process's address space,
@@ -962,6 +972,389 @@ def ps5_write_verified(ip: str, pid: int, addr: int, data: bytes) -> tuple:
     except Exception:
         return True, None, None
     return True, actual == data, actual
+
+
+# ── Change-triggered debugger resolver ────────────────────────────────────────
+#
+# Prefer a hardware-watchpoint trace over a broad pointer-index build.
+# ps5debug-NG exposes a real debug session, four hardware watchpoints, and an
+# async interrupt channel on TCP/755.  The trace changes the target briefly,
+# waits for a real target-process access, captures RIP/registers, disassembles
+# the accessor, and then feeds the observed base pointer into the existing
+# bounded pointer scanner.  The original reverse-index resolver remains the
+# fallback when tracing is unavailable or produces no useful accessor.
+
+CMD_DEBUG_ATTACH        = 0xBDBB0001
+CMD_DEBUG_DETACH        = 0xBDBB0002
+CMD_DEBUG_SET_WATCHPOINT = 0xBDBB0004
+CMD_DEBUG_GET_THREAD_LIST = 0xBDBB0005
+CMD_DEBUG_GETDBREGS     = 0xBDBB000C
+CMD_PROC_DISASM_REGION  = 0xBDAA0020
+
+_DEBUG_EVENT_SIZE = 0x4A0
+_DEBUG_REG_OFFSET = 0x30
+_DEBUG_DBREG_OFFSET = 0x420
+_DEBUG_TRACE_TIMEOUT = 10.0
+_DEBUG_TRACE_MAX_HITS = 8
+_DEBUG_TRACE_WP_INDEX = None
+
+# FreeBSD/amd64 struct reg: 15 GP registers followed by trap/segment fields.
+_REG_OFFSETS = {
+    "r15": 0, "r14": 8, "r13": 16, "r12": 24, "r11": 32, "r10": 40,
+    "r9": 48, "r8": 56, "rdi": 64, "rsi": 72, "rbp": 80, "rbx": 88,
+    "rdx": 96, "rcx": 104, "rax": 112, "rip": 136, "rflags": 152,
+    "rsp": 160,
+}
+
+# Zydis 4.x register IDs used by ps5debug-NG's disassembler.
+_ZYDIS_GPR64 = {
+    53:"rax", 54:"rcx", 55:"rdx", 56:"rbx", 57:"rsp", 58:"rbp",
+    59:"rsi", 60:"rdi", 61:"r8", 62:"r9", 63:"r10", 64:"r11",
+    65:"r12", 66:"r13", 67:"r14", 68:"r15",
+}
+_ZYDIS_RIP = 197
+
+def _debug_status_ok(s: socket.socket) -> bool:
+    return struct.unpack("<I", recv_exact(s, 4))[0] == STATUS_SUCCESS
+
+def _debug_send(s: socket.socket, cmd: int, body: bytes = b"") -> None:
+    s.sendall(cmd_header(cmd, len(body)) + body)
+    if not _debug_status_ok(s):
+        raise RuntimeError(f"debug command 0x{cmd:X} rejected")
+
+def _debug_thread_list(s: socket.socket) -> list:
+    s.sendall(cmd_header(CMD_DEBUG_GET_THREAD_LIST))
+    if not _debug_status_ok(s):
+        raise RuntimeError("debug thread-list rejected")
+    n = struct.unpack("<I", recv_exact(s, 4))[0]
+    if n > 4096:
+        raise RuntimeError("invalid debug thread count")
+    return [struct.unpack("<I", recv_exact(s, 4))[0] for _ in range(n)]
+
+def _debug_get_dbregs(s: socket.socket, lwpid: int) -> bytes:
+    body = struct.pack("<I", int(lwpid))
+    s.sendall(cmd_header(CMD_DEBUG_GETDBREGS, len(body)) + body)
+    if not _debug_status_ok(s):
+        raise RuntimeError("debug DBREG read rejected")
+    return recv_exact(s, 128)
+
+def _debug_free_watchpoint(s: socket.socket, lwpid: int) -> Optional[int]:
+    try:
+        db = _debug_get_dbregs(s, lwpid)
+        regs = struct.unpack("<16Q", db)
+        dr7 = int(regs[7])
+        for i in range(4):
+            if not (dr7 & (1 << (2 * i))) and not (dr7 & (1 << (2 * i + 1))):
+                return i
+    except Exception:
+        return None
+    return None
+
+def _debug_set_watchpoint(s: socket.socket, index: int, address: int,
+                          length_code: int = 0, breaktype: int = 3) -> None:
+    # index, enabled, DR7 length encoding, DR7 access encoding, address
+    body = struct.pack("<IIIIQ", int(index), 1, int(length_code),
+                       int(breaktype), int(address))
+    _debug_send(s, CMD_DEBUG_SET_WATCHPOINT, body)
+
+def _debug_clear_watchpoint(s: socket.socket, index: int) -> None:
+    body = struct.pack("<IIIIQ", int(index), 0, 0, 3, 0)
+    _debug_send(s, CMD_DEBUG_SET_WATCHPOINT, body)
+
+def _debug_continue(s: socket.socket, action: int) -> None:
+    """Resume (0) or stop (1) the attached target process."""
+    _debug_send(s, 0xBDBB0010, struct.pack("<I", int(action)))
+
+def _debug_parse_event(packet: bytes) -> dict:
+    if len(packet) != _DEBUG_EVENT_SIZE:
+        raise RuntimeError("invalid debug event size")
+    regs_blob = packet[_DEBUG_REG_OFFSET:_DEBUG_REG_OFFSET + 176]
+    db_blob = packet[_DEBUG_DBREG_OFFSET:_DEBUG_DBREG_OFFSET + 128]
+    regs = {name: struct.unpack_from("<Q", regs_blob, off)[0]
+            for name, off in _REG_OFFSETS.items()}
+    db = struct.unpack("<16Q", db_blob)
+    return {
+        "lwpid": struct.unpack_from("<I", packet, 0)[0],
+        "status": struct.unpack_from("<I", packet, 4)[0],
+        "regs": regs,
+        "dbregs": db,
+    }
+
+def _debug_disasm(s: socket.socket, pid: int, address: int,
+                  length: int = 32, max_entries: int = 16) -> list:
+    body = struct.pack("<IQII", int(pid), int(address), int(length), int(max_entries))
+    s.sendall(cmd_header(CMD_PROC_DISASM_REGION, len(body)) + body)
+    if not _debug_status_ok(s):
+        raise RuntimeError("disassembly request rejected")
+    out = []
+    while True:
+        raw = recv_exact(s, 32)
+        if raw == b"\xFF" * 32:
+            break
+        addr, rip_rel, mem_disp = struct.unpack_from("<QQq", raw, 0)
+        insn_len, kind, mem_base, mem_index, mem_scale = struct.unpack_from("<BBBBB", raw, 24)
+        mnemonic = struct.unpack_from("<B", raw, 29)[0]
+        out.append({
+            "addr": addr, "rip_rel_target": rip_rel, "mem_disp": mem_disp,
+            "length": insn_len, "kind": kind, "mem_base_reg": mem_base,
+            "mem_index_reg": mem_index, "mem_scale": mem_scale,
+            "mnemonic_lo": mnemonic,
+        })
+    return out
+
+def _trace_temporary_access(ip: str, pid: int, target_addr: int,
+                            width: int, timeout: float = _DEBUG_TRACE_TIMEOUT) -> dict:
+    """
+    Change-triggered resolver:
+      1) attach debugger;
+      2) install a read/write hardware watchpoint on target;
+      3) write a distinctive temporary value;
+      4) wait for a real target-process access;
+      5) capture RIP/registers and decode the memory operand;
+      6) restore the original bytes and detach.
+
+    Returns a trace dictionary.  It never leaves the probe value installed.
+    """
+    target_addr = int(target_addr)
+    width = int(width)
+    original = ps5_read(ip, pid, target_addr, width)
+    if len(original) != width:
+        raise RuntimeError("could not read original target value")
+
+    mask = WIDTH_MAX[width]
+    probe = (int.from_bytes(original, "little") ^ (0x5A5A5A5A5A5A5A5A & mask))
+    if probe == int.from_bytes(original, "little"):
+        probe = (probe + 1) & mask
+    probe_bytes = struct.pack(WIDTH_FMT[width], probe)
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("0.0.0.0", 755))
+    listener.listen(1)
+    listener.settimeout(max(timeout + 1.0, 2.0))
+
+    cmd = None
+    event_sock = None
+    attached = False
+    wp_index = None
+    try:
+        cmd = ps5_connect(ip, timeout=10.0)
+        body = struct.pack("<I", int(pid))
+        cmd.sendall(cmd_header(CMD_DEBUG_ATTACH, len(body)) + body)
+        if not _debug_status_ok(cmd):
+            raise RuntimeError("debug attach rejected")
+        attached = True
+
+        event_sock, _ = listener.accept()
+        event_sock.settimeout(timeout)
+
+        threads = _debug_thread_list(cmd)
+        if not threads:
+            raise RuntimeError("debugger attached but no target threads were reported")
+        lwpid = threads[0]
+        wp_index = _debug_free_watchpoint(cmd, lwpid)
+        if wp_index is None:
+            raise RuntimeError("no free hardware watchpoint slot")
+
+        # The attach command resumes the target. Stop it before changing the
+        # probe so our own write cannot be mistaken for the game's access.
+        _debug_continue(cmd, 1)
+        if not ps5_write(ip, pid, target_addr, probe_bytes):
+            raise RuntimeError("probe write was rejected")
+
+        # DR7 length encoding: 0=1 byte, 1=2 bytes, 2=8 bytes, 3=4 bytes.
+        wp_length = {1: 0, 2: 1, 4: 3, 8: 2}.get(width)
+        if wp_length is None:
+            raise RuntimeError(f"unsupported watchpoint width: {width}")
+        _debug_set_watchpoint(cmd, wp_index, target_addr, wp_length, 3)
+        _debug_continue(cmd, 0)
+
+        # Collect a few genuine target accesses.  The first hit is not always
+        # the useful accessor (for example a housekeeping read), so keep trying
+        # until we decode a usable memory operand or the trace window expires.
+        deadline = time.monotonic() + max(timeout, 0.1)
+        event = None
+        insn = None
+        last_reason = "no matching hardware watchpoint event"
+        hits = 0
+        while time.monotonic() < deadline and hits < _DEBUG_TRACE_MAX_HITS:
+            remaining = max(deadline - time.monotonic(), 0.05)
+            event_sock.settimeout(remaining)
+            try:
+                packet = recv_exact(event_sock, _DEBUG_EVENT_SIZE)
+            except socket.timeout:
+                break
+            candidate = _debug_parse_event(packet)
+            dr6 = int(candidate["dbregs"][6])
+            if not (dr6 & (1 << int(wp_index))):
+                continue
+            hits += 1
+            regs = candidate["regs"]
+            rip = int(regs["rip"])
+            try:
+                insns = _debug_disasm(cmd, pid, max(rip - 8, _ADDR_MIN), 32, 16)
+                decoded = next((x for x in insns if int(x["addr"]) == rip), None)
+            except Exception as exc:
+                decoded = None
+                last_reason = f"disassembly failed: {exc}"
+            if not decoded or not (int(decoded["kind"]) & 0x10):
+                last_reason = "watchpoint hit but accessor instruction was not decoded"
+                continue
+            event = candidate
+            insn = decoded
+            break
+        if event is None or insn is None:
+            raise TimeoutError(last_reason)
+
+        regs = event["regs"]
+        rip = int(regs["rip"])
+
+        base_reg_id = int(insn["mem_base_reg"])
+        index_reg_id = int(insn["mem_index_reg"])
+        base_name = _ZYDIS_GPR64.get(base_reg_id)
+        index_name = _ZYDIS_GPR64.get(index_reg_id)
+
+        # Resolve the actual effective address represented by the decoded
+        # operand.  RIP-relative accesses are stable code references, not object
+        # pointers, so they are reported but not used as permanent pointer roots.
+        index_val = int(regs.get(index_name, 0)) if index_name else 0
+        if base_reg_id == _ZYDIS_RIP:
+            base_val = rip
+            base_name = "rip"
+        elif base_name:
+            base_val = int(regs[base_name])
+        else:
+            base_val = 0
+
+        effective = base_val + (index_val * int(insn["mem_scale"] or 1)) + int(insn["mem_disp"])
+        if effective != target_addr:
+            raise RuntimeError(
+                f"decoded accessor mismatch: {hex(effective)} != {hex(target_addr)}"
+            )
+
+        kind = int(insn.get("kind", 0))
+        access_mode = "readwrite"
+        if kind & 0x40 and not (kind & 0x80):
+            access_mode = "read"
+        elif kind & 0x80 and not (kind & 0x40):
+            access_mode = "write"
+
+        return {
+            "success": True,
+            "target": target_addr,
+            "probe": probe,
+            "rip": rip,
+            "base_reg": base_name or f"reg#{base_reg_id}",
+            "base_value": base_val,
+            "index_reg": index_name,
+            "index_value": index_val,
+            "scale": int(insn["mem_scale"] or 1),
+            "final_offset": int(insn["mem_disp"]),
+            "access_mode": access_mode,
+            "instruction": insn,
+            "lwpid": int(event["lwpid"]),
+        }
+    finally:
+        # Clear the watchpoint before restoring the original value. Otherwise
+        # the restore write itself can generate another debug stop.
+        if cmd is not None and wp_index is not None:
+            try:
+                _debug_clear_watchpoint(cmd, wp_index)
+            except Exception:
+                pass
+        try:
+            ps5_write(ip, pid, target_addr, original)
+        except Exception as exc:
+            add_log(f"Trace restore failed @ {hex(target_addr)}: {exc}", "error")
+        if cmd is not None:
+            if attached:
+                try:
+                    cmd.sendall(cmd_header(CMD_DEBUG_DETACH))
+                    _debug_status_ok(cmd)
+                except Exception:
+                    pass
+        if event_sock is not None:
+            try: event_sock.close()
+            except Exception: pass
+        if cmd is not None:
+            try: cmd.close()
+            except Exception: pass
+        try: listener.close()
+        except Exception: pass
+
+def _resolve_trace_first(ip: str, pid: int, target_addr: int,
+                         width: int, cancel_event=None,
+                         progress_cb=None) -> dict:
+    """
+    Trace first, then resolve the observed object pointer with the existing
+    bounded pointer scanner.  Falls back to the cached reverse index if the
+    trace backend is unavailable or the accessor is not pointer-like.
+    """
+    trace = _trace_temporary_access(ip, pid, target_addr, width)
+    if cancel_event and cancel_event.is_set():
+        return {"candidates": [], "trace": trace, "method": "trace-cancelled"}
+
+    # A stable pointer root needs a general-purpose base register.  Indexed
+    # addressing is reported but deliberately not promoted to a permanent chain
+    # because its index can change at runtime.
+    if (not trace.get("base_value") or trace.get("base_reg") in ("rip", "rsp", "rbp")
+            or trace.get("index_reg")):
+        return {"candidates": [], "trace": trace, "method": "trace-no-stable-base"}
+
+    if progress_cb:
+        progress_cb(0, max(_PTR_RESOLVE_MAX_NODES, 1))
+
+    base_target = int(trace["base_value"])
+    candidates = pointer_chain_scan(
+        ip, pid, base_target,
+        max_depth=min(3, MAX_CHAIN_DEPTH),
+        cancel_event=cancel_event,
+        progress_cb=progress_cb,
+    )
+
+    verified = []
+    final_off = int(trace["final_offset"])
+    maps = _get_maps_cached(ip, pid)
+    for c in candidates:
+        if not c.get("static"):
+            continue
+        c2 = dict(c)
+        # The traced instruction is the terminal field access. The reverse
+        # chain resolves to the object/base pointer; the traced displacement is
+        # then added directly. Do not treat the displacement as another pointer
+        # dereference.
+        c2["offsets"] = list(c["offsets"])
+        c2["terminal_offset"] = final_off
+        c2["depth"] = len(c2["offsets"])
+        c2["trace_rip"] = int(trace["rip"])
+        c2["trace_base_reg"] = trace.get("base_reg")
+        c2["trace_base_value"] = base_target
+        c2["trace_final_offset"] = final_off
+        c2["trace_access_mode"] = trace.get("access_mode", "readwrite")
+        c2["trace_instruction"] = trace.get("instruction")
+        mod, mb, mr = _module_info_for_addr(int(c2["base"]), maps)
+        c2["module_name"] = mod or "main"
+        c2["module_base"] = mb
+        c2["module_relative_offset"] = mr
+        ok, resolved, steps = _resolve_pointer_chain(
+            ip, pid, int(c2["base"]), c2["offsets"], final_off)
+        c2["verified"] = bool(ok and resolved == int(target_addr))
+        c2["resolved"] = int(resolved) if ok else 0
+        c2["resolved_base"] = int(resolved - final_off) if ok else 0
+        c2["steps"] = steps
+        if c2["verified"]:
+            c2["score"] = float(c2.get("score", 0.0)) + 150.0
+            verified.append(c2)
+
+    verified.sort(key=lambda c: (-c["score"], c["depth"]))
+    return {
+        "candidates": verified,
+        "trace": trace,
+        "method": "change-triggered",
+        "index_built": False,
+        "maps": maps,
+    }
+
 
 # ── batch reader for scan_next ────────────────────────────────────────────────
 
@@ -2214,7 +2607,8 @@ def ps5_read_pointer(ip: str, pid: int, addr: int) -> int:
 
 def _resolve_pointer_chain(ip: str, pid: int,
                             base_addr: int,
-                            offsets: list) -> tuple:
+                            offsets: list,
+                            terminal_offset: int = 0) -> tuple:
     """
     Follow a pointer chain starting at `base_addr` and applying each offset
     in `offsets` in order.  Every level reads a uint64 pointer then adds the
@@ -2231,7 +2625,10 @@ def _resolve_pointer_chain(ip: str, pid: int,
         steps contains the intermediate resolved addresses for debugging.
     """
     if not offsets:
-        return True, base_addr, []
+        current = int(base_addr) + int(terminal_offset)
+        if current < _ADDR_MIN or current > _ADDR_MAX:
+            return False, 0, []
+        return True, current, []
 
     steps   = []
     current = base_addr
@@ -2243,262 +2640,536 @@ def _resolve_pointer_chain(ip: str, pid: int,
         current = ptr_val + offset
         steps.append(current)
 
+    current += int(terminal_offset)
     if current < _ADDR_MIN or current > _ADDR_MAX:
         return False, 0, steps
+    if terminal_offset:
+        steps.append(current)
     return True, current, steps
 
 
-def scan_for_pointer(ip: str, pid: int,
-                     target_addr: int,
-                     cancel_event=None,
-                     progress_cb=None) -> np.ndarray:
+# ── Smart temporary → permanent resolver ────────────────────────────────────
+#
+# This is deliberately separate from pointer_chain_scan().  The older scanner
+# remains available as an advanced/fallback search.  The resolver builds one
+# reverse pointer index for the process and then answers many temporary-address
+# queries from that index instead of rescanning memory for every address.
+
+
+def _pointer_map_fingerprint(maps: list) -> tuple:
+    """Compact fingerprint used to invalidate the reverse index on remaps."""
+    return tuple(sorted((int(r.get("start", 0)), int(r.get("end", 0)),
+                         int(r.get("prot", 0)), str(r.get("name", "")))
+                        for r in maps))
+
+
+def _module_info_for_addr(addr: int, maps: list) -> tuple:
+    """Return (module_name, module_base, relative_offset) for a static address."""
+    containing = None
+    for r in maps:
+        if int(r["start"]) <= addr < int(r["end"]):
+            containing = r
+            break
+    if containing is None:
+        return ("", 0, 0)
+    name = str(containing.get("name", "") or "")
+    static_maps = [r for r in maps if _is_static_region(r)]
+    if name:
+        same = [r for r in static_maps if str(r.get("name", "") or "") == name]
+    else:
+        same = []
+    if same:
+        base = min(int(r["start"]) for r in same)
+        return (name, base, int(addr - base))
+    # For unnamed low/static mappings, use the lowest static mapping as the
+    # main module anchor.  This is still ASLR-relative rather than absolute.
+    if _is_static_region(containing) and static_maps:
+        base = min(int(r["start"]) for r in static_maps)
+        return (name or "main", base, int(addr - base))
+    return (name, int(containing["start"]), int(addr - containing["start"]))
+
+
+class _ReversePointerIndex:
+    """Compact reverse pointer index: pointer value -> holder addresses.
+
+    Two uint64 arrays are kept sorted by pointer value.  This is considerably
+    smaller than a Python dict containing millions of integer/list objects and
+    allows repeated binary-search queries for different temporary addresses.
     """
-    Scan all readable memory for uint64 values equal to `target_addr`.
+    def __init__(self, ip: str, pid: int, maps: list, cancel_event=None,
+                 progress_cb=None):
+        self.ip = ip
+        self.pid = pid
+        self.maps = maps
+        self.fingerprint = _pointer_map_fingerprint(maps)
+        self.values = np.empty(0, dtype=np.uint64)
+        self.holders = np.empty(0, dtype=np.uint64)
+        self.total_bytes = 0
+        self.done_bytes = 0
+        self._build(cancel_event, progress_cb)
 
-    This is functionally identical to scan_first() with width=8 and the target
-    being the bytes of the address itself.  We call the existing scan_first()
-    machinery directly rather than duplicating it.
+    def _build(self, cancel_event=None, progress_cb=None):
+        readable = _pointer_readable_regions(self.maps)
+        if not readable:
+            return
+        starts = np.asarray([int(r["start"]) for r in self.maps], dtype=np.uint64)
+        ends = np.asarray([int(r["end"]) for r in self.maps], dtype=np.uint64)
+        total = max(sum(int(r["end"]) - int(r["start"]) for r in readable), 1)
+        vals_parts, holder_parts = [], []
+        sock = _ScanSocket(self.ip, self.pid)
+        try:
+            for region in readable:
+                if cancel_event and cancel_event.is_set():
+                    break
+                rs, re_ = int(region["start"]), int(region["end"])
+                pos = rs + ((-rs) % 8)
+                while pos < re_:
+                    if cancel_event and cancel_event.is_set():
+                        break
+                    size = min(_PTR_INDEX_CHUNK, re_ - pos)
+                    size -= size % 8
+                    if size < 8:
+                        break
+                    try:
+                        raw = sock.read(pos, size, cancel_event)
+                    except Exception as exc:
+                        add_log(f"Pointer index read error @ {hex(pos)}: {exc}", "warn")
+                        self.done_bytes += size
+                        pos += size
+                        if progress_cb:
+                            progress_cb(self.done_bytes, total)
+                        continue
+                    trim = len(raw) - (len(raw) % 8)
+                    if trim >= 8:
+                        a = np.frombuffer(raw[:trim], dtype=np.uint64)
+                        # A pointer candidate must be a user-space address that
+                        # currently falls inside a mapped region.  This removes
+                        # ordinary integers while retaining heap/module pointers.
+                        plausible = (a >= _ADDR_MIN) & (a <= _ADDR_MAX)
+                        idx = np.searchsorted(starts, a, side="right") - 1
+                        idx_i = idx.astype(np.int64, copy=False)
+                        valid_idx = (idx_i >= 0)
+                        if valid_idx.any():
+                            ii = np.where(valid_idx, idx_i, 0)
+                            plausible &= valid_idx & (a < ends[ii])
+                        hit_idx = np.flatnonzero(plausible)
+                        if hit_idx.size:
+                            vals_parts.append(a[hit_idx].copy())
+                            holder_parts.append(
+                                pos + hit_idx.astype(np.uint64, copy=False) * np.uint64(8))
+                    self.done_bytes += size
+                    pos += size
+                    if progress_cb:
+                        progress_cb(self.done_bytes, total)
+        finally:
+            sock.close()
+        if vals_parts:
+            self.values = np.concatenate(vals_parts)
+            self.holders = np.concatenate(holder_parts)
+            order = np.argsort(self.values, kind="mergesort")
+            self.values = self.values[order]
+            self.holders = self.holders[order]
+        add_log(f"Reverse pointer index built: {len(self.values):,} pointers, "
+                f"{self.done_bytes / 1048576:.1f} MiB scanned")
 
-    Returns ndarray[uint64] of addresses that contain a pointer to target_addr.
-    """
-    # Validate target is a plausible PS5 user-space address.
-    if target_addr < _ADDR_MIN or target_addr > _ADDR_MAX:
-        add_log(f"Pointer scan: target {hex(target_addr)} is not a valid "
-                "user-space address", "warn")
-        return np.empty(0, dtype=_NP_ADDR_DTYPE)
-
-    add_log(f"Pointer scan: searching for pointers to {hex(target_addr)}")
-    results = scan_first(
-        ip, pid, target_addr,
-        width=8,
-        aligned=True,          # pointers are always 8-byte aligned on PS5
-        progress_cb=progress_cb,
-        cancel_event=cancel_event,
-        writable_only=False,   # static regions may not be writable
-    )
-    add_log(f"Pointer scan: found {len(results):,} locations containing "
-            f"{hex(target_addr)}")
-    return results
-
-
-def classify_pointer_results(ip: str, pid: int,
-                              ptr_addrs: np.ndarray) -> tuple:
-    """
-    Split pointer scan results into (static_addrs, heap_addrs) using the
-    current memory map.
-
-    Returns:
-        static_addrs : ndarray[uint64]  — addresses in static/module regions
-        heap_addrs   : ndarray[uint64]  — addresses in heap/anon regions
-        region_map   : dict {addr: region_name}  — for display
-    """
-    try:
-        maps = _get_maps_cached(ip, pid)
-    except Exception:
-        # If we can't get the map, return everything as heap (conservative).
-        return np.empty(0, dtype=_NP_ADDR_DTYPE), ptr_addrs, {}
-
-    # Build sorted arrays of region boundaries for O(log N) lookup.
-    starts = np.array([r["start"] for r in maps], dtype=np.uint64)
-    ends   = np.array([r["end"]   for r in maps], dtype=np.uint64)
-    order  = np.argsort(starts)
-    starts = starts[order]
-    ends   = ends[order]
-    maps_s = [maps[i] for i in order]
-
-    static_list  = []
-    heap_list    = []
-    region_map   = {}
-
-    for addr in ptr_addrs.tolist():
-        idx = int(np.searchsorted(starts, addr, side="right")) - 1
-        if idx < 0 or addr >= ends[idx]:
-            heap_list.append(addr)
-            region_map[addr] = "unmapped"
-            continue
-        region = maps_s[idx]
-        name   = region.get("name", "")
-        region_map[addr] = name or "anon"
-        if _is_static_region(region):
-            static_list.append(addr)
-        else:
-            heap_list.append(addr)
-
-    return (np.array(static_list, dtype=_NP_ADDR_DTYPE),
-            np.array(heap_list,   dtype=_NP_ADDR_DTYPE),
-            region_map)
+    def query(self, target: int, max_offset: int = _PTR_RESOLVE_OFFSET_MAX,
+              step: int = _PTR_RESOLVE_OFFSET_STEP,
+              max_hits: int = _PTR_RESOLVE_MAX_HITS) -> list:
+        """Return (holder, offset) where *holder contains target-offset*."""
+        if self.values.size == 0:
+            return []
+        out = []
+        seen = set()
+        for off in range(0, max_offset + 1, step):
+            wanted = int(target) - off
+            if wanted < _ADDR_MIN:
+                continue
+            lo = int(np.searchsorted(self.values, np.uint64(wanted), side="left"))
+            hi = int(np.searchsorted(self.values, np.uint64(wanted), side="right"))
+            for holder in self.holders[lo:hi].tolist():
+                holder = int(holder)
+                if holder in seen:
+                    continue
+                seen.add(holder)
+                out.append((holder, off))
+                if len(out) >= max_hits:
+                    return out
+        return out
 
 
-# A pointer scan normally finds an exact pointer value.  That is not enough
-# to find common struct-member pointers, where the memory cell contains
-# (target_address - struct_offset).  The old _auto_pointer_offset() tried to
-# infer the offset by reading the exact-match cell, which can only ever produce
-# zero.  Keep the zero case cheap and use an explicit bounded sweep for the
-# actual struct-offset case.
-POINTER_STRUCT_SWEEP_MAX = 0x200
-POINTER_STRUCT_SWEEP_STEP = 8
+def _get_reverse_pointer_index(ip: str, pid: int, cancel_event=None,
+                               progress_cb=None):
+    """Get or build the cached reverse pointer index for the current map layout."""
+    maps = _get_maps_cached(ip, pid)
+    fp = _pointer_map_fingerprint(maps)
+    key = (ip, int(pid))
+    with _pointer_index_lock:
+        cached = _pointer_index_cache.get(key)
+        if cached and cached[0] == fp:
+            return cached[1], maps, False
+    idx = _ReversePointerIndex(ip, pid, maps, cancel_event, progress_cb)
+    with _pointer_index_lock:
+        # A later builder may have won the race; keep the first completed index.
+        cached = _pointer_index_cache.get(key)
+        if cached and cached[0] == fp:
+            return cached[1], maps, False
+        _pointer_index_cache[key] = (fp, idx)
+    return idx, maps, True
 
-def _pointer_target_sweep(ip: str, pid: int, target_addr: int,
-                          cancel_event=None) -> list:
-    """Return (holder_address, struct_offset) hits for a target.
 
-    For each aligned offset O, a holder containing ``target_addr - O`` is a
-    valid pointer to ``target_addr`` at ``holder + O``.  The sweep is bounded
-    to 0x200 bytes to avoid turning pointer scanning into an unbounded search.
-    Results are deduplicated by holder/offset and capped like normal pointer
-    scan results.
-    """
-    hits = []
-    seen = set()
-    max_off = min(POINTER_STRUCT_SWEEP_MAX, target_addr - _ADDR_MIN)
-    for off in range(0, max_off + 1, POINTER_STRUCT_SWEEP_STEP):
+def _invalidate_pointer_index(ip=None, pid=None):
+    with _pointer_index_lock:
+        if ip is None and pid is None:
+            _pointer_index_cache.clear()
+            return
+        _pointer_index_cache.pop((ip, int(pid)), None)
+
+
+def _resolve_permanent_candidates(ip: str, pid: int, target_addr: int,
+                                  max_depth: int = 5, cancel_event=None,
+                                  progress_cb=None) -> dict:
+    """Reverse-trace a known temporary address to stable module/static roots."""
+    max_depth = max(1, min(int(max_depth), 6))
+    index, maps, built = _get_reverse_pointer_index(
+        ip, pid, cancel_event, progress_cb)
+    if cancel_event and cancel_event.is_set():
+        return {"candidates": [], "index_built": built, "maps": maps}
+
+    # Queue entries are (current_target, reverse_edges, visited_nodes).
+    # reverse_edges are [(holder, offset, region), ...] from target backwards.
+    queue = [(int(target_addr), [], {int(target_addr)})]
+    found = []
+    best_depth_for_node = {}
+    processed = 0
+
+    while queue and processed < _PTR_RESOLVE_MAX_NODES:
         if cancel_event and cancel_event.is_set():
             break
-        wanted = target_addr - off
-        if wanted < _ADDR_MIN or wanted > _ADDR_MAX:
+        current, rev_edges, visited = queue.pop(0)
+        depth = len(rev_edges) + 1
+        if depth > max_depth:
             continue
-        ptr_addrs = scan_for_pointer(ip, pid, wanted,
-                                     cancel_event=cancel_event,
-                                     progress_cb=None)
-        for addr in ptr_addrs.tolist():
-            key = (int(addr), int(off))
-            if key in seen:
+        hits = index.query(current)
+        for holder, off in hits:
+            if holder in visited:
                 continue
-            seen.add(key)
-            hits.append(key)
-            if len(hits) >= MAX_PTR_RESULTS:
-                add_log("Pointer struct-offset sweep reached result cap", "warn")
-                return hits
+            region = next((r for r in maps
+                           if int(r["start"]) <= holder < int(r["end"])), None)
+            if region is None:
+                continue
+            is_static = _is_static_region(region)
+            edge = (holder, off, region)
+            new_rev = rev_edges + [edge]
+            if is_static:
+                # Reverse order gives root -> target offsets.
+                chain = [e[1] for e in reversed(new_rev)]
+                module_name, module_base, module_rel = _module_info_for_addr(holder, maps)
+                aligned = sum(1 for x in chain if x % 8 == 0)
+                reasonable = sum(1 for x in chain if 0 <= x <= 0x200)
+                stable = bool(region.get("name")) or not (int(region.get("prot", 0)) & 0x2)
+                score = 100 + 60 + max(0, 35 - len(chain) * 7)
+                score += int(12 * aligned / max(len(chain), 1))
+                score += int(8 * reasonable / max(len(chain), 1))
+                score += 12 if stable else 0
+                cand = {
+                    "base": holder,
+                    "offsets": chain,
+                    "depth": len(chain),
+                    "region": region.get("name", "") or "static",
+                    "static": True,
+                    "module_name": module_name or "main",
+                    "module_base": module_base,
+                    "module_relative_offset": module_rel,
+                    "score": float(score),
+                    "verified": False,
+                }
+                found.append(cand)
+            elif depth < max_depth:
+                # Prefer shorter paths to the same holder; this is a small beam
+                # only, because the index itself is cached and cheap to query.
+                old = best_depth_for_node.get(holder)
+                if old is None or len(new_rev) < old:
+                    best_depth_for_node[holder] = len(new_rev)
+                    queue.append((holder, new_rev, visited | {holder}))
+            processed += 1
+        if progress_cb:
+            progress_cb(processed, max(_PTR_RESOLVE_MAX_NODES, 1))
+
+    # Deduplicate by permanent representation and verify every candidate live.
+    unique = {}
+    for c in found:
+        key = (c["module_name"], c["module_relative_offset"], tuple(c["offsets"]))
+        old = unique.get(key)
+        if old is None or c["score"] > old["score"]:
+            unique[key] = c
+    candidates = list(unique.values())
+
+    for c in candidates:
+        if cancel_event and cancel_event.is_set():
+            break
+        ok, resolved, steps = _resolve_pointer_chain(ip, pid, c["base"], c["offsets"])
+        c["verified"] = bool(ok and resolved == int(target_addr))
+        c["resolved"] = int(resolved) if ok else 0
+        c["steps"] = steps
+        if c["verified"]:
+            c["score"] += 100
+
+    candidates.sort(key=lambda c: (-int(c["verified"]), -c["score"],
+                                   c["depth"], c["module_name"],
+                                   c["module_relative_offset"]))
+    for i, c in enumerate(candidates):
+        c["rank"] = i + 1
+    return {"candidates": candidates, "index_built": built, "maps": maps}
+
+
+# ── Dedicated pointer scanner ────────────────────────────────────────────────
+#
+# Pointer scanning is deliberately implemented as a STREAMING / BEAM search.
+# The previous implementation loaded every readable 8-byte slot from the PS5
+# into two giant NumPy arrays at every depth.  On a title with several GB of
+# mapped memory that meant several GB of RAM and another full network pass for
+# every depth, even when the first level had no useful hit.
+#
+# The scanner below keeps only the addresses that can participate in a chain and
+# processes memory in chunks.  It also tests struct offsets at EVERY depth: a
+# chain such as
+#
+#   static -> heap + 0x20 -> heap + 0x58 -> value
+#
+# is otherwise impossible to discover if the non-zero offset occurs after level
+# 1.  A bounded beam prevents a noisy game from exploding into millions of
+# possible chains.
+
+_PTR_STRUCT_MAX       = 0x200
+_PTR_STRUCT_STEP      = 8
+_PTR_CHUNK             = 0x2000000       # 32 MiB network reads
+_PTR_BEAM_MAX          = 12_000          # heap targets carried to next depth
+_PTR_SEARCH_TARGET_MAX = 200_000        # max unique target/offset values per pass
+_PTR_DEPTH_DEFAULT     = 4
+
+
+def _pointer_readable_regions(maps: list) -> list:
+    """Return useful readable regions, excluding obvious giant reserved maps."""
+    PROT_READ = 0x1
+    PROT_EXEC = 0x4
+    MAX_REGION = 0x40000000  # 1 GiB; avoid obvious GPU/VM reservations
+    out = []
+    for r in maps:
+        start, end = int(r.get("start", 0)), int(r.get("end", 0))
+        prot = int(r.get("prot", 0))
+        if end <= start or not (prot & PROT_READ):
+            continue
+        if prot == PROT_EXEC:
+            continue
+        if end - start > MAX_REGION:
+            continue
+        out.append(r)
+    # Static/module regions first.  This lets a useful short chain be surfaced
+    # quickly, while heap regions are still searched when they are needed to
+    # extend a chain.
+    out.sort(key=lambda r: (not _is_static_region(r), r["start"]))
+    return out
+
+
+def _pointer_scan_chunk(sock: _ScanSocket, start: int, size: int,
+                        search_arr: np.ndarray, search_val_map: dict,
+                        maps_sorted: list, map_starts: np.ndarray,
+                        map_ends: np.ndarray, cancel_event=None):
+    """Read one chunk and return matching (holder, target, offset, chain) hits."""
+    raw = sock.read(start, size, cancel_event)
+    trim = len(raw) - (len(raw) % 8)
+    if trim < 8:
+        return []
+    vals = np.frombuffer(raw[:trim], dtype=np.uint64)
+    mask = np.isin(vals, search_arr)
+    indices = np.flatnonzero(mask)
+    if not len(indices):
+        return []
+
+    holders = start + indices.astype(np.uint64) * 8
+    hits = []
+    # Usually only a tiny number of slots match a pointer target.  Keep the
+    # Python work limited to those hits rather than iterating over the chunk.
+    for idx, holder_u in zip(indices.tolist(), holders.tolist()):
+        sv = np.uint64(vals[idx])
+        for target, soff, chain in search_val_map.get(sv, ()):
+            # A pointer holder itself must be inside a mapped region.
+            mi = int(np.searchsorted(map_starts, holder_u, side="right") - 1)
+            if mi < 0 or holder_u >= int(map_ends[mi]):
+                continue
+            region = maps_sorted[mi]
+            hits.append((int(holder_u), int(target), int(soff), chain,
+                         bool(_is_static_region(region)),
+                         region.get("name", "") or "anon"))
     return hits
 
 
 def pointer_chain_scan(ip: str, pid: int,
                        target_addr: int,
-                       max_depth: int = 3,
+                       max_depth: int = _PTR_DEPTH_DEFAULT,
                        cancel_event=None,
                        progress_cb=None) -> list:
+    """Find static pointer chains to ``target_addr`` without full-memory caching.
+
+    The search works backwards from the temporary address.  At each level it
+    looks for pointers to ``target - offset`` for aligned offsets 0..0x200.  A
+    heap holder becomes the target for the next level; a static holder becomes
+    a candidate immediately.
+
+    Important differences from the old scanner:
+      * memory is streamed in 32 MiB chunks instead of retained for every level;
+      * offsets are tested at every pointer level, not only level 1;
+      * heap expansion is bounded (beam search) so one noisy heap cannot create
+        millions of chains;
+      * the default depth is 4, with the UI able to request deeper scans later;
+      * the first static hit can be returned without waiting for six full passes.
     """
-    Multi-level pointer chain scanner.
-
-    Iteratively scans for pointers TO the target, then pointers TO those
-    pointers, up to `max_depth` levels.  At each level the scan is restricted
-    to the writable+readable region so we don't spend time scanning ROM.
-
-    Returns a list of PointerCandidate dicts:
-        {
-            "base":    int,          # static address that anchors the chain
-            "offsets": [int, ...],   # offsets applied at each level
-            "depth":   int,          # chain length
-            "region":  str,          # name of the region containing base
-            "static":  bool,         # True if base is in a static region
-        }
-
-    The list is sorted: static candidates first, then by ascending depth,
-    then by ascending base address (most predictable / lowest first).
-    """
+    started = time.monotonic()
     candidates = []
-    # Level 0: addresses that directly hold target_addr.
-    current_targets = {target_addr: []}   # {addr_being_pointed_to: offsets_so_far}
+
+    max_depth = max(1, min(int(max_depth), MAX_CHAIN_DEPTH))
+    try:
+        maps = _get_maps_cached(ip, pid)
+    except Exception as exc:
+        add_log(f"Pointer scan: could not fetch memory map: {exc}", "error")
+        return []
+    if not maps:
+        add_log("Pointer scan: memory map is empty", "warn")
+        return []
+
+    readable = _pointer_readable_regions(maps)
+    if not readable:
+        add_log("Pointer scan: no readable data regions", "warn")
+        return []
+
+    maps_sorted = sorted(maps, key=lambda r: r["start"])
+    map_starts = np.asarray([r["start"] for r in maps_sorted], dtype=np.uint64)
+    map_ends   = np.asarray([r["end"] for r in maps_sorted], dtype=np.uint64)
+
+    # target -> offsets already discovered, stored as tuples so we can keep the
+    # best (shortest) chain when multiple paths reach the same holder.
+    current_targets = {int(target_addr): []}
+    total_bytes = max(sum(int(r["end"]) - int(r["start"]) for r in readable), 1)
 
     for depth in range(1, max_depth + 1):
         if cancel_event and cancel_event.is_set():
             break
-        next_targets = {}
-
-        for pointed_to, chain_so_far in current_targets.items():
-            if cancel_event and cancel_event.is_set():
-                break
-            if progress_cb:
-                progress_cb(depth - 1, max_depth)
-
-            # The first level gets the bounded struct-member sweep because
-            # this is where a static pointer commonly anchors a heap object.
-            # Deeper levels use exact pointer matches to avoid multiplying a
-            # 65-scan sweep by every intermediate candidate.
-            if depth == 1:
-                pointer_hits = _pointer_target_sweep(
-                    ip, pid, pointed_to, cancel_event=cancel_event)
-            else:
-                ptr_addrs = scan_for_pointer(
-                    ip, pid, pointed_to, cancel_event=cancel_event,
-                    progress_cb=None)
-                pointer_hits = [(int(a), 0) for a in ptr_addrs.tolist()]
-            if not pointer_hits:
-                continue
-
-            # Group/deduplicate by holder while retaining distinct offsets.
-            # A holder may legitimately produce more than one candidate if the
-            # same address can be interpreted through different pointer values.
-            static_hits = []
-            heap_hits = []
-            try:
-                maps = _get_maps_cached(ip, pid)
-            except Exception:
-                maps = []
-            # Classification is independent of the offset, so build the map
-            # index once instead of fetching/rebuilding it for every hit.
-            starts = np.array([r["start"] for r in maps], dtype=np.uint64)
-            ends = np.array([r["end"] for r in maps], dtype=np.uint64)
-            if len(starts):
-                order = np.argsort(starts)
-                starts = starts[order]; ends = ends[order]
-                maps_s = [maps[i] for i in order]
-            else:
-                maps_s = []
-            for addr, step_offset in pointer_hits:
-                mi = int(np.searchsorted(starts, addr, side="right")) - 1 if len(starts) else -1
-                if mi >= 0 and addr < int(ends[mi]):
-                    region = maps_s[mi]
-                    rname = region.get("name", "") or "anon"
-                    is_static = _is_static_region(region)
-                else:
-                    rname = "unmapped"; is_static = False
-                (static_hits if is_static else heap_hits).append((addr, step_offset, rname))
-
-            for addr, step_offset, rname in static_hits:
-                candidates.append({
-                    "base": addr,
-                    "offsets": chain_so_far + [step_offset],
-                    "depth": depth,
-                    "region": rname,
-                    "static": True,
-                })
-
-            # Track heap results as seeds for deeper levels.
-            heap_list = heap_hits
-            if len(next_targets) + len(heap_list) > MAX_PTR_RESULTS:
-                heap_list = heap_list[:max(0, MAX_PTR_RESULTS - len(next_targets))]
-                add_log(f"Depth {depth}: next_targets capped at {MAX_PTR_RESULTS:,}", "warn")
-            for addr, step_offset, rname in heap_list:
-                new_chain = chain_so_far + [step_offset]
-                # Keep one chain per heap holder for the next depth.  If the
-                # same holder was discovered through multiple offsets, prefer
-                # the shorter chain; emitting every duplicate would explode the
-                # search space without improving the next pointer level.
-                old_chain = next_targets.get(addr)
-                if old_chain is None or len(new_chain) < len(old_chain):
-                    next_targets[addr] = new_chain
-                if depth == max_depth:
-                    candidates.append({
-                        "base": addr,
-                        "offsets": new_chain,
-                        "depth": depth,
-                        "region": rname,
-                        "static": False,
-                    })
-
-
-        current_targets = next_targets
         if not current_targets:
+            add_log(f"Pointer scan depth {depth}: no heap targets remain")
             break
 
-    if progress_cb:
-        progress_cb(max_depth, max_depth)
+        # Keep the beam bounded before multiplying by struct offsets.
+        if len(current_targets) > _PTR_BEAM_MAX:
+            current_targets = dict(list(current_targets.items())[:_PTR_BEAM_MAX])
+            add_log(f"Depth {depth}: beam capped at {_PTR_BEAM_MAX:,} targets", "warn")
 
-    # Sort: static first, then by depth, then by base address.
+        sweep_offsets = range(0, _PTR_STRUCT_MAX + 1, _PTR_STRUCT_STEP)
+        search_val_map = {}
+        for tgt, chain in current_targets.items():
+            for soff in sweep_offsets:
+                sv = int(tgt) - int(soff)
+                if not (_ADDR_MIN <= sv <= _ADDR_MAX):
+                    continue
+                search_val_map.setdefault(np.uint64(sv), []).append(
+                    (int(tgt), int(soff), chain))
+
+        # If the beam is still too large, keep exact matches rather than turning
+        # one depth into an enormous np.isin lookup.  A later explicit deep scan
+        # can widen the beam without freezing the UI for minutes.
+        if len(search_val_map) > _PTR_SEARCH_TARGET_MAX:
+            exact = {}
+            for tgt, chain in current_targets.items():
+                exact[np.uint64(tgt)] = [(int(tgt), 0, chain)]
+            search_val_map = exact
+            add_log(f"Depth {depth}: target set too large; using exact-pointer pass",
+                    "warn")
+
+        search_arr = np.fromiter(search_val_map.keys(), dtype=np.uint64)
+        next_targets = {}
+        static_hits = 0
+        heap_hits = 0
+        depth_done = 0
+
+        add_log(f"Pointer scan depth {depth}: {len(current_targets):,} targets, "
+                f"{len(search_arr):,} pointer values")
+
+        sock = None
+        try:
+            sock = _ScanSocket(ip, pid)
+            for region in readable:
+                if cancel_event and cancel_event.is_set():
+                    break
+                rstart, rend = int(region["start"]), int(region["end"])
+                start = rstart + ((-rstart) % 8)
+                while start < rend:
+                    if cancel_event and cancel_event.is_set():
+                        break
+                    size = min(_PTR_CHUNK, rend - start)
+                    size -= size % 8
+                    if size < 8:
+                        break
+                    try:
+                        hits = _pointer_scan_chunk(
+                            sock, start, size, search_arr, search_val_map,
+                            maps_sorted, map_starts, map_ends, cancel_event)
+                    except Exception as exc:
+                        add_log(f"ptr scan read err @ {hex(start)}: {exc}", "warn")
+                        start += size
+                        depth_done += size
+                        continue
+
+                    for holder, target, soff, old_chain, is_static, rname in hits:
+                        new_chain = list(old_chain) + [soff]
+                        if is_static:
+                            candidates.append({
+                                "base": holder,
+                                "offsets": new_chain,
+                                "depth": depth,
+                                "region": rname,
+                                "static": True,
+                            })
+                            static_hits += 1
+                        elif depth < max_depth:
+                            old = next_targets.get(holder)
+                            if old is None or len(new_chain) < len(old):
+                                if len(next_targets) < _PTR_BEAM_MAX or old is not None:
+                                    next_targets[holder] = new_chain
+                            heap_hits += 1
+                        else:
+                            candidates.append({
+                                "base": holder,
+                                "offsets": new_chain,
+                                "depth": depth,
+                                "region": rname,
+                                "static": False,
+                            })
+
+                    start += size
+                    depth_done += size
+                    if progress_cb:
+                        # Map the whole pass into this depth's slice.  This is
+                        # real progress, unlike the old spinner/heartbeat.
+                        overall = ((depth - 1) * total_bytes + depth_done)
+                        progress_cb(overall, total_bytes * max_depth)
+        finally:
+            if sock:
+                sock.close()
+
+        add_log(f"Depth {depth}: {static_hits} static, {heap_hits} heap expansions")
+        current_targets = next_targets
+
+        # Static candidates are the useful output.  Once one exists at a short
+        # depth, do not force the user to wait through unrelated deeper passes.
+        if candidates and any(c["static"] and c["depth"] == depth for c in candidates):
+            add_log(f"Pointer scan found {sum(1 for c in candidates if c['static'])} "
+                    f"static candidate(s) at depth {depth}")
+            break
+
     candidates.sort(key=lambda c: (not c["static"], c["depth"], c["base"]))
+    elapsed = max(time.monotonic() - started, 1e-9)
     add_log(f"Pointer chain scan: {len(candidates)} candidates "
-            f"({sum(1 for c in candidates if c['static'])} static)")
+            f"({sum(1 for c in candidates if c['static'])} static) "
+            f"in {elapsed:.1f}s")
     return candidates
 
 
@@ -2543,6 +3214,28 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r'[^\w\-.]', '_', name)
 
 
+def _runtime_pointer_base(cheat: dict) -> int:
+    """Resolve a stored module-relative pointer root for the current ASLR layout.
+
+    New resolver cheats store module_name + module_relative_offset.  Legacy
+    cheats without those fields continue using their absolute ``base`` field.
+    """
+    if cheat.get("module_name") and "module_relative_offset" in cheat:
+        maps = _get_maps_cached(state["ip"], state["pid"])
+        wanted = str(cheat["module_name"])
+        same = [r for r in maps if str(r.get("name", "") or "") == wanted]
+        if same:
+            base = min(int(r["start"]) for r in same)
+            return base + int(cheat["module_relative_offset"])
+        if wanted == "main":
+            static = [r for r in maps if _is_static_region(r)]
+            if static:
+                return min(int(r["start"]) for r in static) + int(cheat["module_relative_offset"])
+        raise RuntimeError(f"module '{wanted}' is not currently mapped")
+    base = cheat.get("base", 0)
+    return int(base, 0) if isinstance(base, str) else int(base)
+
+
 def generate_cht(cheats: list, game_id: str, game_ver: str,
                  game_title: str, hex_values: bool = True) -> str:
     fmt_val = (lambda v: hex(v)) if hex_values else (lambda v: str(v))
@@ -2553,8 +3246,13 @@ def generate_cht(cheats: list, game_id: str, game_ver: str,
             entry = {
                 "name":    c["name"],
                 "type":    c["type"],                    # pointer_freeze / pointer_write
-                "base":    hex(c["base"]) if isinstance(c["base"], int) else c["base"],
+                "base":    hex(c["base"]) if isinstance(c.get("base"), int) else c.get("base"),
                 "offsets": [hex(o) for o in c["offsets"]],
+                "module":  c.get("module_name"),
+                "module_offset": (hex(c["module_relative_offset"])
+                                   if c.get("module_relative_offset") is not None else None),
+                "terminal_offset": (hex(int(c["terminal_offset"]))
+                                     if c.get("terminal_offset") else None),
                 "value":   fmt_val(c["value"]),
                 "bytes":   c["width"],
             }
@@ -2878,6 +3576,7 @@ def _clear_scan_state() -> None:
     state["scan_unknown"]   = False
     with _map_cache_lock:
         _map_cache.clear()
+    _invalidate_pointer_index()
     _ScanSocket.clear_pool()
     gc.collect()
 
@@ -3836,7 +4535,8 @@ def do_show_results(stdscr) -> None:
                 safe_addstr(stdscr, 10, pane_x, "A  Apply value", color(C_OK))
                 safe_addstr(stdscr, 11, pane_x, "C  Create cheat", color(C_OK))
                 safe_addstr(stdscr, 12, pane_x, "P  Pointer scan", color(C_ACC))
-                safe_addstr(stdscr, 13, pane_x, "D  Drop result", color(C_ERR))
+                safe_addstr(stdscr, 13, pane_x, "R  Resolve permanent", color(C_ACC))
+                safe_addstr(stdscr, 14, pane_x, "D  Drop result", color(C_ERR))
                 safe_addstr(stdscr, 15, pane_x, "N  Next scan", color(C_ACC))
                 safe_addstr(stdscr, 16, pane_x, "M  More actions", color(C_WARN))
 
@@ -3853,7 +4553,7 @@ def do_show_results(stdscr) -> None:
                 (f"{len(results):,} results", C_WARN),
                 ("↑↓/PgUp/PgDn", C_NORM),
                 ("Enter inspect", C_OK), ("A apply", C_OK), ("C cheat", C_OK),
-                ("P pointer", C_ACC), ("N next", C_ACC),
+                ("P pointer", C_ACC), ("R permanent", C_ACC), ("N next", C_ACC),
                 ("D drop", C_ERR), ("M more", C_WARN),
                 (age_label, C_ERR if stale else C_ACC if is_refreshing else C_NORM),
                 ("Q back", C_NORM),
@@ -3938,6 +4638,11 @@ def do_show_results(stdscr) -> None:
             elif key in (ord('p'), ord('P')) and len(results) > 0:
                 stdscr.nodelay(False)
                 do_pointer_scan(stdscr, int(results[sel]))
+                stdscr.nodelay(True)
+                results = state["scan_results"]
+            elif key in (ord('r'), ord('R')) and len(results) > 0:
+                stdscr.nodelay(False)
+                do_resolve_permanent(stdscr, int(results[sel]))
                 stdscr.nodelay(True)
                 results = state["scan_results"]
             elif key in (ord('n'), ord('N')):
@@ -4245,9 +4950,10 @@ def _read_cheat_live_value(cheat: dict) -> str:
         width = int(cheat["width"])
         is_pointer = "offsets" in cheat and cheat.get("offsets") is not None
         if is_pointer:
-            base    = int(cheat["base"], 0) if isinstance(cheat["base"], str) else int(cheat["base"])
+            base    = _runtime_pointer_base(cheat)
             offsets = [int(o, 0) if isinstance(o, str) else int(o) for o in cheat["offsets"]]
-            ok, addr, _ = _resolve_pointer_chain(state["ip"], state["pid"], base, offsets)
+            ok, addr, _ = _resolve_pointer_chain(
+                state["ip"], state["pid"], base, offsets, int(cheat.get("terminal_offset", 0)))
             if not ok:
                 return "?(chain)"
         else:
@@ -4473,7 +5179,7 @@ def _apply_cheat_once(stdscr, cheat: dict) -> None:
 
     if is_pointer:
         # ── pointer cheat: resolve chain first ───────────────────────────
-        base    = int(cheat["base"], 0) if isinstance(cheat["base"], str) else int(cheat["base"])
+        base    = _runtime_pointer_base(cheat)
         offsets = [int(o, 0) if isinstance(o, str) else int(o) for o in cheat["offsets"]]
         ok, addr, steps = _resolve_pointer_chain(
             state["ip"], state["pid"], base, offsets)
@@ -4558,9 +5264,10 @@ def _edit_cheat(stdscr, idx: int) -> None:
     if new_val != old_val:
         try:
             if is_pointer:
-                base = int(c["base"], 0) if isinstance(c["base"], str) else int(c["base"])
+                base = _runtime_pointer_base(c)
                 offsets = [int(o, 0) if isinstance(o, str) else int(o) for o in c["offsets"]]
-                ok_chain, target_addr, _ = _resolve_pointer_chain(state["ip"], state["pid"], base, offsets)
+                ok_chain, target_addr, _ = _resolve_pointer_chain(
+                    state["ip"], state["pid"], base, offsets, int(c.get("terminal_offset", 0)))
                 if not ok_chain:
                     raise ValueError("pointer chain could not be resolved")
                 ack, verified, actual = _write_value_verified(state["ip"], state["pid"], target_addr, new_val, int(c["width"]))
@@ -4732,7 +5439,7 @@ def do_freeze(stdscr) -> None:
         width = int(cheat["width"]); val = int(cheat["value"])
         is_pointer = "offsets" in cheat and cheat.get("offsets") is not None
         if is_pointer:
-            base = int(cheat["base"],0) if isinstance(cheat["base"],str) else int(cheat["base"])
+            base = _runtime_pointer_base(cheat)
             offsets = [int(x,0) if isinstance(x,str) else int(x) for x in cheat["offsets"]]
             addr = 0
         else: addr = int(cheat["address"])
@@ -4764,7 +5471,8 @@ def do_freeze(stdscr) -> None:
                 add_log("Freeze aborted — process or connection changed","warn"); break
             target = addr
             if is_pointer:
-                ok,target,_ = _resolve_pointer_chain(frozen_ip,frozen_pid,base,offsets)
+                ok,target,_ = _resolve_pointer_chain(
+                    frozen_ip, frozen_pid, base, offsets, int(cheat.get("terminal_offset", 0)))
                 if not ok:
                     add_log("Pointer freeze: chain broken — retrying next tick","warn")
                     if stop_event.wait(interval) or _freeze_stop.is_set(): break
@@ -4867,6 +5575,171 @@ def do_ptr_verify_manual(stdscr) -> None:
         "static": True,
     }
     do_pointer_chain_verify(stdscr, candidate, target)
+
+
+def do_resolve_permanent(stdscr, target_addr: int) -> None:
+    """Trace-first temporary -> permanent resolver with pointer-scan fallback."""
+    target_addr = int(target_addr)
+    if not (_ADDR_MIN <= target_addr <= _ADDR_MAX):
+        message_box(stdscr, [f"Invalid target address: {hex(target_addr)}"],
+                    "Resolve Permanent Address", C_ERR)
+        return
+
+    cancel_event = threading.Event()
+    progress = {"done": 0, "total": _PTR_RESOLVE_MAX_NODES,
+                "results": None, "error": None, "built": False}
+
+    def run():
+        try:
+            width = int(state.get("scan_width", 4))
+            # First choice: change the value and catch the real accessor.
+            try:
+                result = _resolve_trace_first(
+                    state["ip"], state["pid"], target_addr, width,
+                    cancel_event=cancel_event,
+                    progress_cb=lambda d, t: progress.update(
+                        done=d, total=max(int(t), 1)))
+                if result.get("candidates"):
+                    progress["results"] = result
+                    progress["built"] = False
+                    return
+                add_log("Trace produced no stable pointer root; using cached reverse resolver",
+                        "warn")
+            except Exception as exc:
+                add_log(f"Change-triggered trace unavailable: {exc}", "warn")
+
+            # Existing robust fallback.
+            progress["results"] = _resolve_permanent_candidates(
+                state["ip"], state["pid"], target_addr,
+                max_depth=5, cancel_event=cancel_event,
+                progress_cb=lambda d, t: progress.update(
+                    done=d, total=max(int(t), 1)))
+            progress["built"] = bool(progress["results"].get("index_built"))
+        except Exception as exc:
+            progress["error"] = str(exc)
+
+    ok = _run_scan_with_progress(
+        stdscr, run,
+        "Tracing dynamic address — perform the normal in-game action that uses it…",
+        cancel_event, progress)
+    if not ok:
+        add_log("Permanent resolver cancelled", "warn")
+        return
+    if progress["error"]:
+        message_box(stdscr, [f"Resolver error: {progress['error']}"],
+                    "Resolver Failed", C_ERR)
+        return
+
+    data = progress["results"] or {}
+    candidates = data.get("candidates", [])
+    trace = data.get("trace")
+    if not candidates:
+        extra = []
+        if trace:
+            extra = [
+                f"Accessor: {hex(int(trace.get('rip', 0)))}",
+                f"Access: {trace.get('access_mode', 'readwrite')}",
+                f"Base: {trace.get('base_reg', '?')} = "
+                f"{hex(int(trace.get('base_value', 0)))}",
+                f"Final offset: {hex(int(trace.get('final_offset', 0)))}",
+                "",
+            ]
+        message_box(
+            stdscr,
+            [f"Temporary: {hex(target_addr)}", ""] + extra +
+            ["No verified module/static pointer chain was found.",
+             "If the value is event-driven, repeat Resolve and perform the normal",
+             "in-game action that reads/writes this value while tracing is active."],
+            "No Permanent Address", C_WARN)
+        return
+
+    sel = 0
+    while True:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        draw_border(stdscr, "RESOLVE PERMANENT ADDRESS")
+        safe_addstr(stdscr, 2, 3, f"Temporary: {hex(target_addr)}",
+                    color(C_WARN) | curses.A_BOLD)
+        method = data.get("method", "reverse-index")
+        safe_addstr(stdscr, 3, 3,
+                    f"Method: {method}   Candidates: {len(candidates)}",
+                    color(C_OK) if method == "change-triggered" else color(C_NORM))
+
+        if trace:
+            safe_addstr(
+                stdscr, 4, 3,
+                f"Accessor {hex(int(trace['rip']))}  "
+                f"{trace.get('base_reg','?')}={hex(int(trace.get('base_value',0)))}  "
+                f"offset={hex(int(trace.get('final_offset',0)))}",
+                color(C_ACC))
+        else:
+            safe_addstr(stdscr, 4, 3,
+                        f"Reverse index: {'built now' if progress['built'] else 'cached'}",
+                        color(C_NORM))
+
+        visible = max(1, h - 11)
+        start_i = max(0, min(sel, len(candidates) - visible))
+        for i, c in enumerate(candidates[start_i:start_i + visible]):
+            idx = start_i + i
+            verified = "✓ VERIFIED" if c.get("verified") else "✗ unverified"
+            mod = c.get("module_name") or "main"
+            rel = hex(int(c.get("module_relative_offset", 0)))
+            offs = "+".join(hex(int(x)) for x in c["offsets"])
+            terminal = int(c.get("terminal_offset", 0))
+            chain_text = offs + (f" + {hex(terminal)} [field]" if terminal else "")
+            line = (f"{'>' if idx == sel else ' '} {idx+1:2d} "
+                    f"{verified:<11} score {c['score']:5.1f} "
+                    f"{mod[:18]} + {rel} [{chain_text}]")
+            safe_addstr(
+                stdscr, 6 + i, 2, line[:max(w - 4, 1)].ljust(max(w - 4, 1)),
+                color(C_SEL) | curses.A_BOLD if idx == sel else
+                (color(C_OK) if c.get("verified") else color(C_NORM)))
+
+        c = candidates[sel]
+        row = 7 + min(visible, len(candidates))
+        if row < h - 3:
+            safe_addstr(stdscr, row, 3,
+                        f"Root: {c.get('module_name') or 'main'} + "
+                        f"{hex(int(c.get('module_relative_offset', 0)))}",
+                        color(C_OK) | curses.A_BOLD)
+            safe_addstr(stdscr, row + 1, 3,
+                        f"Chain: {' + '.join(hex(int(x)) for x in c['offsets'])}"
+                        f"{(' + ' + hex(int(c.get('terminal_offset', 0))) + ' [field]' if c.get('terminal_offset') else '')}",
+                        color(C_WARN))
+            safe_addstr(stdscr, row + 2, 3,
+                        f"Verification: {'PASS' if c.get('verified') else 'FAIL'}  "
+                        f"Confidence: {c['score']:.1f}  Depth: {c['depth']}",
+                        color(C_OK) if c.get("verified") else color(C_ERR))
+
+        draw_statusbar(stdscr, [
+            ("↑↓ select", C_NORM), ("Enter verify/save", C_OK),
+            ("I rebuild index", C_WARN), ("Q back", C_NORM)])
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key == curses.KEY_RESIZE:
+            curses.update_lines_cols()
+            continue
+        if key == curses.KEY_UP:
+            sel = max(0, sel - 1)
+        elif key == curses.KEY_DOWN:
+            sel = min(len(candidates) - 1, sel + 1)
+        elif key in (10, 13, curses.KEY_ENTER):
+            if not c.get("verified"):
+                message_box(stdscr,
+                            ["This chain failed live verification and cannot be saved."],
+                            "Not Verified", C_ERR)
+                continue
+            c2 = dict(c)
+            c2["module_name"] = c.get("module_name") or "main"
+            c2["module_relative_offset"] = int(
+                c.get("module_relative_offset", 0))
+            do_pointer_chain_verify(stdscr, c2, target_addr)
+        elif key in (ord('i'), ord('I')):
+            _invalidate_pointer_index(state["ip"], state["pid"])
+            add_log("Reverse pointer index manually invalidated", "warn")
+            return do_resolve_permanent(stdscr, target_addr)
+        elif key in (ord('q'), ord('Q'), 27):
+            return
 
 
 def do_pointer_scan(stdscr, target_addr: Optional[int] = None) -> None:
@@ -4980,12 +5853,11 @@ def do_pointer_scan(stdscr, target_addr: Optional[int] = None) -> None:
             message_box(stdscr, [f"Invalid address: {exc}"], "Error", C_ERR)
             return
 
-    # ── STEP 2: scan (always at maximum depth) ───────────────────────────────
-    # Depth is fixed at MAX_CHAIN_DEPTH — no reason to ask the user.
-    # Deeper scans find everything shallower ones find plus more; the extra
-    # cost is acceptable and removes a technical question ordinary users
-    # should never have to answer.
-    max_depth    = MAX_CHAIN_DEPTH
+    # ── STEP 2: scan ─────────────────────────────────────────────────────────
+    # Four levels cover the common static -> heap -> object -> value layout
+    # without forcing every user through six full memory passes.  The pointer
+    # scanner itself still accepts deeper values for advanced callers.
+    max_depth    = _PTR_DEPTH_DEFAULT
     cancel_event = threading.Event()
     progress     = {"done": 0, "total": max_depth, "results": None, "error": None}
 
@@ -5184,6 +6056,7 @@ def do_pointer_chain_verify(stdscr, candidate: dict, original_target: int) -> No
     draw_border(stdscr, "VERIFY POINTER CHAIN")
 
     base    = candidate["base"]
+    terminal_offset = int(candidate.get("terminal_offset", 0))
     # Use a one-element list so closures always see the current offsets list
     # even after reassignment in the E branch (closures capture the cell, not
     # the value; a mutable container avoids the stale-reference problem).
@@ -5192,10 +6065,14 @@ def do_pointer_chain_verify(stdscr, candidate: dict, original_target: int) -> No
 
     safe_addstr(stdscr, 2, 3,
         f"Base address : {hex(base)}  [{region}]", color(C_OK) | curses.A_BOLD)
+    if terminal_offset:
+        safe_addstr(stdscr, 3, 3,
+                    f"Terminal field offset: +{hex(terminal_offset)}", color(C_ACC))
 
     def _test_chain():
         """Resolve chain and return (ok, final_addr, steps)."""
-        return _resolve_pointer_chain(state["ip"], state["pid"], base, _offsets[0])
+        return _resolve_pointer_chain(
+            state["ip"], state["pid"], base, _offsets[0], terminal_offset)
 
     def _draw_chain(start_row: int) -> int:
         """Draw the current chain and return the row after the last line."""
@@ -5324,11 +6201,16 @@ def do_pointer_chain_verify(stdscr, candidate: dict, original_target: int) -> No
                 "type":    typ,
                 "base":    base,
                 "offsets": list(offsets),
+                **({"terminal_offset": terminal_offset} if terminal_offset else {}),
                 "value":   val,
                 "width":   width,
                 "pid":     state["pid"],
                 "process": state["proc_name"],
                 "session": state["session"],
+                # Smart resolver metadata: survives ASLR/module relocation.
+                **({"module_name": candidate["module_name"],
+                    "module_relative_offset": int(candidate["module_relative_offset"])}
+                   if candidate.get("module_name") is not None else {}),
                 # For display compatibility with non-pointer cheats:
                 "address": 0,    # resolved at apply time
             }

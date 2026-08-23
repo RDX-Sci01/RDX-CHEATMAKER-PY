@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 
 """
-Python Cheat Maker with Terminal UI
+RDX CheatMaker Final Release with Terminal UI
 
 Usage:
     python3 RDX-CHEATMAKER-UI.py
 """
 
+RDX_VERSION = "1.0.0"
+
 import array as _array
 import bisect
 import curses
 import gc
+import hashlib
 import heapq
+import math
 import os
 import queue as _queue
 import re
@@ -21,6 +25,7 @@ import json
 import threading
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Optional   # keep 3.8/3.9 compatibility (no X|Y union syntax)
 
@@ -226,6 +231,22 @@ PROC_AUTH_MAGIC = 0xBB40E64D
 STATUS_SUCCESS = 0x80000000
 STATUS_ERROR   = 0xF0000001
 PS5_PORT       = 744
+MEMDBG_PORT    = 9020
+MEMDBG_MAGIC   = 0x4742444D             # "MDBG", little-endian
+MEMDBG_VERSION = 1
+MEMDBG_CMD_HELLO = 0x0001
+MEMDBG_CMD_PROCESS_LIST = 0x0100
+MEMDBG_CMD_PROCESS_MAPS = 0x0101
+MEMDBG_CMD_MEMORY_READ = 0x0200
+MEMDBG_CMD_MEMORY_WRITE = 0x0201
+MEMDBG_CMD_SCAN_POINTER = 0x0303
+MEMDBG_CAP_PROCESS_LIST = 1 << 0
+MEMDBG_CAP_PROCESS_MAPS = 1 << 1
+MEMDBG_CAP_MEMORY_READ = 1 << 2
+MEMDBG_CAP_MEMORY_WRITE = 1 << 3
+MEMDBG_CAP_SCAN_POINTER = 1 << 10
+MEMDBG_MAX_MEMORY_READ = 1024 * 1024
+MEMDBG_MAX_WRITE_DATA = 1024 * 1024 - 16  # request body includes 16-byte header
 
 # A TurboScan list session lives on its TCP connection.  Retaining that
 # connection lets subsequent exact scans use the payload's resident COUNT
@@ -233,10 +254,191 @@ PS5_PORT       = 744
 _turbo_session_lock = threading.RLock()
 _turbo_session = None
 
+# ``WIDTH_*`` remain as the backwards-compatible unsigned view used by the
+# pointer subsystem and older external callers.  User-facing scans and cheats
+# use VALUE_TYPES below, which carries the signed/float/raw-byte semantics that
+# a width by itself cannot express.
 WIDTH_FMT   = {1: 'B', 2: '<H', 4: '<I', 8: '<Q'}
 VALID_WIDTHS = [1, 2, 4, 8]
 WIDTH_LABEL  = {1: "byte (u8)", 2: "uint16", 4: "uint32", 8: "uint64"}
 WIDTH_MAX    = {1: 0xFF, 2: 0xFFFF, 4: 0xFFFFFFFF, 8: 0xFFFFFFFFFFFFFFFF}
+
+VALUE_TYPES = {
+    "u8":  {"label": "Unsigned 8-bit (u8)",  "width": 1, "fmt": "<B", "dtype": "<u1", "kind": "uint", "min": 0, "max": 0xFF},
+    "i8":  {"label": "Signed 8-bit (i8)",    "width": 1, "fmt": "<b", "dtype": "<i1", "kind": "sint", "min": -0x80, "max": 0x7F},
+    "u16": {"label": "Unsigned 16-bit (u16)", "width": 2, "fmt": "<H", "dtype": "<u2", "kind": "uint", "min": 0, "max": 0xFFFF},
+    "i16": {"label": "Signed 16-bit (i16)",   "width": 2, "fmt": "<h", "dtype": "<i2", "kind": "sint", "min": -0x8000, "max": 0x7FFF},
+    "u32": {"label": "Unsigned 32-bit (u32)", "width": 4, "fmt": "<I", "dtype": "<u4", "kind": "uint", "min": 0, "max": 0xFFFFFFFF},
+    "i32": {"label": "Signed 32-bit (i32)",   "width": 4, "fmt": "<i", "dtype": "<i4", "kind": "sint", "min": -0x80000000, "max": 0x7FFFFFFF},
+    "f32": {"label": "Float 32-bit (f32)",    "width": 4, "fmt": "<f", "dtype": "<f4", "kind": "float"},
+    "u64": {"label": "Unsigned 64-bit (u64)", "width": 8, "fmt": "<Q", "dtype": "<u8", "kind": "uint", "min": 0, "max": 0xFFFFFFFFFFFFFFFF},
+    "i64": {"label": "Signed 64-bit (i64)",   "width": 8, "fmt": "<q", "dtype": "<i8", "kind": "sint", "min": -0x8000000000000000, "max": 0x7FFFFFFFFFFFFFFF},
+    "f64": {"label": "Float 64-bit (f64)",    "width": 8, "fmt": "<d", "dtype": "<f8", "kind": "float"},
+    # Raw byte cheats use a per-entry width and canonical uppercase hex value.
+    "bytes": {"label": "Byte pattern / raw bytes", "width": None,
+              "fmt": None, "dtype": None, "kind": "bytes"},
+}
+VALUE_TYPE_ORDER = ["u8", "i8", "u16", "i16", "u32", "i32", "f32",
+                    "u64", "i64", "f64", "bytes"]
+LEGACY_VALUE_TYPE = {1: "u8", 2: "u16", 4: "u32", 8: "u64"}
+SCAN_VALUE_TYPE_ID = {
+    "u8": 0, "i8": 1, "u16": 2, "i16": 3,
+    "u32": 4, "i32": 5, "u64": 6, "i64": 7,
+    "f32": 8, "f64": 9, "bytes": 10,
+}
+
+
+def _normalise_value_type(value_type=None, width: Optional[int] = None) -> str:
+    """Return a supported type key, preserving unsigned legacy behaviour."""
+    key = str(value_type or "").strip().lower()
+    aliases = {
+        "byte": "u8", "uint8": "u8", "int8": "i8",
+        "uint16": "u16", "int16": "i16", "short": "i16",
+        "uint32": "u32", "int32": "i32", "int": "i32",
+        "float": "f32", "single": "f32",
+        "uint64": "u64", "int64": "i64", "double": "f64",
+        "aob": "bytes", "hex": "bytes", "raw": "bytes",
+    }
+    key = aliases.get(key, key)
+    if key in VALUE_TYPES:
+        return key
+    if width is not None and int(width) in LEGACY_VALUE_TYPE:
+        return LEGACY_VALUE_TYPE[int(width)]
+    return "u32"
+
+
+def _value_spec(value_type=None, width: Optional[int] = None) -> dict:
+    return VALUE_TYPES[_normalise_value_type(value_type, width)]
+
+
+def _value_width(value_type=None, width: Optional[int] = None) -> int:
+    spec = _value_spec(value_type, width)
+    resolved = spec.get("width") if spec.get("width") is not None else width
+    if resolved is None or int(resolved) <= 0 or int(resolved) > 256:
+        raise ValueError("raw-byte values require a width from 1 to 256")
+    return int(resolved)
+
+
+def _parse_byte_pattern(text: str, allow_wildcards: bool = True) -> tuple:
+    """Parse ``AA BB ?? CC`` or compact hex into (bytes, mask, canonical)."""
+    raw = str(text or "").strip()
+    if not raw:
+        raise ValueError("byte pattern is empty")
+    if re.fullmatch(r"[0-9a-fA-F]+", raw) and len(raw) % 2 == 0:
+        tokens = [raw[i:i + 2] for i in range(0, len(raw), 2)]
+    else:
+        tokens = [t for t in re.split(r"[\s,;:-]+", raw) if t]
+    if not 1 <= len(tokens) <= 256:
+        raise ValueError("byte pattern must contain 1 to 256 bytes")
+    values = bytearray()
+    mask = bytearray()
+    canonical = []
+    for token in tokens:
+        if token in {"?", "??", "**"}:
+            if not allow_wildcards:
+                raise ValueError("wildcards are not allowed for a write value")
+            values.append(0)
+            mask.append(0)
+            canonical.append("??")
+            continue
+        if not re.fullmatch(r"[0-9a-fA-F]{2}", token):
+            raise ValueError(f"invalid byte token: {token!r}")
+        values.append(int(token, 16))
+        mask.append(0xFF)
+        canonical.append(token.upper())
+    if not any(mask):
+        raise ValueError("a pattern cannot consist entirely of wildcards")
+    return bytes(values), bytes(mask), " ".join(canonical)
+
+
+def _parse_value_text(text: str, value_type=None,
+                      width: Optional[int] = None):
+    key = _normalise_value_type(value_type, width)
+    spec = VALUE_TYPES[key]
+    if spec["kind"] == "bytes":
+        raw, _mask, _canonical = _parse_byte_pattern(text, False)
+        if width is not None and len(raw) != int(width):
+            raise ValueError(f"expected {int(width)} bytes, got {len(raw)}")
+        return raw.hex().upper()
+    if spec["kind"] == "float":
+        try:
+            value = float(str(text).strip())
+        except ValueError:
+            raise ValueError(f"invalid {key} value: {text!r}")
+        if not math.isfinite(value):
+            raise ValueError("NaN and infinity are not supported")
+        # Packing catches f32 overflow and also rounds to the value that is
+        # actually representable in game memory.
+        try:
+            return struct.unpack(spec["fmt"], struct.pack(spec["fmt"], value))[0]
+        except (OverflowError, struct.error):
+            raise ValueError(f"value is out of range for {key}")
+    try:
+        value = int(str(text).strip(), 0)
+    except ValueError:
+        raise ValueError(f"invalid {key} value: {text!r}")
+    if not int(spec["min"]) <= value <= int(spec["max"]):
+        raise ValueError(
+            f"value must be between {spec['min']} and {spec['max']} for {key}")
+    return value
+
+
+def _pack_typed_value(value, value_type=None,
+                      width: Optional[int] = None) -> bytes:
+    key = _normalise_value_type(value_type, width)
+    spec = VALUE_TYPES[key]
+    if spec["kind"] == "bytes":
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            raw = bytes(value)
+        else:
+            raw, _mask, _canonical = _parse_byte_pattern(str(value), False)
+        if width is not None and len(raw) != int(width):
+            raise ValueError(f"expected {int(width)} bytes, got {len(raw)}")
+        return raw
+    parsed = value
+    if isinstance(value, str):
+        parsed = _parse_value_text(value, key, width)
+    try:
+        return struct.pack(spec["fmt"], parsed)
+    except (OverflowError, TypeError, ValueError, struct.error):
+        raise ValueError(f"value {value!r} is not valid for {key}")
+
+
+def _unpack_typed_value(raw: bytes, value_type=None,
+                        width: Optional[int] = None):
+    key = _normalise_value_type(value_type, width)
+    if key == "bytes":
+        expected = _value_width(key, width)
+        if len(raw) != expected:
+            raise ValueError(f"expected {expected} bytes, got {len(raw)}")
+        return bytes(raw).hex().upper()
+    expected = _value_width(key, width)
+    if len(raw) != expected:
+        raise ValueError(f"expected {expected} bytes, got {len(raw)}")
+    return struct.unpack(VALUE_TYPES[key]["fmt"], raw)[0]
+
+
+def _format_typed_value(value, value_type=None,
+                        width: Optional[int] = None) -> str:
+    key = _normalise_value_type(value_type, width)
+    if key == "bytes":
+        try:
+            raw = _pack_typed_value(value, key, width)
+            return " ".join(f"{b:02X}" for b in raw)
+        except ValueError:
+            return str(value)
+    if VALUE_TYPES[key]["kind"] == "float":
+        return format(float(value), ".9g" if key == "f32" else ".17g")
+    return str(int(value))
+
+
+def _cheat_value_type(cheat: dict) -> str:
+    return _normalise_value_type(cheat.get("value_type"), cheat.get("width", 4))
+
+
+def _cheat_value_bytes(cheat: dict, field: str = "value") -> bytes:
+    return _pack_typed_value(
+        cheat[field], _cheat_value_type(cheat), int(cheat.get("width", 4)))
 
 # PS5 user-space is 0x0001 – 0x00007FFF_FFFF_FFFF.
 # Static/module segments on PS5 (orbis-ld output) are loaded in the low
@@ -246,8 +448,8 @@ _STATIC_ADDR_MAX  = 0x0000_0100_0000_0000   # below ≈ 1 TB → likely module/s
 _HEAP_NAME_HINTS  = frozenset({"", "anon", "heap", "stack", "scePthread",
                                 "SceKernelPrimary", "SceLibcInternal"})
 
-# Maximum pointer-chain depth.  Chains longer than 6 are almost never seen
-# in retail titles and exponential scan cost grows quickly beyond this.
+# Maximum pointer-chain depth. The normal guided scan uses five levels and the
+# exhaustive resolver uses six; manual/advanced callers can opt into eight.
 MAX_CHAIN_DEPTH   = 8
 
 # How many pointer-scan results to keep per depth level before filtering.
@@ -380,8 +582,13 @@ _WRITE_MAP_CACHE_TTL = 10.0          # shorter TTL for writes/freezes
 _pointer_index_cache = {}
 _pointer_index_lock = threading.RLock()
 _PTR_INDEX_CHUNK = 0x2000000          # 32 MiB
-_PTR_RESOLVE_OFFSET_MAX = 0x2000   # ±8 KiB maximum field-offset search
-_PTR_RESOLVE_OFFSET_TIERS = (0x100, 0x400, 0x1000, 0x2000)
+# PS4CheaterNeo permits an unlimited pointer offset.  RDX keeps a finite safety
+# bound, but the exhaustive sorted index can search a much wider interval with
+# two binary searches; it need not enumerate every possible offset.  Small
+# tiers preserve common-case ranking while the 1 MiB fallback prevents the old
+# ±8 KiB ceiling from guaranteeing false negatives on manager/pool layouts.
+_PTR_RESOLVE_OFFSET_MAX = 0x100000
+_PTR_RESOLVE_OFFSET_TIERS = (0x100, 0x1000, 0x4000, 0x10000, 0x100000)
 _PTR_RESOLVE_OFFSET_STEP = 4      # common 32-bit structure-field alignment
 _PTR_RESOLVE_MAX_HITS = 192       # deterministic candidate window per target
 _PTR_RESOLVE_MAX_NODES = 2500
@@ -391,20 +598,85 @@ _PTR_FAST_DIRECT_HITS = 24
 
 # Bounded streaming pointer scanner.  These limits are separate from the
 # reverse-index resolver above and must remain defined for pointer_chain_scan.
-_PTR_STRUCT_MAX = 0x1000             # interval matching keeps wide offsets cheap
+_PTR_STRUCT_MAX = 0x4000             # ±16 KiB; interval matching keeps this cheap
 _PTR_STRUCT_STEP = 4
 _PTR_CHUNK = 0x2000000              # 32 MiB network reads
 _PTR_BEAM_MAX = 12_000              # heap targets carried to the next depth
 _PTR_VERIFY_MAX = 64                # bounded same-session network validations
 _PTR_VERIFY_PER_FAMILY = 2          # duplicate roots per converged heap path
 _PTR_SEARCH_TARGET_MAX = 4_096      # bounded deep-pass value set
-_PTR_DEPTH_DEFAULT = 3
+_PTR_DEPTH_DEFAULT = 5
 _PTR_DISK_INDEX_THRESHOLD = 0x40000000  # 1 GiB readable memory
 _PTR_DISK_SHARD_BYTES = 0x2000000       # 32 MiB per sorted disk shard
 _PTR_DISK_WORKERS = 6                    # persistent parallel reader/indexers
 _pointer_region_class_cache = {}         # map fingerprint -> classified rows
 _POINTER_PROVISIONAL_FILE = Path(__file__).with_name(
     ".rdx-pointer-candidates.json")
+_PREFERENCES_FILE = Path(__file__).with_name(".rdx-preferences.json")
+
+
+def _load_preferences(path: Optional[Path] = None) -> dict:
+    """Load small, non-sensitive UI preferences; corrupt files fail closed."""
+    src = Path(path or _PREFERENCES_FILE)
+    try:
+        data = json.loads(src.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or int(data.get("version", 0)) != 1:
+            return {}
+        out = {}
+        for key in ("last_ip", "last_process", "export_dir"):
+            value = data.get(key)
+            if isinstance(value, str) and len(value) <= 1024:
+                out[key] = value
+        return out
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _save_preferences(updates: Optional[dict] = None,
+                      path: Optional[Path] = None) -> None:
+    """Atomically persist connection/export convenience settings."""
+    dst = Path(path or _PREFERENCES_FILE)
+    payload = {"version": 1}
+    payload.update(_load_preferences(dst))
+    for key, value in (updates or {}).items():
+        if key in {"last_ip", "last_process", "export_dir"}:
+            payload[key] = str(value or "")[:1024]
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=dst.name + ".", dir=str(dst.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, dst)
+    finally:
+        try:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        except OSError:
+            pass
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write a UTF-8 text export without leaving a half-written trainer."""
+    dst = Path(path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=dst.name + ".", dir=str(dst.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, dst)
+    finally:
+        try:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        except OSError:
+            pass
+
+
+_preferences = _load_preferences()
 
 # Issues #7/#8/#9/#10: track the active freeze worker globally so it can be
 # stopped when the user changes process or reconnects.  Without this the old
@@ -413,7 +685,134 @@ _POINTER_PROVISIONAL_FILE = Path(__file__).with_name(
 # was re-used by the OS.
 _freeze_stop:   threading.Event  = threading.Event()
 _freeze_thread: Optional[threading.Thread] = None
-_freeze_lock:   threading.Lock   = threading.Lock()   # guards the two vars above
+_freeze_lock:   threading.RLock  = threading.RLock()
+_freeze_targets: dict = {}       # runtime id -> saved cheat object
+_freeze_status: dict = {}        # runtime id -> last success/error text
+
+
+def _cheat_runtime_id(cheat: dict) -> str:
+    runtime_id = str(cheat.get("_runtime_id", "") or "")
+    if not runtime_id:
+        runtime_id = uuid.uuid4().hex
+        cheat["_runtime_id"] = runtime_id
+    return runtime_id
+
+
+def _is_cheat_frozen(cheat: dict) -> bool:
+    runtime_id = str(cheat.get("_runtime_id", "") or "")
+    with _freeze_lock:
+        return bool(runtime_id and runtime_id in _freeze_targets)
+
+
+def _cheat_freeze_indicator(cheat: dict) -> str:
+    runtime_id = str(cheat.get("_runtime_id", "") or "")
+    with _freeze_lock:
+        if not runtime_id or runtime_id not in _freeze_targets:
+            return "OFF"
+        status = str(_freeze_status.get(runtime_id, "") or "")
+    return "ERR" if status.startswith("error:") else "ON"
+
+
+def _resolve_cheat_runtime_address(cheat: dict) -> int:
+    """Resolve a saved cheat without prompting; raise on stale ownership."""
+    portable = _is_portable_cheat(cheat)
+    same_process = str(cheat.get("process", "") or "") in (
+        "", str(state.get("proc_name", "") or ""))
+    portable_here = (portable and same_process and
+                     _portable_cheat_matches_current_game(cheat))
+    stale = (cheat.get("pid") != state.get("pid") or
+             cheat.get("session") != state.get("session"))
+    if stale and not portable_here:
+        raise ValueError("cheat belongs to another process/session")
+    if cheat.get("offsets") is not None:
+        base = _runtime_pointer_base(cheat)
+        offsets = [int(item, 0) if isinstance(item, str) else int(item)
+                   for item in cheat.get("offsets", [])]
+        ok, address, _steps = _resolve_pointer_chain(
+            state["ip"], state["pid"], base, offsets,
+            int(cheat.get("terminal_offset", 0)))
+        if not ok:
+            raise ValueError("pointer chain is currently unresolved")
+        return int(address)
+    return int(_runtime_scalar_address(cheat))
+
+
+def _freeze_manager_worker() -> None:
+    """Keep every enabled saved cheat active until individually disabled."""
+    global _freeze_thread
+    try:
+        while not _freeze_stop.is_set():
+            with _freeze_lock:
+                targets = list(_freeze_targets.items())
+            if not targets:
+                # Keep one lightweight manager alive between toggle changes.
+                # Exiting here races with a new enable that sees the old
+                # thread as alive and therefore does not start a replacement.
+                _freeze_stop.wait(0.5)
+                continue
+            for runtime_id, cheat in targets:
+                if _freeze_stop.is_set():
+                    break
+                try:
+                    address = _resolve_cheat_runtime_address(cheat)
+                    width = int(cheat["width"])
+                    error = _validate_addr_in_maps(
+                        state["ip"], state["pid"], address, width, 10.0)
+                    if error:
+                        raise ValueError(error)
+                    if not ps5_write(
+                            state["ip"], state["pid"], address,
+                            _cheat_value_bytes(cheat),
+                            cancel_event=_freeze_stop, timeout=1.0):
+                        raise IOError("payload rejected the write")
+                    with _freeze_lock:
+                        _freeze_status[runtime_id] = (
+                            f"active @ {hex(address)}")
+                except Exception as exc:
+                    with _freeze_lock:
+                        _freeze_status[runtime_id] = f"error: {exc}"
+            _freeze_stop.wait(0.2)
+    finally:
+        with _freeze_lock:
+            if threading.current_thread() is _freeze_thread:
+                _freeze_thread = None
+
+
+def _ensure_freeze_worker() -> None:
+    global _freeze_thread
+    with _freeze_lock:
+        if _freeze_thread and _freeze_thread.is_alive():
+            return
+        _freeze_stop.clear()
+        _freeze_thread = threading.Thread(
+            target=_freeze_manager_worker, name="rdx-freeze-manager",
+            daemon=True)
+        _freeze_thread.start()
+
+
+def _toggle_cheat_freeze(cheat: dict) -> bool:
+    """Toggle one saved cheat while leaving every other toggle untouched."""
+    runtime_id = _cheat_runtime_id(cheat)
+    with _freeze_lock:
+        if runtime_id in _freeze_targets:
+            _freeze_targets.pop(runtime_id, None)
+            _freeze_status.pop(runtime_id, None)
+            cheat["enabled"] = False
+            add_log(f"Disabled freeze '{cheat.get('name', 'Unnamed')}'")
+            return False
+    # Resolve and validate before presenting the toggle as enabled.
+    address = _resolve_cheat_runtime_address(cheat)
+    error = _validate_addr_in_maps(
+        state["ip"], state["pid"], address, int(cheat["width"]), 0.0)
+    if error:
+        raise ValueError(error)
+    with _freeze_lock:
+        _freeze_targets[runtime_id] = cheat
+        _freeze_status[runtime_id] = f"starting @ {hex(address)}"
+        cheat["enabled"] = True
+    _ensure_freeze_worker()
+    add_log(f"Enabled freeze '{cheat.get('name', 'Unnamed')}'")
+    return True
 
 def _stop_freeze_worker() -> None:
     """
@@ -425,6 +824,10 @@ def _stop_freeze_worker() -> None:
     with _freeze_lock:
         _freeze_stop.set()
         t = _freeze_thread
+        for cheat in _freeze_targets.values():
+            cheat["enabled"] = False
+        _freeze_targets.clear()
+        _freeze_status.clear()
     if t and t.is_alive():
         t.join(timeout=2.0)
     with _freeze_lock:
@@ -437,8 +840,13 @@ def _stop_freeze_worker() -> None:
             _freeze_stop.clear()
 
 state = {
-    "ip":           "",
+    "ip":           _preferences.get("last_ip", ""),
     "connected":    False,
+    # ps5debug remains the default transport. Current MemDBG payloads advertise
+    # native read/write capabilities; older builds transparently fall back to
+    # their optional ps5debug-compatible listener.
+    "backend":      "ps5debug",           # ps5debug / memdbg-experimental
+    "memdbg":       None,                 # HELLO metadata/capabilities
     "session":      0,                    # increments after every reconnect
     "pid":          None,
     "proc_name":    "",
@@ -449,13 +857,19 @@ state = {
     "scan_truncated":  False,
     "scan_unknown":    False,
     "scan_width":   4,
+    "scan_type":    "u32",
+    "scan_tolerance": 0.0001,
+    "scan_pattern": "",
     "scan_aligned":       True,
     "scan_writable_only": True,
+    "scan_scope":         "recommended",
     "scan_engine": "auto",          # auto / turbo / console / host
     "cheats":       [],
     "game_id":      "",
     "game_ver":     "01.00",
     "game_title":   "",
+    "export_dir":   _preferences.get("export_dir", str(Path.home())),
+    "last_process": _preferences.get("last_process", "eboot.bin"),
     "log":          [],
     # Undo history — delta format; see _push_undo() above.
     "scan_history": deque(maxlen=5),
@@ -509,6 +923,286 @@ def recv_exact(s: socket.socket, n: int) -> bytes:
             raise ConnectionError("PS5 disconnected")
         pos += got
     return bytes(buf)
+
+
+def _lz4_decompress_block(data: bytes, expected_length: int) -> bytes:
+    """Decode one raw LZ4 block with strict bounds and length validation.
+
+    MemDBG wraps compressible memory reads in a tiny command-local frame rather
+    than an LZ4 frame/container.  Keeping the block decoder here avoids making
+    a third-party Python package mandatory for the experimental native backend.
+    """
+    expected_length = int(expected_length)
+    if expected_length < 0 or expected_length > MEMDBG_MAX_MEMORY_READ:
+        raise RuntimeError("invalid MemDBG LZ4 output length")
+    source = memoryview(data)
+    out = bytearray()
+    pos = 0
+
+    def extended_length(initial: int) -> int:
+        nonlocal pos
+        length = initial
+        if initial == 15:
+            while True:
+                if pos >= len(source):
+                    raise RuntimeError("truncated MemDBG LZ4 length")
+                value = int(source[pos])
+                pos += 1
+                length += value
+                if value != 255:
+                    break
+        return length
+
+    while pos < len(source):
+        token = int(source[pos])
+        pos += 1
+        literal_length = extended_length(token >> 4)
+        if (literal_length > expected_length - len(out) or
+                pos + literal_length > len(source)):
+            raise RuntimeError("invalid MemDBG LZ4 literals")
+        out.extend(source[pos:pos + literal_length])
+        pos += literal_length
+        if pos == len(source):
+            break
+        if pos + 2 > len(source):
+            raise RuntimeError("truncated MemDBG LZ4 match offset")
+        offset = int(source[pos]) | (int(source[pos + 1]) << 8)
+        pos += 2
+        if offset == 0 or offset > len(out):
+            raise RuntimeError("invalid MemDBG LZ4 match offset")
+        match_length = extended_length(token & 0x0F) + 4
+        if match_length > expected_length - len(out):
+            raise RuntimeError("MemDBG LZ4 output exceeds declared length")
+        # LZ4 matches may overlap their own output.  Copy from a fixed start in
+        # increasingly large slices; this preserves overlap semantics without
+        # a byte-at-a-time Python loop for highly compressible game memory.
+        match_start = len(out) - offset
+        remaining = match_length
+        while remaining:
+            take = min(remaining, len(out) - match_start)
+            if take <= 0:
+                raise RuntimeError("invalid MemDBG LZ4 match")
+            out.extend(out[match_start:match_start + take])
+            remaining -= take
+    if len(out) != expected_length:
+        raise RuntimeError(
+            f"MemDBG LZ4 length mismatch: {len(out)} != {expected_length}")
+    return bytes(out)
+
+
+def _memdbg_unframe_memory(raw: bytes) -> bytes:
+    """Decode MemDBG's command-local raw/LZ4 memory-response frame."""
+    if not raw:
+        raise RuntimeError("empty MemDBG memory frame")
+    if raw[0] == 0:
+        return raw[1:]
+    if raw[0] == 1:
+        if len(raw) < 5:
+            raise RuntimeError("short MemDBG LZ4 frame")
+        expected = struct.unpack_from("<I", raw, 1)[0]
+        return _lz4_decompress_block(raw[5:], expected)
+    raise RuntimeError(f"invalid MemDBG memory frame marker: {raw[0]}")
+
+
+class _MemDBGClient:
+    """Small dependency-free client for MemDBG's native control protocol.
+
+    RDX keeps the adapter capability-gated: current payloads supply process
+    metadata, framed native memory I/O and one-hop pointer seeds, while older
+    builds fall back to their ps5debug-compatible listener.
+    """
+    _next_id = 1
+
+    def __init__(self, ip: str, timeout: float = 5.0):
+        self.ip = ip
+        self.sock = None
+        self.timeout = timeout
+        self.hello = None
+
+    def connect(self):
+        info = socket.getaddrinfo(self.ip, MEMDBG_PORT, type=socket.SOCK_STREAM)
+        last_exc = OSError("no MemDBG addresses")
+        for family, _, _, _, sockaddr in info:
+            s = socket.socket(family, socket.SOCK_STREAM)
+            s.settimeout(self.timeout)
+            try:
+                s.connect(sockaddr)
+                self.sock = s
+                # Empty HELLO is part of the stable v1 contract and works with
+                # both old and current MemDBG payloads.
+                raw = self.request(MEMDBG_CMD_HELLO)
+                if len(raw) < 44:
+                    raise RuntimeError("short MemDBG HELLO")
+                protocol, platform, caps, debug_port, udp_port = struct.unpack_from(
+                    "<HHIHH", raw, 0)
+                version = raw[12:28].split(b"\0", 1)[0].decode("utf-8", "replace")
+                name = raw[28:44].split(b"\0", 1)[0].decode("utf-8", "replace")
+                feature = struct.unpack_from("<H", raw, 44)[0] if len(raw) >= 46 else 1
+                if len(raw) >= 112:
+                    full_version = raw[64:112].split(b"\0", 1)[0].decode(
+                        "utf-8", "replace")
+                    if full_version:
+                        version = full_version
+                self.hello = {"protocol": protocol, "platform": platform,
+                              "capabilities": caps, "debug_port": debug_port,
+                              "udp_port": udp_port, "version": version,
+                              "name": name, "feature_level": feature}
+                return self
+            except Exception as exc:
+                last_exc = exc
+                try: s.close()
+                except Exception: pass
+                self.sock = None
+        raise last_exc
+
+    def close(self):
+        if self.sock is not None:
+            try: self.sock.close()
+            except Exception: pass
+            self.sock = None
+
+    def request(self, command: int, body: bytes = b"") -> bytes:
+        if self.sock is None:
+            raise ConnectionError("MemDBG client is not connected")
+        request_id = _MemDBGClient._next_id & 0xFFFFFFFF
+        _MemDBGClient._next_id = (_MemDBGClient._next_id + 1) & 0xFFFFFFFF
+        header = struct.pack("<IHHII", MEMDBG_MAGIC, MEMDBG_VERSION,
+                             int(command), request_id, len(body))
+        self.sock.sendall(header + body)
+        response = recv_exact(self.sock, 20)
+        magic, version, echoed_cmd, echoed_id, status, length = struct.unpack(
+            "<IHHIiI", response)
+        if (magic != MEMDBG_MAGIC or version != MEMDBG_VERSION or
+                echoed_cmd != int(command) or echoed_id != request_id):
+            raise RuntimeError("invalid MemDBG response header")
+        if length > 8 * 1024 * 1024:
+            raise RuntimeError(f"oversized MemDBG response: {length}")
+        payload = recv_exact(self.sock, length) if length else b""
+        if status != 0:
+            raise RuntimeError(f"MemDBG command 0x{command:04X} failed: {status}")
+        return payload
+
+    def process_list(self) -> list:
+        raw = self.request(MEMDBG_CMD_PROCESS_LIST)
+        if len(raw) < 4:
+            raise RuntimeError("short MemDBG process list")
+        count = struct.unpack_from("<I", raw, 0)[0]
+        payload_len = len(raw) - 4
+        stride = 56 if payload_len == count * 56 else (
+            52 if payload_len == count * 52 else 0)
+        if count > 65536 or not stride:
+            raise RuntimeError("invalid MemDBG process list length")
+        out = []
+        for i in range(count):
+            off = 4 + i * stride
+            pid = struct.unpack_from("<i", raw, off)[0]
+            name_off = off + (8 if stride == 56 else 4)
+            name = raw[name_off:off + stride].split(b"\0", 1)[0].decode(
+                "utf-8", "replace")
+            out.append({"pid": pid, "name": name})
+        return out
+
+    def process_maps(self, pid: int) -> list:
+        raw = self.request(MEMDBG_CMD_PROCESS_MAPS, struct.pack("<i", int(pid)))
+        if len(raw) < 4:
+            raise RuntimeError("short MemDBG map list")
+        count = struct.unpack_from("<I", raw, 0)[0]
+        expected = 4 + count * 88
+        if count > 131072 or len(raw) != expected:
+            raise RuntimeError("invalid MemDBG map list length")
+        out = []
+        for i in range(count):
+            off = 4 + i * 88
+            start, end, prot, flags = struct.unpack_from("<QQII", raw, off)
+            name = raw[off + 24:off + 88].split(b"\0", 1)[0].decode(
+                "utf-8", "replace")
+            out.append({"start": start, "end": end, "prot": prot,
+                        "flags": flags, "name": name})
+        return out
+
+    def memory_read(self, pid: int, address: int, length: int) -> bytes:
+        """Read through native MemDBG, splitting at its public 1 MiB limit."""
+        caps = int((self.hello or {}).get("capabilities", 0))
+        if not (caps & MEMDBG_CAP_MEMORY_READ):
+            raise RuntimeError("MemDBG does not advertise native memory reads")
+        length = int(length)
+        if length < 0:
+            raise ValueError("negative memory read length")
+        result = bytearray(length)
+        pos = 0
+        while pos < length:
+            take = min(MEMDBG_MAX_MEMORY_READ, length - pos)
+            body = struct.pack("<iQI", int(pid), int(address) + pos, take)
+            chunk = _memdbg_unframe_memory(
+                self.request(MEMDBG_CMD_MEMORY_READ, body))
+            if len(chunk) != take:
+                raise RuntimeError(
+                    f"short MemDBG memory read: {len(chunk)} != {take}")
+            result[pos:pos + take] = chunk
+            pos += take
+        return bytes(result)
+
+    def memory_write(self, pid: int, address: int, data: bytes) -> bool:
+        """Write through native MemDBG and require its exact byte count."""
+        caps = int((self.hello or {}).get("capabilities", 0))
+        if not (caps & MEMDBG_CAP_MEMORY_WRITE):
+            raise RuntimeError("MemDBG does not advertise native memory writes")
+        view = memoryview(data)
+        pos = 0
+        while pos < len(view):
+            take = min(MEMDBG_MAX_WRITE_DATA, len(view) - pos)
+            body = (struct.pack("<iQI", int(pid), int(address) + pos, take) +
+                    bytes(view[pos:pos + take]))
+            raw = self.request(MEMDBG_CMD_MEMORY_WRITE, body)
+            if len(raw) != 4 or struct.unpack("<I", raw)[0] != take:
+                raise RuntimeError("short MemDBG memory write")
+            pos += take
+        return True
+
+    def pointer_holders(self, pid: int, target: int, regions: list,
+                        max_results: int = 50000) -> list:
+        """Return native one-hop exact holders, explicitly not full chains."""
+        caps = int((self.hello or {}).get("capabilities", 0))
+        if not (caps & MEMDBG_CAP_SCAN_POINTER):
+            return []
+        found = []
+        for region in regions:
+            start, end = int(region["start"]), int(region["end"])
+            if end <= start:
+                continue
+            body = struct.pack("<iQQQIIII", int(pid), start, end - start,
+                               int(target), 1, max(1, max_results - len(found)),
+                               8, 0)
+            raw = self.request(MEMDBG_CMD_SCAN_POINTER, body)
+            if len(raw) < 40:
+                raise RuntimeError("short MemDBG pointer response")
+            count = struct.unpack_from("<I", raw, 0)[0]
+            remaining = len(raw) - 40
+            # Current MemDBG main declares 16-byte pointer-chain entries but
+            # its daemon's generic result sender emits 8-byte address entries.
+            # Accept both so RDX works before and after that upstream mismatch
+            # is corrected.
+            stride = 16 if remaining == count * 16 else (
+                8 if remaining == count * 8 else 0)
+            if not stride:
+                raise RuntimeError("invalid MemDBG pointer response length")
+            found.extend(struct.unpack_from("<Q", raw, 40 + i * stride)[0]
+                         for i in range(count))
+            if len(found) >= max_results:
+                break
+        return found[:max_results]
+
+
+def memdbg_probe(ip: str, timeout: float = 1.5) -> Optional[dict]:
+    """Return native MemDBG HELLO information, or None when unavailable."""
+    client = _MemDBGClient(ip, timeout)
+    try:
+        client.connect()
+        return dict(client.hello or {})
+    except Exception:
+        return None
+    finally:
+        client.close()
 
 def check_ok(s: socket.socket) -> bool:
     return struct.unpack("<I", recv_exact(s, 4))[0] == STATUS_SUCCESS
@@ -640,10 +1334,11 @@ def _recv_exact_cancel(s: socket.socket, n: int,
         s.settimeout(old_timeout)
     return bytes(buf)
 
-def ps5_scan_exact_server(ip: str, pid: int, value: int, width: int,
+def ps5_scan_exact_server(ip: str, pid: int, value, width: int,
                           regions: list, aligned: bool = True,
                           cancel_event=None,
-                          progress_cb=None) -> np.ndarray:
+                          progress_cb=None,
+                          value_type: Optional[str] = None) -> np.ndarray:
     """Run ps5debug's legacy exact-value scanner on-console."""
     # VM maps can contain overlapping entries after page-table augmentation.
     # Merge them so bisecting by start cannot select a short overlapping entry
@@ -658,9 +1353,10 @@ def ps5_scan_exact_server(ip: str, pid: int, value: int, width: int,
     if not regions:
         return np.empty(0, dtype=_NP_ADDR_DTYPE)
 
-    value_type = {1: 0, 2: 2, 4: 4, 8: 6}[width]
-    target = struct.pack(WIDTH_FMT[width], value)
-    body = struct.pack("<IBBI", pid, value_type, 0, len(target))
+    type_key = _normalise_value_type(value_type, width)
+    wire_type = SCAN_VALUE_TYPE_ID[type_key]
+    target = _pack_typed_value(value, type_key, width)
+    body = struct.pack("<IBBI", pid, wire_type, 0, len(target))
     starts = [r[0] for r in regions]
     total_bytes = max(sum(end - start for start, end in regions), 1)
     if progress_cb:
@@ -759,9 +1455,10 @@ def _close_turbo_session() -> None:
             s.close()
 
 
-def ps5_scan_exact_turbo(ip: str, pid: int, value: int, width: int,
+def ps5_scan_exact_turbo(ip: str, pid: int, value, width: int,
                          regions: list, aligned: bool = True,
-                         cancel_event=None, progress_cb=None) -> np.ndarray:
+                         cancel_event=None, progress_cb=None,
+                         value_type: Optional[str] = None) -> np.ndarray:
     """Segmented SIMD exact scan, retaining its server-resident result list."""
     global _turbo_session
     _close_turbo_session()
@@ -797,8 +1494,9 @@ def ps5_scan_exact_turbo(ip: str, pid: int, value: int, width: int,
     if len(merged) > 1_048_576:
         raise RuntimeError("too many TurboScan segments")
 
-    target = struct.pack(WIDTH_FMT[width], value)
-    value_type = {1: 0, 2: 2, 4: 4, 8: 6}[width]
+    type_key = _normalise_value_type(value_type, width)
+    target = _pack_typed_value(value, type_key, width)
+    wire_type = SCAN_VALUE_TYPE_ID[type_key]
     flags = 0x02 | 0x10  # server resident + segmented
     if (engines & 0x02) and os.environ.get("RDX_TURBO_ALIAS", "1") != "0":
         flags |= 0x01
@@ -807,7 +1505,7 @@ def ps5_scan_exact_turbo(ip: str, pid: int, value: int, width: int,
     # scan_turbo.c uses `alignment ? alignment : value_length`; therefore 0
     # means width-aligned.  A byte step of 1 is the true unaligned mode.
     alignment = width if aligned else 1
-    body = struct.pack("<IQIBBBII", pid, 0, 0, value_type, 0,
+    body = struct.pack("<IQIBBBII", pid, 0, 0, wire_type, 0,
                        alignment, len(target), flags)
     total_bytes = sum(end - start for start, end in merged)
     if progress_cb:
@@ -886,7 +1584,7 @@ def ps5_scan_exact_turbo(ip: str, pid: int, value: int, width: int,
         with _turbo_session_lock:
             _turbo_session = {"socket": s, "ip": ip, "pid": pid,
                               "width": width, "count": int(count),
-                              "engines": engines}
+                              "engines": engines, "value_type": type_key}
         retain_session = True
         return out
     finally:
@@ -900,23 +1598,26 @@ def ps5_scan_exact_turbo(ip: str, pid: int, value: int, width: int,
             s.close()
 
 
-def ps5_scan_next_turbo(ip: str, pid: int, value: int, width: int,
-                         cancel_event=None, progress_cb=None) -> np.ndarray:
+def ps5_scan_next_turbo(ip: str, pid: int, value, width: int,
+                         cancel_event=None, progress_cb=None,
+                         value_type: Optional[str] = None) -> np.ndarray:
     """Refine the complete resident result set on-console using COUNT."""
     global _turbo_session
     with _turbo_session_lock:
         session = _turbo_session
+        type_key = _normalise_value_type(value_type, width)
         if not session or any((session["ip"] != ip, session["pid"] != pid,
-                               session["width"] != width)):
+                               session["width"] != width,
+                               session.get("value_type", type_key) != type_key)):
             raise RuntimeError("no matching resident TurboScan session")
         s = session["socket"]
         old_count = int(session["count"])
-        target = struct.pack(WIDTH_FMT[width], value)
-        value_type = {1: 0, 2: 2, 4: 4, 8: 6}[width]
+        target = _pack_typed_value(value, type_key, width)
+        wire_type = SCAN_VALUE_TYPE_ID[type_key]
         flags = 0x02  # TS_SERVER_RESIDENT
         if session["engines"] & 0x200:
             flags |= 0x100  # TS_RESCAN_ALIASING
-        body = struct.pack("<IQBBII", pid, 0, value_type, 0,
+        body = struct.pack("<IQBBII", pid, 0, wire_type, 0,
                            len(target), flags)
         try:
             if progress_cb:
@@ -955,6 +1656,16 @@ def ps5_scan_next_turbo(ip: str, pid: int, value: int, width: int,
 # All helpers use sendall() and try/finally so the socket is always closed.
 
 def ps5_proc_list(ip: str) -> list:
+    if state.get("backend") == "memdbg-experimental":
+        client = _MemDBGClient(ip)
+        try:
+            client.connect()
+            return client.process_list()
+        except Exception as exc:
+            add_log(f"MemDBG process list failed; using compatibility port: {exc}",
+                    "warn")
+        finally:
+            client.close()
     s = ps5_connect(ip)
     try:
         s.sendall(cmd_header(CMD_PROC_LIST))
@@ -974,6 +1685,15 @@ def ps5_proc_list(ip: str) -> list:
         s.close()
 
 def ps5_maps(ip: str, pid: int) -> list:
+    if state.get("backend") == "memdbg-experimental":
+        client = _MemDBGClient(ip)
+        try:
+            client.connect()
+            return client.process_maps(pid)
+        except Exception as exc:
+            add_log(f"MemDBG maps failed; using compatibility port: {exc}", "warn")
+        finally:
+            client.close()
     s = ps5_connect(ip)
     try:
         body = struct.pack("<I", pid)
@@ -987,18 +1707,50 @@ def ps5_maps(ip: str, pid: int) -> list:
             name  = raw[:32].split(b'\x00', 1)[0].decode('utf-8', errors='replace')
             start = struct.unpack_from("<Q", raw, 32)[0]
             end   = struct.unpack_from("<Q", raw, 40)[0]
-            # offset field (bytes 48-55) consumed but not stored
+            offset = struct.unpack_from("<Q", raw, 48)[0]
             prot  = struct.unpack_from("<H", raw, 56)[0]
-            maps.append({"start": start, "end": end, "prot": prot, "name": name})
+            maps.append({"start": start, "end": end, "prot": prot,
+                         "offset": offset, "name": name})
         return maps
     finally:
         s.close()
 
 _UI_MAX_RETRIES = 3   # retries for individual ps5_read / ps5_write UI calls
+_memdbg_fallback_notes = set()
+_memdbg_fallback_lock = threading.Lock()
+
+
+def _memdbg_has(capability: int) -> bool:
+    return (state.get("backend") == "memdbg-experimental" and
+            bool(int((state.get("memdbg") or {}).get("capabilities", 0)) &
+                 int(capability)))
+
+
+def _note_memdbg_fallback(operation: str, exc: Exception) -> None:
+    """Log one native-to-compatibility fallback per operation and session."""
+    key = (int(state.get("session", 0)), str(operation))
+    with _memdbg_fallback_lock:
+        if key in _memdbg_fallback_notes:
+            return
+        _memdbg_fallback_notes.add(key)
+    add_log(f"MemDBG native {operation} failed; trying port 744: {exc}", "warn")
 
 def ps5_read(ip: str, pid: int, addr: int, length: int) -> bytes:
     """Read with up to _UI_MAX_RETRIES retries on transient connection failures."""
     last_exc: Exception = RuntimeError("no attempts")
+    if _memdbg_has(MEMDBG_CAP_MEMORY_READ):
+        for attempt in range(_UI_MAX_RETRIES):
+            client = _MemDBGClient(ip)
+            try:
+                client.connect()
+                return client.memory_read(pid, addr, length)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < _UI_MAX_RETRIES - 1:
+                    time.sleep(0.1 * (attempt + 1))
+            finally:
+                client.close()
+        _note_memdbg_fallback("read", last_exc)
     for attempt in range(_UI_MAX_RETRIES):
         s = None
         try:
@@ -1022,6 +1774,27 @@ def ps5_write(ip: str, pid: int, addr: int, data: bytes,
               cancel_event: Optional[threading.Event] = None,
               timeout: float = 15.0) -> bool:
     """Two-phase write with up to _UI_MAX_RETRIES retries."""
+    native_exc: Exception = RuntimeError("no attempts")
+    if _memdbg_has(MEMDBG_CAP_MEMORY_WRITE):
+        for attempt in range(_UI_MAX_RETRIES):
+            if cancel_event and cancel_event.is_set():
+                return False
+            client = _MemDBGClient(ip, timeout=timeout)
+            try:
+                client.connect()
+                return client.memory_write(pid, addr, data)
+            except Exception as exc:
+                native_exc = exc
+                if attempt < _UI_MAX_RETRIES - 1:
+                    delay = 0.1 * (attempt + 1)
+                    if cancel_event:
+                        if cancel_event.wait(delay):
+                            return False
+                    else:
+                        time.sleep(delay)
+            finally:
+                client.close()
+        _note_memdbg_fallback("write", native_exc)
     for attempt in range(_UI_MAX_RETRIES):
         if cancel_event and cancel_event.is_set():
             return False
@@ -1463,7 +2236,8 @@ def _resolve_trace_first(ip: str, pid: int, target_addr: int,
 # ── batch reader for scan_next ────────────────────────────────────────────────
 
 def ps5_read_batch(ip: str, pid: int, addrs: np.ndarray, width: int,
-                   cancel_event=None, progress_cb=None) -> tuple:
+                   cancel_event=None, progress_cb=None,
+                   value_type: Optional[str] = None) -> tuple:
     """
     Read `width` bytes at each address using NEXT_WORKERS parallel sockets.
 
@@ -1500,9 +2274,15 @@ def ps5_read_batch(ip: str, pid: int, addrs: np.ndarray, width: int,
     MAX_BYTES_PER_CANDIDATE = 4096
     LOCAL_BUF     = 256         # thread-local accumulation size before flush
 
+    type_key = _normalise_value_type(value_type, width)
+    if type_key == "bytes":
+        raise ValueError("typed batch reads do not decode variable raw bytes")
+    width = _value_width(type_key, width)
+    val_dtype = np.dtype(VALUE_TYPES[type_key]["dtype"])
+
     if len(addrs) == 0:
         return (np.empty(0, dtype=_NP_ADDR_DTYPE),
-                np.empty(0, dtype=_NP_VALUE_DTYPE[width]))
+                np.empty(0, dtype=val_dtype))
 
     started = time.monotonic()
 
@@ -1523,7 +2303,7 @@ def ps5_read_batch(ip: str, pid: int, addrs: np.ndarray, width: int,
     while rs < len(sorted_addr):
         if cancel_event and cancel_event.is_set():
             return (np.empty(0, dtype=_NP_ADDR_DTYPE),
-                    np.empty(0, dtype=_NP_VALUE_DTYPE[width]))
+                    np.empty(0, dtype=val_dtype))
         first_addr = int(sorted_addr[rs])
         max_last   = first_addr + COALESCE_MAX - width
         span_re = int(np.searchsorted(sorted_addr, max_last, side='right'))
@@ -1545,9 +2325,6 @@ def ps5_read_batch(ip: str, pid: int, addrs: np.ndarray, width: int,
         rs = re
 
     total     = len(addrs)
-    val_dtype = _NP_VALUE_DTYPE[width]
-    fmt       = WIDTH_FMT[width]
-
     # Pre-allocated output buffers — worst case all reads succeed.
     out_addrs = np.empty(total, dtype=_NP_ADDR_DTYPE)
     out_vals  = np.empty(total, dtype=val_dtype)
@@ -1625,8 +2402,8 @@ def ps5_read_batch(ip: str, pid: int, addrs: np.ndarray, width: int,
                             # byte-index matrix.
                             all_vals = np.ndarray(
                                 shape=(len(window) - width + 1,),
-                                dtype=f'<u{width}', buffer=window, strides=(1,))
-                            v_vals = all_vals[v_off].astype(val_dtype, copy=False)
+                                dtype=val_dtype, buffer=window, strides=(1,))
+                            v_vals = all_vals[v_off]
                             # Write into local buffer in one slice assignment;
                             # flush in chunks of LOCAL_BUF if needed.
                             n_v = len(v_addrs)
@@ -1691,7 +2468,7 @@ def ps5_read_batch(ip: str, pid: int, addrs: np.ndarray, width: int,
 
 class _ScanSocket:
     """
-    Holds a single persistent TCP connection for the duration of a scan.
+    Holds one persistent native-MemDBG or ps5debug connection for a scan.
     Automatically reconnects (up to MAX_RETRIES times) when the socket dies.
 
     Hot-path optimisation: the CMD_PROC_READ request is 28 bytes total
@@ -1717,6 +2494,8 @@ class _ScanSocket:
         self.ip  = ip
         self.pid = pid
         self._s: Optional[socket.socket] = None
+        self._native = _memdbg_has(MEMDBG_CAP_MEMORY_READ)
+        self._native_client: Optional[_MemDBGClient] = None
         self._from_pool = False
         # Pre-built mutable request buffer; addr field patched in read()
         self._req = bytearray(self._HDR_SIZE)
@@ -1737,10 +2516,30 @@ class _ScanSocket:
                     except Exception: pass
 
     def _connect(self):
+        if self._native_client is not None:
+            self._native_client.close()
+            self._native_client = None
         if self._s:
             try: self._s.close()
             except Exception: pass
             self._s = None
+        if self._native:
+            client = _MemDBGClient(self.ip, timeout=15.0)
+            try:
+                client.connect()
+                if not (int((client.hello or {}).get("capabilities", 0)) &
+                        MEMDBG_CAP_MEMORY_READ):
+                    raise RuntimeError("native reads are not advertised")
+                self._native_client = client
+                self._from_pool = False
+                return
+            except Exception as exc:
+                client.close()
+                # A development/older payload may still expose the compatibility
+                # service.  Try it without making every scan worker repeat the
+                # native failure on each reconnect.
+                self._native = False
+                _note_memdbg_fallback("scan read", exc)
         key = (self.ip, self.pid)
         with self._pool_lock:
             bucket = self._pool.get(key)
@@ -1755,6 +2554,27 @@ class _ScanSocket:
     def read(self, addr: int, length: int,
              cancel_event: Optional[threading.Event] = None) -> bytes:
         """Read `length` bytes from `addr`, reconnecting on transient failure."""
+        # Both native MemDBG and its compatibility bridge cap public reads at
+        # 1 MiB. RDX's scan engine uses larger logical chunks, so split here
+        # while retaining one persistent connection and return a contiguous
+        # buffer to callers. Without this, every experimental pointer scan was
+        # rejected before examining a single byte.
+        if (state.get("backend") == "memdbg-experimental" and length > 0x100000):
+            parts = bytearray(length)
+            pos = 0
+            while pos < length:
+                if cancel_event and cancel_event.is_set():
+                    raise InterruptedError("scan cancelled")
+                take = min(0x100000, length - pos)
+                parts[pos:pos + take] = self._read_single(
+                    addr + pos, take, cancel_event)
+                pos += take
+            return bytes(parts)
+        return self._read_single(addr, length, cancel_event)
+
+    def _read_single(self, addr: int, length: int,
+                     cancel_event: Optional[threading.Event] = None) -> bytes:
+        """Perform one payload-sized read with reconnect handling."""
         # Patch addr and length directly into the pre-built bytearray.
         # sendall accepts bytearray natively — no bytes() copy needed.
         struct.pack_into("<QI", self._req, 16, addr, length)
@@ -1762,8 +2582,13 @@ class _ScanSocket:
             if cancel_event and cancel_event.is_set():
                 raise InterruptedError("scan cancelled")
             try:
-                if self._s is None:
+                if self._native and self._native_client is None:
                     self._connect()
+                elif not self._native and self._s is None:
+                    self._connect()
+                if self._native_client is not None:
+                    return self._native_client.memory_read(
+                        self.pid, addr, length)
                 self._s.sendall(self._req)   # zero-copy: no bytes() allocation
                 if not check_ok(self._s):
                     raise RuntimeError("read rejected")
@@ -1773,8 +2598,12 @@ class _ScanSocket:
                     raise InterruptedError("scan cancelled") from exc
                 add_log(f"scan read err (attempt {attempt+1}/{self.MAX_RETRIES}) "
                         f"@ {hex(addr)}: {exc}", "warn")
-                try: self._s.close()
-                except Exception: pass
+                if self._native_client is not None:
+                    self._native_client.close()
+                    self._native_client = None
+                if self._s is not None:
+                    try: self._s.close()
+                    except Exception: pass
                 self._s = None
                 self._from_pool = False
                 # The caller can immediately retry this range with a smaller
@@ -1792,6 +2621,10 @@ class _ScanSocket:
                     time.sleep(delay)
 
     def close(self):
+        if self._native_client is not None:
+            self._native_client.close()
+            self._native_client = None
+            return
         if not self._s:
             return
         sock, self._s = self._s, None
@@ -1806,17 +2639,20 @@ class _ScanSocket:
         except Exception: pass
         self._from_pool = False
 
-def _get_maps_cached(ip: str, pid: int) -> list:
+def _get_maps_cached(ip: str, pid: int,
+                     ttl_override: Optional[float] = None) -> list:
     """
     Return ps5_maps() with a 30-second cache.  Consecutive scans on the same
     process reuse the map rather than paying an extra RTT before each scan.
     Invalidated automatically when the endpoint or pid changes, or TTL expires.
     """
     now = time.time()
+    ttl = (_MAP_CACHE_TTL if ttl_override is None else
+           max(0.0, float(ttl_override)))
     with _map_cache_lock:
         cache_key = (ip, pid)
         entry = _map_cache.get(cache_key)
-        if entry and (now - entry[0]) < _MAP_CACHE_TTL:
+        if entry and (now - entry[0]) < ttl:
             return entry[1]
     maps = ps5_maps(ip, pid)
     with _map_cache_lock:
@@ -1825,10 +2661,33 @@ def _get_maps_cached(ip: str, pid: int) -> list:
     return maps
 
 
-def scan_first(ip: str, pid: int, value: int, width: int = 4,
+def _recommended_game_scan_region(region: dict, process: str = "") -> bool:
+    """Exclude obvious payload/library mappings from the default game scan."""
+    name = str(region.get("name", "") or "").replace("\\", "/").lower()
+    process_name = str(process or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    basename = name.rsplit("/", 1)[-1]
+    main_image = (name == "executable" or
+                  (process_name and basename == process_name) or
+                  "/app0/" in name or "eboot" in basename)
+    library_or_payload = (
+        any(token in name for token in
+            (".sprx", ".prx", ".so", "/lib/", "libkernel", "libsce",
+             "ps5debug", "ps4debug", "memdbg", "etahen", "goldhen"))
+        and not main_image)
+    if library_or_payload:
+        return False
+    prot = int(region.get("prot", 0))
+    heap_named = any(token in name for token in
+                     ("anon", "heap", "dlmalloc", "game"))
+    return bool(main_image or heap_named or (prot & 0x2))
+
+
+def scan_first(ip: str, pid: int, value, width: int = 4,
                aligned: bool = True, progress_cb=None,
                cancel_event=None,
-               writable_only: bool = True) -> np.ndarray:
+               writable_only: bool = True,
+               value_type: Optional[str] = None,
+               region_scope: Optional[str] = None) -> np.ndarray:
     """
     Scan all readable regions for `value`.
 
@@ -1866,13 +2725,14 @@ def scan_first(ip: str, pid: int, value: int, width: int = 4,
     if cancel_event is None:
         cancel_event = threading.Event()
         cancel_event.truncated = False
-    # Validate via struct.pack — handles both signed and unsigned types correctly.
-    # The old `value < 0` guard blocked all signed-type scans (int8/16/32/64).
-    try:
-        target = struct.pack(WIDTH_FMT[width], value)
-    except struct.error:
-        raise ValueError(
-            f"Value {value} out of range for {WIDTH_LABEL.get(width, str(width))}")
+    type_key = _normalise_value_type(value_type, width)
+    if type_key == "bytes":
+        raise ValueError("use scan_first_pattern for raw byte patterns")
+    width = _value_width(type_key, width)
+    target = _pack_typed_value(value, type_key, width)
+    # Console scanners accept the unsigned bit-pattern for integer types.  This
+    # gives signed scans their correct two's-complement byte representation
+    # without requiring a new payload ABI.
     maps = _get_maps_cached(ip, pid)
 
     CHUNK        = 0x2000000   # 32 MB per request — amortises RTT 8× more than 4 MB;
@@ -1911,6 +2771,10 @@ def scan_first(ip: str, pid: int, value: int, width: int = 4,
         ro_only    = [r for r in ro_regions
                       if (r['start'], r['end']) not in rw_set]
         scannable  = rw_regions + ro_only
+    if str(region_scope or "") == "recommended":
+        scannable = [r for r in scannable
+                     if _recommended_game_scan_region(
+                         r, state.get("proc_name", ""))]
     # Phase 4a: sort regions largest-first.  Benefits:
     #   • Workers pick up the biggest chunks immediately → CPU/network both
     #     saturated from the first second rather than warming up on tiny regions.
@@ -1929,10 +2793,14 @@ def scan_first(ip: str, pid: int, value: int, width: int = 4,
     # Select the scanner engine from the UI setting.
     engine = state.get("scan_engine", "auto")
     selected_ranges = sorted((r['start'], r['end']) for r in scannable)
-    if engine in ("auto", "turbo") and os.environ.get("RDX_TURBO_SCAN", "1") != "0":
+    payload_exact_ok = VALUE_TYPES[type_key]["kind"] in {"uint", "sint", "float"}
+    if (payload_exact_ok and engine in ("auto", "turbo") and
+            os.environ.get("RDX_TURBO_SCAN", "1") != "0"):
         try:
-            result = ps5_scan_exact_turbo(ip, pid, value, width, selected_ranges, aligned,
-                                          cancel_event, progress_cb)
+            result = ps5_scan_exact_turbo(ip, pid, value, width,
+                                          selected_ranges, aligned,
+                                          cancel_event, progress_cb,
+                                          value_type=type_key)
             add_log(f"Turbo first scan completed in {max(time.monotonic()-started,1e-9):.2f}s")
             return result
         except InterruptedError:
@@ -1941,10 +2809,14 @@ def scan_first(ip: str, pid: int, value: int, width: int = 4,
             add_log(f"TurboScan unavailable ({exc})", "warn")
             if engine == "turbo":
                 raise
-    if engine in ("auto", "console"):
+    elif engine == "turbo" and not payload_exact_ok:
+        raise ValueError(f"Turbo-only scanning does not support {type_key}; use Auto or Host")
+    if payload_exact_ok and engine in ("auto", "console"):
         try:
-            result = ps5_scan_exact_server(ip, pid, value, width, selected_ranges, aligned,
-                                           cancel_event, progress_cb)
+            result = ps5_scan_exact_server(ip, pid, value, width,
+                                           selected_ranges, aligned,
+                                           cancel_event, progress_cb,
+                                           value_type=type_key)
             add_log(f"Console first scan completed in {max(time.monotonic()-started,1e-9):.2f}s")
             return result
         except InterruptedError:
@@ -1953,6 +2825,8 @@ def scan_first(ip: str, pid: int, value: int, width: int = 4,
             add_log(f"Console scan unavailable ({exc})", "warn")
             if engine == "console":
                 raise
+    elif engine == "console" and not payload_exact_ok:
+        raise ValueError(f"Console-only scanning does not support {type_key}; use Auto or Host")
 
     # ── build flat work list of (base_addr, size) chunks ─────────────────────
     # Use region_size for small regions to avoid padding waste on tiny regions.
@@ -2167,9 +3041,209 @@ def scan_first(ip: str, pid: int, value: int, width: int = 4,
     return result
 
 
-def scan_next(ip: str, pid: int, value: int, width: int,
+def _find_pattern_offsets(data: bytes, pattern: bytes, mask: bytes,
+                          absolute_base: int = 0,
+                          alignment: int = 1) -> list:
+    """Return pattern starts, supporting byte wildcards without regex copies."""
+    if len(pattern) != len(mask) or not pattern:
+        raise ValueError("invalid byte pattern")
+    alignment = max(1, int(alignment))
+    limit = len(data) - len(pattern)
+    if limit < 0:
+        return []
+    if all(m == 0xFF for m in mask):
+        hits = []
+        pos = 0
+        while pos <= limit:
+            found = data.find(pattern, pos)
+            if found < 0:
+                break
+            if (absolute_base + found) % alignment == 0:
+                hits.append(found)
+            pos = found + 1
+        return hits
+
+    # Anchor wildcard searches on the first concrete byte so candidate
+    # generation stays in CPython's fast bytes.find implementation.
+    anchor = next(i for i, m in enumerate(mask) if m)
+    anchor_byte = pattern[anchor:anchor + 1]
+    concrete = [(i, pattern[i]) for i, m in enumerate(mask) if m]
+    hits = []
+    pos = anchor
+    while pos < len(data):
+        found = data.find(anchor_byte, pos)
+        if found < 0:
+            break
+        start = found - anchor
+        if (0 <= start <= limit and
+                (absolute_base + start) % alignment == 0 and
+                all(data[start + i] == value for i, value in concrete)):
+            hits.append(start)
+        pos = found + 1
+    return hits
+
+
+def scan_first_pattern(ip: str, pid: int, pattern: bytes, mask: bytes,
+                       alignment: int = 1, progress_cb=None,
+                       cancel_event=None,
+                       writable_only: bool = False,
+                       region_scope: Optional[str] = None) -> np.ndarray:
+    """Host-side AOB scan with ``??`` wildcard support and bounded memory."""
+    pattern = bytes(pattern)
+    mask = bytes(mask)
+    if not pattern or len(pattern) != len(mask) or len(pattern) > 256:
+        raise ValueError("invalid byte pattern")
+    if not any(mask):
+        raise ValueError("a pattern cannot consist entirely of wildcards")
+    if cancel_event is None:
+        cancel_event = threading.Event()
+        cancel_event.truncated = False
+
+    maps = _get_maps_cached(ip, pid)
+    regions = [r for r in maps
+               if int(r.get("end", 0)) > int(r.get("start", 0))
+               and int(r.get("end", 0)) - int(r.get("start", 0)) <= 0x40000000
+               and (int(r.get("prot", 0)) & 0x1)
+               and (not writable_only or (int(r.get("prot", 0)) & 0x2))]
+    if str(region_scope or "") == "recommended":
+        regions = [r for r in regions if _recommended_game_scan_region(
+            r, state.get("proc_name", ""))]
+    regions.sort(key=lambda r: int(r["end"]) - int(r["start"]), reverse=True)
+    total_bytes = max(sum(int(r["end"]) - int(r["start"])
+                          for r in regions), 1)
+    if not regions:
+        if progress_cb:
+            progress_cb(1, 1)
+        return np.empty(0, dtype=_NP_ADDR_DTYPE)
+
+    chunk_size = 0x400000  # 4 MiB: responsive cancellation, modest RAM.
+    work = []
+    for region in regions:
+        start, end = int(region["start"]), int(region["end"])
+        cursor = start
+        while cursor < end:
+            primary_end = min(cursor + chunk_size, end)
+            read_end = min(primary_end + len(pattern) - 1, end)
+            work.append((cursor, read_end - cursor, primary_end))
+            cursor = primary_end
+
+    work_index = [0]
+    done_bytes = [0]
+    found = []
+    lock = threading.Lock()
+    errors = []
+
+    def worker():
+        sock = None
+        try:
+            sock = _ScanSocket(ip, pid)
+            while not cancel_event.is_set():
+                with lock:
+                    if work_index[0] >= len(work):
+                        break
+                    address, size, primary_end = work[work_index[0]]
+                    work_index[0] += 1
+                try:
+                    data = sock.read(address, size, cancel_event)
+                    if len(data) != size:
+                        raise IOError(f"partial read: {len(data)}/{size}")
+                    local = [address + off for off in _find_pattern_offsets(
+                        data, pattern, mask, address, alignment)
+                             if address + off < primary_end]
+                    with lock:
+                        remaining = MAX_SCAN_RESULTS - len(found)
+                        if remaining > 0:
+                            found.extend(local[:remaining])
+                        if len(local) > remaining:
+                            cancel_event.truncated = True
+                            cancel_event.set()
+                except InterruptedError:
+                    break
+                except Exception as exc:
+                    with lock:
+                        if len(errors) < 20:
+                            errors.append(f"{hex(address)}: {exc}")
+                finally:
+                    with lock:
+                        done_bytes[0] += min(size, chunk_size)
+                        if progress_cb:
+                            progress_cb(min(done_bytes[0], total_bytes),
+                                        total_bytes)
+        finally:
+            if sock:
+                sock.close()
+
+    threads = [threading.Thread(target=worker, daemon=True)
+               for _ in range(min(6, max(1, len(work))))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    for error in errors:
+        add_log(f"AOB read skipped at {error}", "warn")
+    if progress_cb and not cancel_event.is_set():
+        progress_cb(total_bytes, total_bytes)
+    result = np.asarray(sorted(set(found)), dtype=_NP_ADDR_DTYPE)
+    add_log(f"AOB scan: {len(result):,} matches"
+            f"{' (truncated)' if getattr(cancel_event, 'truncated', False) else ''}")
+    return result
+
+
+def scan_next_pattern(ip: str, pid: int, pattern: bytes, mask: bytes,
+                      prev: np.ndarray, cancel_event=None,
+                      progress_cb=None) -> np.ndarray:
+    """Revalidate AOB candidates without rescanning unrelated memory."""
+    pattern, mask = bytes(pattern), bytes(mask)
+    if not pattern or len(pattern) != len(mask):
+        raise ValueError("invalid byte pattern")
+    if cancel_event is None:
+        cancel_event = threading.Event()
+    addresses = np.asarray(prev, dtype=_NP_ADDR_DTYPE)
+    index = [0]
+    found = []
+    lock = threading.Lock()
+
+    def worker():
+        sock = None
+        try:
+            sock = _ScanSocket(ip, pid)
+            while not cancel_event.is_set():
+                with lock:
+                    if index[0] >= len(addresses):
+                        break
+                    item_index = index[0]
+                    index[0] += 1
+                address = int(addresses[item_index])
+                try:
+                    raw = sock.read(address, len(pattern), cancel_event)
+                    if (len(raw) == len(pattern) and
+                            all(not m or raw[i] == pattern[i]
+                                for i, m in enumerate(mask))):
+                        with lock:
+                            found.append(address)
+                except Exception:
+                    pass
+                if progress_cb:
+                    with lock:
+                        progress_cb(index[0], max(len(addresses), 1))
+        finally:
+            if sock:
+                sock.close()
+
+    threads = [threading.Thread(target=worker, daemon=True)
+               for _ in range(min(8, max(1, len(addresses))))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return np.asarray(sorted(found), dtype=_NP_ADDR_DTYPE)
+
+
+def scan_next(ip: str, pid: int, value, width: int,
               prev: np.ndarray,
-              cancel_event=None, progress_cb=None) -> np.ndarray:
+              cancel_event=None, progress_cb=None,
+              value_type: Optional[str] = None,
+              tolerance: float = 0.0) -> np.ndarray:
     """
     Filter `prev` to addresses that currently hold `value`.
 
@@ -2188,9 +3262,19 @@ def scan_next(ip: str, pid: int, value: int, width: int,
     the actual comparison cost only ~0.34 ms.  By moving the decode into
     ps5_read_batch workers the Python iteration is eliminated entirely.
     """
-    if state.get("scan_engine", "auto") in ("auto", "turbo"):
+    type_key = _normalise_value_type(value_type, width)
+    if type_key == "bytes":
+        raise ValueError("use scan_next_pattern for raw byte patterns")
+    width = _value_width(type_key, width)
+    packed_target = _pack_typed_value(value, type_key, width)
+    kind = VALUE_TYPES[type_key]["kind"]
+    if (kind in {"uint", "sint", "float"} and
+            not (kind == "float" and float(tolerance) > 0) and
+            state.get("scan_engine", "auto") in ("auto", "turbo")):
         try:
-            return ps5_scan_next_turbo(ip, pid, value, width, cancel_event, progress_cb)
+            return ps5_scan_next_turbo(
+                ip, pid, value, width, cancel_event, progress_cb,
+                value_type=type_key)
         except InterruptedError:
             raise
         except Exception as exc:
@@ -2198,16 +3282,14 @@ def scan_next(ip: str, pid: int, value: int, width: int,
             if state.get("scan_engine") == "turbo":
                 raise
 
-    dtype = _NP_VALUE_DTYPE[width]
-    try:
-        target = dtype(value & WIDTH_MAX[width])
-    except (OverflowError, ValueError):
-        raise ValueError(
-            f"Value {value} out of range for {WIDTH_LABEL.get(width, str(width))}")
+    dtype = np.dtype(VALUE_TYPES[type_key]["dtype"])
+    target = np.asarray([_unpack_typed_value(
+        packed_target, type_key, width)], dtype=dtype)[0]
 
     # Stage 1: parallel network reads → pre-allocated ndarrays (no Python list)
     live_addrs, live_vals = ps5_read_batch(ip, pid, prev, width,
-                                           cancel_event, progress_cb)
+                                           cancel_event, progress_cb,
+                                           value_type=type_key)
 
     if len(live_addrs) == 0:
         add_log(f"Exact next scan: 0 remain (no reads succeeded), "
@@ -2215,7 +3297,11 @@ def scan_next(ip: str, pid: int, value: int, width: int,
         return np.empty(0, dtype=_NP_ADDR_DTYPE)
 
     # Stage 2: vectorised comparison — one C-level call across all N entries
-    mask        = live_vals == target
+    if kind == "float" and float(tolerance) > 0:
+        mask = np.isfinite(live_vals) & np.isclose(
+            live_vals, target, rtol=0.0, atol=float(tolerance))
+    else:
+        mask = live_vals == target
     n_match     = int(mask.sum())
     n_read      = len(live_addrs)
 
@@ -2232,7 +3318,9 @@ def scan_next(ip: str, pid: int, value: int, width: int,
 def scan_first_unknown(ip: str, pid: int, width: int = 4,
                        aligned: bool = True, progress_cb=None,
                        cancel_event=None,
-                       writable_only: bool = True
+                       writable_only: bool = True,
+                       value_type: Optional[str] = None,
+                       region_scope: Optional[str] = None
                        ) -> tuple:
     """
     Unknown-value first scan.
@@ -2260,6 +3348,11 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
     relational next scans reduce candidates rapidly.
     """
     started = time.monotonic()
+    type_key = _normalise_value_type(value_type, width)
+    if type_key == "bytes":
+        raise ValueError("unknown-value scans require a numeric type")
+    width = _value_width(type_key, width)
+    value_dtype = np.dtype(VALUE_TYPES[type_key]["dtype"])
     if cancel_event is None:
         cancel_event = threading.Event()
         cancel_event.truncated = False
@@ -2291,6 +3384,10 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
         ro_only    = [r for r in ro_regions
                       if (r['start'], r['end']) not in rw_set]
         scannable  = rw_regions + ro_only
+    if str(region_scope or "") == "recommended":
+        scannable = [r for r in scannable
+                     if _recommended_game_scan_region(
+                         r, state.get("proc_name", ""))]
     # Phase 4a: sort largest-first — same rationale as scan_first.
     scannable.sort(key=lambda r: r['end'] - r['start'], reverse=True)
     total_bytes = max(sum(r['end'] - r['start'] for r in scannable), 1)
@@ -2300,7 +3397,7 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
             progress_cb(1, 1)
         add_log("Unknown scan: no eligible memory regions", "warn")
         return (np.empty(0, dtype=_NP_ADDR_DTYPE),
-                np.empty(0, dtype=_NP_VALUE_DTYPE[width]))
+                np.empty(0, dtype=value_dtype))
 
     work: list = []
     for r in scannable:
@@ -2428,7 +3525,7 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
 
             # ── vectorised extract ────────────────────────────────────────────
             # View the raw bytes as the correct dtype, then slice with step.
-            val_dtype = _NP_VALUE_DTYPE[width]
+            val_dtype = value_dtype
             # Number of complete width-byte values in this chunk
             n_vals = (csz - (csz % width)) // width
             if n_vals == 0:
@@ -2446,7 +3543,7 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
                 lead       = (-addr) % width
                 aligned_n  = (csz - lead) // width
                 vals_slice = np.frombuffer(
-                    data[lead:lead + aligned_n * width], dtype=f'<u{width}')
+                    data[lead:lead + aligned_n * width], dtype=value_dtype)
                 n_out      = len(vals_slice)
                 first_addr = addr + lead
                 addrs_out  = np.arange(first_addr, first_addr + n_out * width, width,
@@ -2457,7 +3554,7 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
                 n_out      = csz - width + 1
                 offsets    = np.arange(n_out, dtype=np.intp)
                 vals_slice = np.ndarray(
-                    shape=(n_out,), dtype=f'<u{width}',
+                    shape=(n_out,), dtype=value_dtype,
                     buffer=data, strides=(1,))
                 addrs_out  = (addr + offsets).astype(_NP_ADDR_DTYPE)
 
@@ -2467,7 +3564,7 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
                 addrs_out  = addrs_out[:remaining]
                 vals_slice = vals_slice[:remaining]
                 found_addrs.append(addrs_out)
-                found_values.append(vals_slice.astype(_NP_VALUE_DTYPE[width]))
+                found_values.append(vals_slice.astype(value_dtype, copy=False))
                 total_so_far += len(addrs_out)
                 add_log(f"Unknown scan cap ({MAX_SCAN_RESULTS:,}) hit"
                         " — snapshot truncated", "warn")
@@ -2481,7 +3578,7 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
                 return
 
             found_addrs.append(addrs_out)
-            found_values.append(vals_slice.astype(_NP_VALUE_DTYPE[width]))
+            found_values.append(vals_slice.astype(value_dtype, copy=False))
             total_so_far += len(addrs_out)
 
             done_bytes[0] += csz
@@ -2532,7 +3629,7 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
         out_values = np.concatenate(found_values)
     else:
         out_addrs  = np.empty(0, dtype=_NP_ADDR_DTYPE)
-        out_values = np.empty(0, dtype=_NP_VALUE_DTYPE[width])
+        out_values = np.empty(0, dtype=value_dtype)
 
     add_log(f"Unknown-scan snapshot: {len(out_addrs):,} candidates, "
             f"RSS {_rss_mb():.0f} MB")
@@ -2557,9 +3654,11 @@ def scan_next_relational(ip: str, pid: int, width: int,
                          prev_addrs: np.ndarray,
                          prev_values: np.ndarray,
                          mode: str,
-                         delta: int = 0,
+                         delta=0,
                          cancel_event=None,
-                         progress_cb=None) -> tuple:
+                         progress_cb=None,
+                         value_type: Optional[str] = None,
+                         tolerance: float = 0.0) -> tuple:
     """
     Relational next scan — NumPy vectorised implementation.
 
@@ -2589,9 +3688,13 @@ def scan_next_relational(ip: str, pid: int, width: int,
     no per-element Python overhead, and since prev_addrs is already sorted
     (scan_first guarantees this), no extra sort is needed.
     """
-    fmt   = WIDTH_FMT[width]
-    mask  = np.uint64(WIDTH_MAX[width])
-    dtype = _NP_VALUE_DTYPE[width]
+    type_key = _normalise_value_type(value_type, width)
+    if type_key == "bytes":
+        raise ValueError("relational scans require a numeric type")
+    width = _value_width(type_key, width)
+    spec = VALUE_TYPES[type_key]
+    kind = spec["kind"]
+    dtype = np.dtype(spec["dtype"])
 
     # prev_addrs must be sorted for searchsorted.
     if len(prev_addrs) > 1 and not np.all(prev_addrs[:-1] <= prev_addrs[1:]):
@@ -2602,7 +3705,8 @@ def scan_next_relational(ip: str, pid: int, width: int,
     # ps5_read_batch now returns (live_addrs, live_vals) ndarrays directly —
     # no Python list of (addr, bytes) tuples, no per-address decode loop.
     live_addrs, live_vals = ps5_read_batch(ip, pid, prev_addrs, width,
-                                           cancel_event, progress_cb)
+                                           cancel_event, progress_cb,
+                                           value_type=type_key)
     live_vals = live_vals.astype(dtype, copy=False)
 
     if len(live_addrs) == 0:
@@ -2626,7 +3730,7 @@ def scan_next_relational(ip: str, pid: int, width: int,
     # ── vectorised comparison — Phase 3: Numba parallel kernel or NumPy ────────
     cur = live_vals
     prv = prv_vals
-    if _NUMBA_OK and mode in RELATIONAL_MODE_IDS:
+    if _NUMBA_OK and kind == "uint" and mode in RELATIONAL_MODE_IDS:
         # Phase 3 fast path: Numba compiles _nb_relational_mask to native
         # LLVM code on first call (cached to disk after that).  Subsequent
         # calls skip compilation entirely.  The parallel=True flag enables
@@ -2642,18 +3746,40 @@ def scan_next_relational(ip: str, pid: int, width: int,
         ).astype(bool)
     else:
         # Phase 3 fallback: pure NumPy (always correct, single-threaded SIMD).
-        if   mode == "decreased":
+        if mode == "decreased":
             keep = cur < prv
         elif mode == "increased":
             keep = cur > prv
         elif mode == "changed":
             keep = cur != prv
         elif mode == "unchanged":
-            keep = cur == prv
+            if kind == "float" and float(tolerance) > 0:
+                keep = np.isfinite(cur) & np.isfinite(prv) & np.isclose(
+                    cur, prv, rtol=0.0, atol=float(tolerance))
+            else:
+                keep = cur == prv
         elif mode == "decreased by":
-            keep = cur == ((prv.astype(np.uint64) - np.uint64(delta)) & mask).astype(dtype)
+            if kind == "uint":
+                bit_mask = np.uint64(WIDTH_MAX[width])
+                expected = ((prv.astype(np.uint64) - np.uint64(delta)) &
+                            bit_mask).astype(dtype)
+            else:
+                expected = prv - delta
+            keep = (np.isclose(cur, expected, rtol=0.0,
+                               atol=float(tolerance))
+                    if kind == "float" and float(tolerance) > 0
+                    else cur == expected)
         elif mode == "increased by":
-            keep = cur == ((prv.astype(np.uint64) + np.uint64(delta)) & mask).astype(dtype)
+            if kind == "uint":
+                bit_mask = np.uint64(WIDTH_MAX[width])
+                expected = ((prv.astype(np.uint64) + np.uint64(delta)) &
+                            bit_mask).astype(dtype)
+            else:
+                expected = prv + delta
+            keep = (np.isclose(cur, expected, rtol=0.0,
+                               atol=float(tolerance))
+                    if kind == "float" and float(tolerance) > 0
+                    else cur == expected)
         else:
             raise ValueError(f"Unknown relational mode: {mode!r}")
 
@@ -2683,9 +3809,15 @@ def _is_static_region(region: dict) -> bool:
     name = str(region.get("name", "") or "").strip()
     start = int(region.get("start", 0))
     prot = int(region.get("prot", 0))
+    flags = int(region.get("flags", 0))
     PROT_READ, PROT_WRITE, PROT_EXEC = 0x1, 0x2, 0x4
 
     low_name = name.lower()
+    # MemDBG preserves the native VM object type in the high flag byte.  A
+    # readable vnode/file mapping is image-backed even when the PS5 omitted its
+    # filename; this is stronger evidence than the writable/name heuristics.
+    if ((flags >> 24) & 0xFF) == 2 and (prot & PROT_READ):
+        return True
     transient_prefixes = ("[heap", "[stack", "[anon", "anon", "heap", "stack",
                            "scepthread", "scelibcinternal")
     if low_name.startswith(transient_prefixes) or low_name in {"", "anon"}:
@@ -2703,6 +3835,7 @@ def _is_static_region(region: dict) -> bool:
         # Writable named image mapping: require a module-like name rather than
         # an arbitrary allocation label.
         module_like = (low_name == "executable" or
+                       low_name.startswith("libsce") or
                        ".elf" in low_name or ".prx" in low_name or
                        ".sprx" in low_name or "/" in name or
                        low_name.endswith((".bin", ".self", ".so")))
@@ -2783,21 +3916,29 @@ def _resolve_pointer_chain(ip: str, pid: int,
 def _pointer_map_fingerprint(maps: list) -> tuple:
     """Compact fingerprint used to invalidate the reverse index on remaps."""
     return tuple(sorted((int(r.get("start", 0)), int(r.get("end", 0)),
-                         int(r.get("prot", 0)), str(r.get("name", "")))
+                         int(r.get("prot", 0)), int(r.get("flags", 0)),
+                         int(r.get("offset", 0)), str(r.get("name", "")))
                         for r in maps))
 
 
 def _module_info_for_addr(addr: int, maps: list) -> tuple:
     """Return (module_name, module_base, relative_offset) for a static address."""
-    containing = None
-    for r in maps:
-        if int(r["start"]) <= addr < int(r["end"]):
-            containing = r
-            break
+    region_starts, region_rows = _build_region_lookup(maps)
+    containing = _region_for_addr(int(addr), region_starts, region_rows)
     if containing is None:
         return ("", 0, 0)
     name = str(containing.get("name", "") or "")
     static_maps = [r for r in maps if _is_static_region(r)]
+    # MemDBG must synthesize names such as ``[file]`` when the kernel does not
+    # expose a vnode path.  Treating every such row as one giant module made a
+    # root in a library rebase from the first file mapping in the process.
+    # PS4Cheater's proven representation is section-relative (section ID plus
+    # offset), so use a stable metadata/ordinal section identity for generic
+    # rows while retaining friendlier module-relative roots for named images.
+    if _is_static_region(containing) and _is_generic_map_name(name):
+        section_id = _section_module_identity(containing, static_maps)
+        return (section_id, int(containing["start"]),
+                int(addr - int(containing["start"])))
     if name:
         same = [r for r in static_maps if str(r.get("name", "") or "") == name]
     else:
@@ -2814,23 +3955,43 @@ def _module_info_for_addr(addr: int, maps: list) -> tuple:
 
 
 def _build_region_lookup(maps: list):
-    """Build a binary-searchable region table once per resolver run."""
-    rows = sorted(
+    """Build an overlap-safe binary-searchable region table.
+
+    PS5 map enumeration may contain a large reservation plus smaller augmented
+    page-table rows.  A plain ``bisect(start)`` can land on a short overlapping
+    row that does not contain the address and incorrectly report it unmapped.
+    Prefix maximum ends let lookup walk back only while an earlier row can
+    still cover the address.
+    """
+    raw_rows = sorted(
         (int(r.get("start", 0)), int(r.get("end", 0)), r)
         for r in maps if int(r.get("end", 0)) > int(r.get("start", 0))
     )
+    rows = []
+    max_end = 0
+    for start, end, region in raw_rows:
+        max_end = max(max_end, end)
+        rows.append((start, end, region, max_end))
     starts = [x[0] for x in rows]
     return starts, rows
 
 
 def _region_for_addr(addr: int, region_starts: list, region_rows: list):
-    """O(log n) memory-map ownership lookup."""
+    """Overlap-safe memory-map ownership lookup, preferring static identity."""
     i = bisect.bisect_right(region_starts, int(addr)) - 1
-    if i >= 0:
-        start, end, region = region_rows[i]
+    matches = []
+    while i >= 0:
+        start, end, region, prefix_max_end = region_rows[i]
         if start <= int(addr) < end:
-            return region
-    return None
+            matches.append(region)
+        i -= 1
+        if i < 0 or region_rows[i][3] <= int(addr):
+            break
+    if not matches:
+        return None
+    return max(matches, key=lambda r: (_is_static_region(r),
+                                       _region_priority(r),
+                                       -(int(r["end"]) - int(r["start"]))))
 
 
 def _region_priority(region: dict) -> int:
@@ -2848,6 +4009,131 @@ def _region_priority(region: dict) -> int:
     return 10
 
 
+_SECTION_MODULE_PREFIX = "@section:"
+
+
+def _is_generic_map_name(name: str) -> bool:
+    """Whether a map label identifies a backing type rather than a module."""
+    low = str(name or "").strip().lower()
+    return (not low or low in {"anon", "heap", "[file]", "[vnode]",
+                               "[untyped]", "[default]", "[unknown]"})
+
+
+def _section_signature(region: dict) -> tuple:
+    """Stable fields available in both ps5debug and MemDBG map records."""
+    return (int(region.get("prot", 0)),
+            (int(region.get("flags", 0)) >> 24) & 0xFF,
+            int(region.get("end", 0)) - int(region.get("start", 0)))
+
+
+def _section_module_identity(region: dict, static_maps: list) -> str:
+    """Encode PS4Cheater-style section identity without persisting an address."""
+    prot, map_type, size = _section_signature(region)
+    peers = sorted((r for r in static_maps
+                    if _section_signature(r) == (prot, map_type, size)
+                    and _is_generic_map_name(str(r.get("name", "") or ""))),
+                   key=lambda r: (int(r["start"]), int(r["end"])))
+    ordinal = 0
+    wanted_bounds = (int(region["start"]), int(region["end"]))
+    for i, peer in enumerate(peers):
+        if (int(peer["start"]), int(peer["end"])) == wanted_bounds:
+            ordinal = i
+            break
+    return (f"{_SECTION_MODULE_PREFIX}{prot:x}:{map_type:x}:"
+            f"{size:x}:{ordinal}")
+
+
+def _build_region_priority_intervals(maps: list):
+    """Return disjoint mapped intervals carrying the best overlap priority.
+
+    A pointer value only needs to land in *some* mapped row.  Using a simple
+    ``searchsorted(starts)`` against overlapping VM records can select a short
+    overlay and reject an address that is still covered by a larger mapping.
+    This sweep converts the map into non-overlapping intervals once, allowing
+    the RAM and disk reverse indexes to keep their vectorized hot paths.
+    """
+    events = {}
+    priorities = {}
+    row_id = 0
+    for region in maps:
+        start = int(region.get("start", 0))
+        end = int(region.get("end", 0))
+        if end <= start:
+            continue
+        priorities[row_id] = int(_region_priority(region))
+        events.setdefault(start, [[], []])[0].append(row_id)  # additions
+        events.setdefault(end, [[], []])[1].append(row_id)    # removals
+        row_id += 1
+
+    active = set()
+    priority_heap = []
+    intervals = []
+    previous = None
+    for coordinate in sorted(events):
+        while priority_heap and priority_heap[0][1] not in active:
+            heapq.heappop(priority_heap)
+        if previous is not None and coordinate > previous and priority_heap:
+            priority = -int(priority_heap[0][0])
+            if (intervals and intervals[-1][1] == previous and
+                    intervals[-1][2] == priority):
+                intervals[-1] = (intervals[-1][0], coordinate, priority)
+            else:
+                intervals.append((previous, coordinate, priority))
+
+        additions, removals = events[coordinate]
+        for rid in removals:
+            active.discard(rid)
+        for rid in additions:
+            active.add(rid)
+            heapq.heappush(priority_heap, (-priorities[rid], rid))
+        while priority_heap and priority_heap[0][1] not in active:
+            heapq.heappop(priority_heap)
+        previous = coordinate
+
+    return (
+        np.asarray([row[0] for row in intervals], dtype=np.uint64),
+        np.asarray([row[1] for row in intervals], dtype=np.uint64),
+        np.asarray([row[2] for row in intervals], dtype=np.uint8),
+    )
+
+
+def _pointer_word_views(raw: bytes, start: int,
+                        holder_limit: Optional[int] = None):
+    """Yield uint64 pointer slots at the two common 64-bit field alignments.
+
+    A native pointer has an eight-byte width, but it can live at an offset of
+    four inside a packed or mixed-width game structure.  Scanning only an
+    eight-byte grid therefore makes an entire class of valid roots invisible.
+    The caller may append a four-byte transport overlap and pass the logical
+    chunk end as ``holder_limit``; this includes a cross-boundary 4-aligned
+    word once without returning the next chunk's ordinary 8-aligned word.
+    """
+    view = memoryview(raw)
+    start = int(start)
+    limit = int(holder_limit) if holder_limit is not None else start + len(view)
+    residues = (0,) if _PTR_STRUCT_STEP <= 0 or _PTR_STRUCT_STEP >= 8 else (
+        0, _PTR_STRUCT_STEP)
+    seen = set()
+    for residue in residues:
+        residue = int(residue)
+        if residue in seen:
+            continue
+        seen.add(residue)
+        available = len(view) - residue
+        usable = available - (available % 8)
+        if usable < 8:
+            continue
+        holder_base = start + residue
+        count = max(0, (limit - holder_base + 7) // 8)
+        if count <= 0:
+            continue
+        values = np.frombuffer(view[residue:residue + usable], dtype="<u8")
+        if count < len(values):
+            values = values[:count]
+        if len(values):
+            yield holder_base, values
+
+
 def _fast_direct_pointer_hits(ip: str, pid: int, target: int, maps: list,
                               cancel_event=None, max_hits: int = _PTR_FAST_DIRECT_HITS) -> list:
     """Cheap first pass: find direct target-near pointers without building the full index."""
@@ -2855,9 +4141,28 @@ def _fast_direct_pointer_hits(ip: str, pid: int, target: int, maps: list,
     readable.sort(key=lambda r: (-_region_priority(r), int(r["start"])))
     low = max(_ADDR_MIN, int(target) - _PTR_FAST_DIRECT_RANGE)
     high = min(_ADDR_MAX, int(target) + _PTR_FAST_DIRECT_RANGE)
-    starts = np.asarray([int(r["start"]) for r in maps], dtype=np.uint64)
-    ends = np.asarray([int(r["end"]) for r in maps], dtype=np.uint64)
     hits = []
+
+    # MemDBG currently implements a fast exact one-hop holder scan.  Use it as
+    # a seed only; RDX remains responsible for offsets, recursion, module roots
+    # and verification.  This avoids trusting MemDBG's presently-unused depth
+    # field as if it represented a complete chain.
+    if state.get("backend") == "memdbg-experimental":
+        client = _MemDBGClient(ip, timeout=10.0)
+        try:
+            client.connect()
+            for holder in client.pointer_holders(pid, target, readable, max_hits):
+                region_starts, region_rows = _build_region_lookup(maps)
+                region = _region_for_addr(holder, region_starts, region_rows)
+                if region is not None and _is_static_region(region):
+                    hits.append((int(holder), 0, region))
+            if hits:
+                add_log(f"MemDBG native pointer seed: {len(hits)} exact static holder(s)")
+                return hits[:max_hits]
+        except Exception as exc:
+            add_log(f"MemDBG pointer seed unavailable; using RDX scan: {exc}", "warn")
+        finally:
+            client.close()
     sock = _ScanSocket(ip, pid)
     try:
         for region in readable:
@@ -2870,14 +4175,16 @@ def _fast_direct_pointer_hits(ip: str, pid: int, target: int, maps: list,
                 size -= size % 8
                 if size < 8:
                     break
+                # Include four bytes from the following logical chunk so a
+                # 4-byte-aligned uint64 holder at its end is not lost.
+                read_size = min(size + _PTR_STRUCT_STEP, re_ - pos)
                 try:
-                    raw = sock.read(pos, size, cancel_event)
+                    raw = sock.read(pos, read_size, cancel_event)
                 except Exception:
                     pos += size
                     continue
-                trim = len(raw) - (len(raw) % 8)
-                if trim >= 8:
-                    a = np.frombuffer(raw[:trim], dtype=np.uint64)
+                for holder_base, a in _pointer_word_views(
+                        raw, pos, holder_limit=pos + size):
                     mask = (a >= np.uint64(low)) & (a <= np.uint64(high))
                     if mask.any():
                         idxs = np.flatnonzero(mask)
@@ -2886,7 +4193,7 @@ def _fast_direct_pointer_hits(ip: str, pid: int, target: int, maps: list,
                             delta = int(target) - value
                             if delta % _PTR_RESOLVE_OFFSET_STEP:
                                 continue
-                            holder = pos + j * 8
+                            holder = holder_base + j * 8
                             hits.append((holder, delta, region))
                             if len(hits) >= max_hits:
                                 break
@@ -2921,14 +4228,10 @@ class _ReversePointerIndex:
         readable = _pointer_readable_regions(self.maps)
         if not readable:
             return
-        # ps5debug map order is not guaranteed.  searchsorted requires sorted
-        # starts; using the raw map order can silently discard valid pointers.
-        lookup_maps = sorted(
-            (r for r in self.maps if int(r.get("end", 0)) > int(r.get("start", 0))),
-            key=lambda r: int(r["start"])
-        )
-        starts = np.asarray([int(r["start"]) for r in lookup_maps], dtype=np.uint64)
-        ends = np.asarray([int(r["end"]) for r in lookup_maps], dtype=np.uint64)
+        starts, ends, interval_priority = _build_region_priority_intervals(
+            self.maps)
+        if starts.size == 0:
+            return
         total = max(sum(int(r["end"]) - int(r["start"]) for r in readable), 1)
         vals_parts, holder_parts = [], []
         sock = _ScanSocket(self.ip, self.pid)
@@ -2945,8 +4248,12 @@ class _ReversePointerIndex:
                     size -= size % 8
                     if size < 8:
                         break
+                    # Preserve a 4-byte-aligned pointer which straddles this
+                    # logical chunk boundary.  ``holder_limit`` below keeps
+                    # the overlap from producing duplicate holders.
+                    read_size = min(size + _PTR_STRUCT_STEP, re_ - pos)
                     try:
-                        raw = sock.read(pos, size, cancel_event)
+                        raw = sock.read(pos, read_size, cancel_event)
                     except Exception as exc:
                         add_log(f"Pointer index read error @ {hex(pos)}: {exc}", "warn")
                         self.done_bytes += size
@@ -2954,9 +4261,8 @@ class _ReversePointerIndex:
                         if progress_cb:
                             progress_cb(self.done_bytes, total)
                         continue
-                    trim = len(raw) - (len(raw) % 8)
-                    if trim >= 8:
-                        a = np.frombuffer(raw[:trim], dtype=np.uint64)
+                    for holder_base, a in _pointer_word_views(
+                            raw, pos, holder_limit=pos + size):
                         # A pointer candidate must be a user-space address that
                         # currently falls inside a mapped region.  This removes
                         # ordinary integers while retaining heap/module pointers.
@@ -2971,7 +4277,8 @@ class _ReversePointerIndex:
                         if hit_idx.size:
                             vals_parts.append(a[hit_idx].copy())
                             holder_parts.append(
-                                pos + hit_idx.astype(np.uint64, copy=False) * np.uint64(8))
+                                np.uint64(holder_base) +
+                                hit_idx.astype(np.uint64, copy=False) * np.uint64(8))
                     self.done_bytes += size
                     pos += size
                     if progress_cb:
@@ -2990,9 +4297,6 @@ class _ReversePointerIndex:
             # Cache holder-region priority once.  Querying a dense pointer
             # range must not discard a good module/static pointer merely
             # because many heap pointers occur at smaller offsets.
-            map_priority = np.fromiter(
-                (_region_priority(r) for r in lookup_maps),
-                dtype=np.uint8, count=len(lookup_maps))
             holder_map = np.searchsorted(starts, self.holders, side="right") - 1
             holder_map_i = holder_map.astype(np.int64, copy=False)
             valid = holder_map_i >= 0
@@ -3000,7 +4304,7 @@ class _ReversePointerIndex:
             if valid.any():
                 vi = np.where(valid, holder_map_i, 0)
                 inside = valid & (self.holders < ends[vi])
-                hp[inside] = map_priority[vi[inside]]
+                hp[inside] = interval_priority[vi[inside]]
             self.holder_priority = hp
             order = np.argsort(self.values, kind="mergesort")
             self.values = self.values[order]
@@ -3012,7 +4316,7 @@ class _ReversePointerIndex:
     def query(self, target: int, max_offset: int = _PTR_RESOLVE_OFFSET_MAX,
               step: int = _PTR_RESOLVE_OFFSET_STEP,
               max_hits: int = _PTR_RESOLVE_MAX_HITS) -> list:
-        """Return (holder, offset) for values in [target-max_offset, target].
+        """Return (holder, offset) for values within max_offset of target.
 
         The old implementation performed one binary search per 8-byte offset.
         That becomes expensive with an 8 KiB window.  This version performs one
@@ -3097,11 +4401,10 @@ class _DiskReversePointerIndex:
 
     def _build(self, cancel_event=None, progress_cb=None):
         readable = _coalesce_pointer_regions(_pointer_readable_regions(self.maps))
-        lookup_maps = sorted(
-            (r for r in self.maps if int(r.get("end", 0)) > int(r.get("start", 0))),
-            key=lambda r: int(r["start"]))
-        starts = np.asarray([int(r["start"]) for r in lookup_maps], dtype=np.uint64)
-        ends = np.asarray([int(r["end"]) for r in lookup_maps], dtype=np.uint64)
+        starts, ends, _interval_priority = _build_region_priority_intervals(
+            self.maps)
+        if starts.size == 0:
+            return
         total = max(sum(int(r["end"]) - int(r["start"]) for r in readable), 1)
         self.total_bytes = total
         tasks = _queue.Queue()
@@ -3287,10 +4590,16 @@ def _get_reverse_pointer_index(ip: str, pid: int, cancel_event=None,
             add_log(f"Region classifier unavailable; using map safeguards: {exc}",
                     "warn")
     key = (ip, int(pid), int(state.get("session", 0)))
+    stale_index = None
     with _pointer_index_lock:
         cached = _pointer_index_cache.get(key)
         if cached and cached[0] == fp:
             return cached[1], maps, False
+        if cached:
+            _pointer_index_cache.pop(key, None)
+            stale_index = cached[1]
+    if stale_index is not None and hasattr(stale_index, "close"):
+        stale_index.close()
     readable_bytes = sum(
         int(r["end"]) - int(r["start"])
         for r in _pointer_readable_regions(maps))
@@ -3326,6 +4635,26 @@ def _invalidate_pointer_index(ip=None, pid=None):
                 entry = _pointer_index_cache.pop(key, None)
                 if entry and hasattr(entry[1], "close"):
                     entry[1].close()
+
+
+def _query_pointer_index_tiered(index, target: int) -> list:
+    """Query narrow-to-wide without letting wide-range noise hide near hits."""
+    out = []
+    seen = set()
+    per_tier = max(32, _PTR_RESOLVE_MAX_HITS // 2)
+    for window in _PTR_RESOLVE_OFFSET_TIERS:
+        for holder, offset in index.query(
+                int(target), int(window), _PTR_RESOLVE_OFFSET_STEP, per_tier):
+            key = (int(holder), int(offset))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+        # Preserve all close candidates; allow progressively wider tiers to
+        # add alternatives up to a bounded multiple of the former single pass.
+        if len(out) >= _PTR_RESOLVE_MAX_HITS * 3:
+            break
+    return out
 
 
 def _candidate_confidence(c: dict) -> int:
@@ -3462,8 +4791,7 @@ def _resolve_permanent_candidates(ip: str, pid: int, target_addr: int,
         # Deterministic search: every node uses the same full offset window.
         # Do not stop early because a nearby heap reference happened to exist;
         # that can hide a valid module/static root farther from the target.
-        hits = index.query(current, _PTR_RESOLVE_OFFSET_MAX,
-                           _PTR_RESOLVE_OFFSET_STEP, _PTR_RESOLVE_MAX_HITS)
+        hits = _query_pointer_index_tiered(index, current)
 
         for holder, off in hits:
             if holder in visited:
@@ -3569,8 +4897,7 @@ def _resolve_permanent_candidates(ip: str, pid: int, target_addr: int,
                 depth = len(rev_edges) + 1
                 if depth > max_depth:
                     continue
-                hits = fresh_index.query(current, _PTR_RESOLVE_OFFSET_MAX,
-                                         _PTR_RESOLVE_OFFSET_STEP, _PTR_RESOLVE_MAX_HITS)
+                hits = _query_pointer_index_tiered(fresh_index, current)
                 for holder, off in hits:
                     if holder in visited:
                         continue
@@ -3632,10 +4959,15 @@ def _resolve_permanent_candidates(ip: str, pid: int, target_addr: int,
 
 
 def _pointer_readable_regions(maps: list) -> list:
-    """Return useful readable regions, excluding obvious giant reserved maps."""
+    """Return useful readable regions, excluding confirmed uncached maps.
+
+    Region size alone is not evidence of a GPU reservation.  Large PS5 heaps
+    are legitimate pointer sources, and excluding every map above 1 GiB made
+    some games mathematically impossible to resolve.  The authenticated region
+    classifier remains the authoritative way to omit uncached/GPU memory.
+    """
     PROT_READ = 0x1
     PROT_EXEC = 0x4
-    MAX_REGION = 0x40000000  # 1 GiB; avoid obvious GPU/VM reservations
     out = []
     classified = _pointer_region_class_cache.get(_pointer_map_fingerprint(maps), [])
     uncached = sorted(
@@ -3649,8 +4981,6 @@ def _pointer_readable_regions(maps: list) -> list:
         if end <= start or not (prot & PROT_READ):
             continue
         if prot == PROT_EXEC:
-            continue
-        if end - start > MAX_REGION:
             continue
         name = str(r.get("name", "") or "")
         if name.startswith("libSce"):
@@ -3688,9 +5018,9 @@ def _coalesce_pointer_regions(regions: list) -> list:
         is_static = bool(_is_static_region(region))
         if end <= start:
             continue
-        if (merged and start == merged[-1]["end"] and
+        if (merged and start <= merged[-1]["end"] and
                 is_static == merged[-1]["static"]):
-            merged[-1]["end"] = end
+            merged[-1]["end"] = max(merged[-1]["end"], end)
         else:
             merged.append({"start": start, "end": end,
                            "static": is_static})
@@ -3699,8 +5029,7 @@ def _coalesce_pointer_regions(regions: list) -> list:
 
 def _pointer_scan_chunk(sock: _ScanSocket, start: int, size: int,
                         target_arr: np.ndarray, target_chains: dict,
-                        maps_sorted: list, map_starts: np.ndarray,
-                        map_ends: np.ndarray, cancel_event=None,
+                        region_starts: list, region_rows: list, cancel_event=None,
                         diagnostic: Optional[dict] = None):
     """Read one chunk and return matching (holder, target, offset, chain) hits."""
     raw = sock.read(start, size, cancel_event)
@@ -3711,11 +5040,10 @@ def _pointer_scan_chunk(sock: _ScanSocket, start: int, size: int,
     if diagnostic is not None:
         diagnostic["slots_scanned"] = diagnostic.get("slots_scanned", 0) + len(vals)
     # Match pointer values to target *ranges* instead of enumerating every
-    # target-offset value. The nearest sorted target is sufficient to decide
-    # whether at least one target lies within the signed offset window; exact
+    # target-offset value. Neighbouring targets cheaply identify whether at
+    # least one target lies within the signed offset window; exact aligned
     # target/chain combinations are expanded only for the tiny set of hits.
     positions = np.searchsorted(target_arr, vals, side="left")
-    mask = np.zeros(vals.shape, dtype=bool)
     range_mask = np.zeros(vals.shape, dtype=bool)
     right = positions < target_arr.size
     if right.any():
@@ -3724,7 +5052,6 @@ def _pointer_scan_chunk(sock: _ScanSocket, start: int, size: int,
         rd = target_arr[ri].astype(np.int64) - rv.astype(np.int64)
         in_range = np.abs(rd) <= _PTR_STRUCT_MAX
         range_mask[right] |= in_range
-        mask[right] |= in_range & ((rd % _PTR_STRUCT_STEP) == 0)
     left = positions > 0
     if left.any():
         li = positions[left] - 1
@@ -3732,14 +5059,16 @@ def _pointer_scan_chunk(sock: _ScanSocket, start: int, size: int,
         ld = target_arr[li].astype(np.int64) - lv.astype(np.int64)
         in_range = np.abs(ld) <= _PTR_STRUCT_MAX
         range_mask[left] |= in_range
-        mask[left] |= in_range & ((ld % _PTR_STRUCT_STEP) == 0)
     if diagnostic is not None:
         raw_count = int(np.count_nonzero(range_mask))
-        aligned_count = int(np.count_nonzero(mask))
         diagnostic["raw_range_matches"] = diagnostic.get("raw_range_matches", 0) + raw_count
-        diagnostic["alignment_rejected"] = diagnostic.get("alignment_rejected", 0) + max(0, raw_count - aligned_count)
-        diagnostic["aligned_matches"] = diagnostic.get("aligned_matches", 0) + aligned_count
-    indices = np.flatnonzero(mask)
+    # The range prefilter only checks the nearest target on either side. With multiple
+    # targets, that nearest target can have the wrong 4-byte residue while a
+    # slightly farther in-range target is a valid aligned edge.  PS4Cheater's
+    # exhaustive address walk does not make this mistake.  Expand every cheap
+    # interval match here and apply exact alignment in the small Python loop
+    # below, preventing a systematic deep-chain false negative.
+    indices = np.flatnonzero(range_mask)
     if not len(indices):
         return []
 
@@ -3762,14 +5091,19 @@ def _pointer_scan_chunk(sock: _ScanSocket, start: int, size: int,
                 continue
             chain = target_chains[target]
             # A pointer holder itself must be inside a mapped region.
-            mi = int(np.searchsorted(map_starts, holder_u, side="right") - 1)
-            if mi < 0 or holder_u >= int(map_ends[mi]):
+            region = _region_for_addr(int(holder_u), region_starts, region_rows)
+            if region is None:
                 continue
-            region = maps_sorted[mi]
             hits.append((int(holder_u), int(target), int(soff), chain,
                          bool(_is_static_region(region)),
                          region.get("name", "") or "anon"))
     if diagnostic is not None:
+        aligned_slots = len({hit[0] for hit in hits})
+        diagnostic["aligned_matches"] = (
+            diagnostic.get("aligned_matches", 0) + aligned_slots)
+        diagnostic["alignment_rejected"] = (
+            diagnostic.get("alignment_rejected", 0) +
+            max(0, int(np.count_nonzero(range_mask)) - aligned_slots))
         diagnostic["expanded_hits"] = diagnostic.get("expanded_hits", 0) + len(hits)
     return hits
 
@@ -3783,17 +5117,17 @@ def pointer_chain_scan(ip: str, pid: int,
     """Find static pointer chains to ``target_addr`` without full-memory caching.
 
     The search works backwards from the temporary address.  At each level it
-    looks for pointers to ``target - offset`` for aligned offsets 0..0x200.  A
-    heap holder becomes the target for the next level; a static holder becomes
-    a candidate immediately.
+    looks for pointers within a signed ±16 KiB field-offset window, accepting
+    4-byte-aligned offsets.  A heap holder becomes the target for the next
+    level; a static holder becomes a candidate immediately.
 
     Important differences from the old scanner:
       * memory is streamed in 32 MiB chunks instead of retained for every level;
       * offsets are tested at every pointer level, not only level 1;
       * heap expansion is bounded (beam search) so one noisy heap cannot create
         millions of chains;
-      * the default depth is 4, with the UI able to request deeper scans later;
-      * the first static hit can be returned without waiting for six full passes.
+      * the default depth is five, with up to eight supported;
+      * all heap address families remain eligible until a static root is found.
     """
     started = time.monotonic()
     candidates = []
@@ -3811,7 +5145,7 @@ def pointer_chain_scan(ip: str, pid: int,
     readable_maps = _pointer_readable_regions(maps)
     if diagnostic_report is not None:
         readable_ids = {id(r) for r in readable_maps}
-        excluded = {"not_readable": 0, "execute_only": 0, "over_1gib": 0,
+        excluded = {"not_readable": 0, "execute_only": 0,
                     "libsce": 0, "classified_uncached": 0, "other": 0}
         for r in maps:
             if id(r) in readable_ids:
@@ -3820,7 +5154,6 @@ def pointer_chain_scan(ip: str, pid: int,
             prot = int(r.get("prot", 0)); name = str(r.get("name", "") or "")
             if end <= start or not (prot & 1): excluded["not_readable"] += 1
             elif prot == 4: excluded["execute_only"] += 1
-            elif end - start > 0x40000000: excluded["over_1gib"] += 1
             elif name.startswith("libSce"): excluded["libsce"] += 1
             else: excluded["other"] += 1
         diagnostic_report.update({
@@ -3835,9 +5168,7 @@ def pointer_chain_scan(ip: str, pid: int,
         add_log("Pointer scan: no readable data regions", "warn")
         return []
 
-    maps_sorted = sorted(maps, key=lambda r: r["start"])
-    map_starts = np.asarray([r["start"] for r in maps_sorted], dtype=np.uint64)
-    map_ends   = np.asarray([r["end"] for r in maps_sorted], dtype=np.uint64)
+    region_starts, region_rows = _build_region_lookup(maps)
 
     # target -> offsets already discovered, stored as tuples so we can keep the
     # best (shortest) chain when multiple paths reach the same holder.
@@ -3900,14 +5231,11 @@ def pointer_chain_scan(ip: str, pid: int,
                     add_log(f"Depth {depth}: static-root pass complete; "
                             "skipping terminal heap scan")
                     break
-                is_local = (int(region["start"]) >> 32) in target_prefixes
-                if (not region.get("static") and not is_local and next_targets):
-                    if diagnostic_report is not None:
-                        depth_diag["nonlocal_heap_regions_deferred"] += 1
-                    add_log(f"Depth {depth}: local heap produced "
-                            f"{len(next_targets):,} parents; deferring unrelated "
-                            "address families")
-                    break
+                # Do not stop after the first address family yields a parent.
+                # PS5 allocators commonly keep manager objects, pools and game
+                # objects in different high-address families.  The old locality
+                # shortcut made every later family invisible and was a major
+                # systematic source of zero static-root results.
                 rstart, rend = int(region["start"]), int(region["end"])
                 start = rstart + ((-rstart) % 8)
                 chunk_limit = _PTR_CHUNK
@@ -3921,7 +5249,7 @@ def pointer_chain_scan(ip: str, pid: int,
                     try:
                         hits = _pointer_scan_chunk(
                             sock, start, size, target_arr, current_targets,
-                            maps_sorted, map_starts, map_ends, cancel_event,
+                            region_starts, region_rows, cancel_event,
                             depth_diag if diagnostic_report is not None else None)
                     except Exception as exc:
                         if diagnostic_report is not None:
@@ -4125,22 +5453,84 @@ def _runtime_pointer_base(cheat: dict) -> int:
     if cheat.get("module_name") and "module_relative_offset" in cheat:
         maps = _get_maps_cached(state["ip"], state["pid"])
         wanted = str(cheat["module_name"])
-        same = [r for r in maps if str(r.get("name", "") or "") == wanted]
-        if same:
-            base = min(int(r["start"]) for r in same)
+        base = _pointer_module_base(maps, wanted)
+        if base is not None:
             return base + int(cheat["module_relative_offset"])
-        if wanted == "main":
-            static = [r for r in maps if _is_static_region(r)]
-            if static:
-                return min(int(r["start"]) for r in static) + int(cheat["module_relative_offset"])
         raise RuntimeError(f"module '{wanted}' is not currently mapped")
     base = cheat.get("base", 0)
     return int(base, 0) if isinstance(base, str) else int(base)
 
 
+def _is_cross_reload_pointer(cheat: dict) -> bool:
+    """Whether a cheat has enough persisted evidence to survive reconnects."""
+    return bool(
+        cheat.get("offsets") is not None
+        and cheat.get("module_name")
+        and cheat.get("module_relative_offset") is not None
+        and cheat.get("cross_reload_validated") is True
+        and cheat.get("game_identity")
+    )
+
+
+def _is_module_relative_scalar(cheat: dict) -> bool:
+    """Whether a flat write has a relocatable static-module address."""
+    return bool(
+        cheat.get("offsets") is None
+        and cheat.get("module_name")
+        and cheat.get("module_relative_offset") is not None
+        and cheat.get("game_identity")
+    )
+
+
+def _is_portable_cheat(cheat: dict) -> bool:
+    return bool(cheat.get("game_identity")) and (
+        _is_cross_reload_pointer(cheat) or _is_module_relative_scalar(cheat))
+
+
+def _portable_cheat_matches_current_game(cheat: dict) -> bool:
+    """Fail closed before rebasing a trainer into another eboot.bin title."""
+    if not _is_portable_cheat(cheat):
+        return False
+    try:
+        maps = _get_maps_cached(state["ip"], state["pid"])
+        current = _pointer_game_identity(state.get("proc_name", ""), maps)
+        return str(cheat.get("game_identity", "")) == current
+    except Exception:
+        return False
+
+
+def _runtime_scalar_address(cheat: dict) -> int:
+    """Rebase a static scalar patch, or return its legacy absolute address."""
+    if _is_module_relative_scalar(cheat):
+        maps = _get_maps_cached(state["ip"], state["pid"])
+        base = _pointer_module_base(maps, str(cheat["module_name"]))
+        if base is None:
+            raise RuntimeError(
+                f"module '{cheat['module_name']}' is not currently mapped")
+        return int(base) + int(cheat["module_relative_offset"])
+    return int(cheat["address"])
+
+
 def _pointer_module_base(maps: list, module_name: str) -> Optional[int]:
     """Return the current base for a persisted pointer-root module."""
     wanted = str(module_name or "main")
+    if wanted.startswith(_SECTION_MODULE_PREFIX):
+        match = re.fullmatch(
+            re.escape(_SECTION_MODULE_PREFIX) +
+            r"([0-9a-fA-F]+):([0-9a-fA-F]+):([0-9a-fA-F]+):(\d+)",
+            wanted)
+        if not match:
+            return None
+        prot, map_type, size = (int(match.group(i), 16) for i in range(1, 4))
+        ordinal = int(match.group(4))
+        peers = sorted((r for r in maps
+                        if _is_static_region(r)
+                        and _is_generic_map_name(str(r.get("name", "") or ""))
+                        and _section_signature(r) == (prot, map_type, size)),
+                       key=lambda r: (int(r["start"]), int(r["end"])))
+        if 0 <= ordinal < len(peers):
+            return int(peers[ordinal]["start"])
+        return None
     same = [r for r in maps if str(r.get("name", "") or "") == wanted]
     if same:
         return min(int(r["start"]) for r in same)
@@ -4182,10 +5572,124 @@ def _load_pointer_provisionals(path: Optional[Path] = None) -> list:
         return []
 
 
+def _pointer_project_summary(process: str = "", maps: Optional[list] = None,
+                             path: Optional[Path] = None) -> dict:
+    """Summarise the persisted two-reload pointer validation project."""
+    records = _load_pointer_provisionals(path)
+    wanted_process = str(process or "")
+    if wanted_process:
+        records = [r for r in records
+                   if str(r.get("observed_process", "") or "") in
+                   ("", wanted_process)]
+    game_identity = (_pointer_game_identity(wanted_process, maps)
+                     if maps else "")
+    if game_identity:
+        records = [r for r in records
+                   if str(r.get("observed_game", "") or "") in
+                   ("", game_identity)]
+    survivals = max((int(r.get("reload_survivals", 0)) for r in records),
+                    default=0)
+    return {
+        "count": len(records),
+        "survivals": min(max(survivals, 0), 2),
+        "complete": survivals >= 2,
+        "target": (int(records[0].get("observed_target", 0))
+                   if records else None),
+        "process": wanted_process,
+        "game_identity": game_identity,
+    }
+
+
+def _clear_pointer_project(process: str = "", maps: Optional[list] = None,
+                           path: Optional[Path] = None) -> int:
+    """Remove only this game/process project; preserve unrelated candidates."""
+    dst = Path(path or _POINTER_PROVISIONAL_FILE)
+    all_records = _load_pointer_provisionals(dst)
+    wanted_process = str(process or "")
+    game_identity = (_pointer_game_identity(wanted_process, maps)
+                     if maps else "")
+
+    def belongs(record):
+        process_matches = (not wanted_process or
+                           str(record.get("observed_process", "") or "") in
+                           ("", wanted_process))
+        game_matches = (not game_identity or
+                        str(record.get("observed_game", "") or "") in
+                        ("", game_identity))
+        return process_matches and game_matches
+
+    kept = [record for record in all_records if not belongs(record)]
+    removed = len(all_records) - len(kept)
+    if removed:
+        _save_pointer_provisionals(kept, dst)
+    return removed
+
+
+def _is_main_module_name(map_name, process: str) -> bool:
+    """Match ps5debug labels and MemDBG full paths to the target image."""
+    name = str(map_name or "").strip()
+    process = str(process or "").strip()
+    if not name:
+        return False
+    if name == "executable" or (process and name == process):
+        return True
+    name_base = name.replace("\\", "/").rsplit("/", 1)[-1]
+    process_base = process.replace("\\", "/").rsplit("/", 1)[-1]
+    return bool(process_base and name_base == process_base)
+
+
+def _pointer_game_identity(process: str, maps: list) -> str:
+    """Build an ASLR-independent identity for an attached game image.
+
+    Process names alone are not sufficient because unrelated titles normally
+    run as ``eboot.bin``. Prefer the named main image; when MemDBG only exposes
+    generic vnode rows, use their ordered section metadata. Addresses are
+    deliberately excluded so the identity survives relocation.
+    """
+    process = str(process or "")
+    basename = process.replace("\\", "/").rsplit("/", 1)[-1]
+    static = [r for r in maps if _is_static_region(r)]
+    main_rows = [r for r in static
+                 if _is_main_module_name(r.get("name", ""), process)]
+    chosen = main_rows or sorted(static, key=lambda r: int(r["start"]))[:32]
+    signature = sorted((
+        str(r.get("name", "") or ""),
+        int(r.get("prot", 0)),
+        (int(r.get("flags", 0)) >> 24) & 0xFF,
+        int(r.get("offset", 0)),
+        int(r.get("end", 0)) - int(r.get("start", 0)),
+    ) for r in chosen)
+    encoded = json.dumps(signature, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()[:20]
+    return f"{basename or 'process'}:{digest}"
+
+
+def _merge_pointer_provisionals(records: list, process: str,
+                                path: Optional[Path] = None,
+                                game_identity: Optional[str] = None) -> list:
+    """Replace one game's candidates without erasing other games."""
+    wanted = str(process or "")
+    def same_scope(record):
+        if str(record.get("observed_process", "")) not in ("", wanted):
+            return False
+        if game_identity is None:
+            return True
+        # Empty identities are prerelease records. Replace them in this process
+        # scope so they cannot continue colliding with every eboot.bin title.
+        return str(record.get("observed_game", "")) in ("", game_identity)
+
+    preserved = [x for x in _load_pointer_provisionals(path)
+                 if not same_scope(x)]
+    merged = preserved + list(records)
+    _save_pointer_provisionals(merged, path)
+    return merged
+
+
 def _make_pointer_provisionals(candidates: list, maps: list, pid: int,
                                process: str, target_addr: int) -> list:
     """Convert same-session hits into bounded, module-relative records."""
     unique = {}
+    game_identity = _pointer_game_identity(process, maps)
     for candidate in candidates:
         if not candidate.get("verified") or not candidate.get("static"):
             continue
@@ -4209,6 +5713,7 @@ def _make_pointer_provisionals(candidates: list, maps: list, pid: int,
             "depth": len(offsets),
             "observed_pid": int(pid),
             "observed_process": str(process or ""),
+            "observed_game": game_identity,
             "observed_target": int(target_addr),
             "reload_survivals": 0,
         }
@@ -4224,8 +5729,9 @@ def _make_pointer_provisionals(candidates: list, maps: list, pid: int,
 def _validate_pointer_provisionals(ip: str, pid: int, process: str,
                                    target_addr: int, records: list,
                                    maps: Optional[list] = None) -> dict:
-    """Rebase and validate saved chains; promotion requires a different PID."""
+    """Rebase saved chains and validate them in a new relocation epoch."""
     maps = maps if maps is not None else _get_maps_cached(ip, pid)
+    game_identity = _pointer_game_identity(process, maps)
     survivors, rejected = [], []
     for saved in records:
         candidate = dict(saved)
@@ -4233,7 +5739,16 @@ def _validate_pointer_provisionals(ip: str, pid: int, process: str,
             candidate["rejection_reason"] = "different process"
             rejected.append(candidate)
             continue
-        if int(saved.get("observed_pid", pid)) == int(pid):
+        if str(saved.get("observed_game", "")) not in ("", game_identity):
+            candidate["rejection_reason"] = "different game image"
+            rejected.append(candidate)
+            continue
+        same_pid = int(saved.get("observed_pid", pid)) == int(pid)
+        same_target = int(saved.get("observed_target", target_addr)) == int(target_addr)
+        # A relocated address is a new validation epoch even when the process
+        # survives a scene/save reload. Requiring a new PID rejected the normal
+        # PointerFinder-style "Next Scan" workflow.
+        if same_pid and same_target:
             candidate["rejection_reason"] = "reload not detected"
             rejected.append(candidate)
             continue
@@ -4253,6 +5768,7 @@ def _validate_pointer_provisionals(ip: str, pid: int, process: str,
             # A second survival must come from another actual game reload.
             candidate["observed_pid"] = int(pid)
             candidate["observed_process"] = str(process or "")
+            candidate["observed_game"] = game_identity
             candidate["observed_target"] = int(target_addr)
             candidate["confidence"] = _candidate_confidence(candidate)
             survivors.append(candidate)
@@ -4264,10 +5780,20 @@ def _validate_pointer_provisionals(ip: str, pid: int, process: str,
 
 
 def generate_cht(cheats: list, game_id: str, game_ver: str,
-                 game_title: str, hex_values: bool = True) -> str:
-    fmt_val = (lambda v: hex(v)) if hex_values else (lambda v: str(v))
+                 game_title: str, hex_values: bool = True,
+                 process: str = "eboot.bin") -> str:
+    """Generate RDX's pointer-capable, round-trippable trainer format."""
+    def fmt_val(c, value):
+        type_key = _cheat_value_type(c)
+        if type_key == "bytes":
+            return _pack_typed_value(value, type_key, int(c["width"])).hex().upper()
+        if VALUE_TYPES[type_key]["kind"] == "float":
+            return float(value)
+        return hex(int(value)) if hex_values else str(int(value))
+
     cheat_list = []
     for c in cheats:
+        type_key = _cheat_value_type(c)
         is_pointer = "offsets" in c and c.get("offsets") is not None
         if is_pointer:
             entry = {
@@ -4275,30 +5801,152 @@ def generate_cht(cheats: list, game_id: str, game_ver: str,
                 "type":    c["type"],                    # pointer_freeze / pointer_write
                 "base":    hex(c["base"]) if isinstance(c.get("base"), int) else c.get("base"),
                 "offsets": [hex(o) for o in c["offsets"]],
-                "module":  c.get("module_name"),
-                "module_offset": (hex(c["module_relative_offset"])
-                                   if c.get("module_relative_offset") is not None else None),
+                "module_name": c.get("module_name"),
+                "module_relative_offset": (
+                    hex(c["module_relative_offset"])
+                    if c.get("module_relative_offset") is not None else None),
                 "terminal_offset": (hex(int(c["terminal_offset"]))
                                      if c.get("terminal_offset") else None),
-                "value":   fmt_val(c["value"]),
+                "value":   fmt_val(c, c["value"]),
+                "value_type": type_key,
                 "bytes":   c["width"],
+                "original_value": (fmt_val(c, c["original_value"])
+                                   if c.get("original_value") is not None else None),
+                "cross_reload_validated": bool(
+                    c.get("cross_reload_validated", False)
+                    and c.get("game_identity")),
+                "game_identity": str(c.get("game_identity", "") or ""),
             }
         else:
             entry = {
                 "name":    c["name"],
                 "type":    c["type"],
                 "address": hex(c["address"]),
-                "value":   fmt_val(c["value"]),
+                "module_name": c.get("module_name"),
+                "module_relative_offset": (
+                    hex(c["module_relative_offset"])
+                    if c.get("module_relative_offset") is not None else None),
+                "value":   fmt_val(c, c["value"]),
+                "value_type": type_key,
                 "bytes":   c["width"],
+                "original_value": (fmt_val(c, c["original_value"])
+                                   if c.get("original_value") is not None else None),
+                "session_bound": not _is_module_relative_scalar(c),
+                "game_identity": str(c.get("game_identity", "") or ""),
             }
         cheat_list.append(entry)
+    identities = sorted({str(c.get("game_identity", "") or "")
+                         for c in cheats if c.get("game_identity")})
     payload = {
         "title":     game_title,
         "titleid":   game_id,
         "version":   game_ver,
+        "process":   process,
+        "format":    "rdx-pointer-trainer-v1",
+        "game_identity": identities[0] if len(identities) == 1 else None,
         "cheatList": cheat_list,
     }
     return json.dumps(payload, indent=2)
+
+
+def _etahen_main_module(maps: list, process: str) -> tuple:
+    """Return (base, accepted map names) for etaHEN's target module.
+
+    etaHEN resolves every JSON patch as ``module.sections[0].vaddr + offset``.
+    ps5debug normally labels the corresponding image ``executable`` whereas
+    MemDBG may expose a real process/module name.  Generic ``[file]`` rows are
+    intentionally not guessed: etaHEN cannot select one of several anonymous
+    vnode images from a per-patch field.
+    """
+    process = str(process or "eboot.bin")
+    same = [r for r in maps
+            if _is_static_region(r)
+            and _is_main_module_name(r.get("name", ""), process)]
+    if same:
+        return (min(int(r["start"]) for r in same),
+                {str(r.get("name", "") or "") for r in same})
+    return (None, set())
+
+
+def _scalar_hex_bytes(value, width: int,
+                      value_type: Optional[str] = None) -> str:
+    """etaHEN JSON stores raw little-endian bytes as uppercase hex."""
+    width = int(width)
+    return _pack_typed_value(value, value_type, width).hex().upper()
+
+
+def generate_etahen_json(cheats: list, game_id: str, game_ver: str,
+                         game_title: str, process: str, maps: list,
+                         author: str = "RDX CheatMaker") -> tuple:
+    """Generate an etaHEN-compatible static-patch JSON and a skip report.
+
+    etaHEN's loader accepts module-relative byte patches only.  It has no field
+    for RDX/PointerFinder-style dereference chains and it does not implement a
+    repeated freeze.  Pointer/dynamic entries therefore remain in the native
+    RDX trainer and are never misrepresented as etaHEN-compatible patches.
+    """
+    module_base, accepted_names = _etahen_main_module(maps, process)
+    region_starts, region_rows = _build_region_lookup(maps)
+    mods = []
+    skipped = []
+    for cheat in cheats:
+        name = str(cheat.get("name", "Unnamed cheat"))
+        if cheat.get("offsets") is not None:
+            skipped.append((name, "pointer chain requires the RDX runtime"))
+            continue
+        if module_base is None:
+            skipped.append((name, "main executable module was not identifiable"))
+            continue
+        try:
+            address = int(cheat["address"])
+            width = int(cheat["width"])
+            saved_module = str(cheat.get("module_name", "") or "")
+            saved_relative = cheat.get("module_relative_offset")
+            if saved_module in accepted_names and saved_relative is not None:
+                relative = int(saved_relative)
+            else:
+                region = _region_for_addr(address, region_starts, region_rows)
+                region_name = str((region or {}).get("name", "") or "")
+                if (region is None or not _is_static_region(region) or
+                        region_name not in accepted_names):
+                    skipped.append((name, "address is not in the target module"))
+                    continue
+                relative = address - int(module_base)
+            if relative < 0:
+                skipped.append((name, "address precedes the target module base"))
+                continue
+            original = cheat.get("original_value")
+            if original is None:
+                skipped.append((name, "original/off value is unknown"))
+                continue
+            value_type = _cheat_value_type(cheat)
+            on_bytes = _scalar_hex_bytes(cheat["value"], width, value_type)
+            off_bytes = _scalar_hex_bytes(original, width, value_type)
+        except (KeyError, TypeError, ValueError, struct.error) as exc:
+            skipped.append((name, f"invalid scalar patch: {exc}"))
+            continue
+        description = "RDX module-relative scalar write."
+        if str(cheat.get("type", "")) == "freeze":
+            description += " etaHEN applies it once per toggle; it is not a live freeze."
+        mods.append({
+            "name": name,
+            "description": description,
+            "type": "checkbox",
+            "memory": [{
+                "offset": f"{relative:X}",
+                "on": on_bytes,
+                "off": off_bytes,
+            }],
+        })
+    payload = {
+        "name": game_title,
+        "id": game_id,
+        "version": game_ver,
+        "process": str(process or "eboot.bin"),
+        "mods": mods,
+        "credits": [str(author or "RDX CheatMaker")],
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False), mods, skipped
 
 # ── logging ───────────────────────────────────────────────────────────────────
 LOG_LIMIT = 500   # raised from 200 so older diagnostics are not lost so quickly
@@ -4311,15 +5959,24 @@ def add_log(msg: str, level: str = "info") -> None:
 
 # ── curses UI helpers ─────────────────────────────────────────────────────────
 
+_COLORS_OK = False
+
 def init_colors() -> None:
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_CYAN,    -1)   # C_TITLE
-    curses.init_pair(2, curses.COLOR_GREEN,   -1)   # C_OK
-    curses.init_pair(3, curses.COLOR_YELLOW,  -1)   # C_WARN
-    curses.init_pair(4, curses.COLOR_RED,     -1)   # C_ERR
-    curses.init_pair(5, curses.COLOR_WHITE,   -1)   # C_NORM
-    curses.init_pair(6, curses.COLOR_MAGENTA, -1)   # C_ACC
+    global _COLORS_OK
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN,    -1)   # C_TITLE
+        curses.init_pair(2, curses.COLOR_GREEN,   -1)   # C_OK
+        curses.init_pair(3, curses.COLOR_YELLOW,  -1)   # C_WARN
+        curses.init_pair(4, curses.COLOR_RED,     -1)   # C_ERR
+        curses.init_pair(5, curses.COLOR_WHITE,   -1)   # C_NORM
+        curses.init_pair(6, curses.COLOR_MAGENTA, -1)   # C_ACC
+        curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_CYAN)  # C_SEL
+        curses.init_pair(8, curses.COLOR_BLACK, curses.COLOR_RED)   # C_DSEL
+        _COLORS_OK = True
+    except curses.error:
+        _COLORS_OK = False
 
 
 def _safe_curs_set(visibility: int) -> None:
@@ -4328,14 +5985,17 @@ def _safe_curs_set(visibility: int) -> None:
         curses.curs_set(int(visibility))
     except curses.error:
         pass
-    curses.init_pair(7, curses.COLOR_BLACK,   curses.COLOR_CYAN)  # C_SEL
-    curses.init_pair(8, curses.COLOR_BLACK,   curses.COLOR_RED)   # C_DSEL
 
 C_TITLE = 1; C_OK = 2; C_WARN = 3; C_ERR = 4
 C_NORM  = 5; C_ACC = 6; C_SEL  = 7; C_DSEL = 8
 
 def color(pair: int) -> int:
-    return curses.color_pair(pair)
+    if not _COLORS_OK:
+        return 0
+    try:
+        return curses.color_pair(pair)
+    except curses.error:
+        return 0
 
 def safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
     """
@@ -4379,8 +6039,10 @@ def safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
         pass
 
 
-# Minimum terminal size the UI can sensibly operate in.
-_MIN_ROWS, _MIN_COLS = 10, 40
+# The pointer verifier, freeze monitor, and guided scan forms need these bounds
+# to keep their actions and cancel/status rows visible. Smaller terminals now
+# get one clear resize prompt instead of silently accepting hidden defaults.
+_MIN_ROWS, _MIN_COLS = 24, 72
 
 
 def _popup_dims(stdscr, content_lines: list, title: str = "") -> tuple:
@@ -4449,14 +6111,16 @@ def draw_progress_bar(win, y: int, x: int, bar_width: int,
 
 def input_box(stdscr, prompt: str, y: int, x: int,
               width: int = 30, default: str = "",
-              allow_cancel: bool = False) -> Optional[str]:
+              allow_cancel: bool = False,
+              empty_uses_default: bool = True,
+              cancel_with_q: bool = True) -> Optional[str]:
     h, w = stdscr.getmaxyx()
     if y < 0 or y >= h - 1:
-        return default
+        return None if allow_cancel else default
     safe_addstr(stdscr, y, x, prompt, color(C_WARN) | curses.A_BOLD)
     px = x + len(prompt)
     if px >= w:
-        return default
+        return None if allow_cancel else default
     # Always switch to blocking + cbreak before getstr().  Any caller that
     # used nodelay(True) (progress loops, results screen) must not leave the
     # terminal in non-blocking mode when we hand off to text input — getstr()
@@ -4477,7 +6141,7 @@ def input_box(stdscr, prompt: str, y: int, x: int,
             chars = []
             while True:
                 key = stdscr.getch()
-                if key in (27, ord('q'), ord('Q')):
+                if key == 27 or (cancel_with_q and key in (ord('q'), ord('Q'))):
                     return None
                 if key in (curses.KEY_ENTER, 10, 13):
                     break
@@ -4500,20 +6164,25 @@ def input_box(stdscr, prompt: str, y: int, x: int,
             raw = stdscr.getstr(y, px, width)
         val = raw.decode('utf-8').strip()
     except Exception:
-        val = default
+        # A terminal/input failure must not silently submit displayed defaults
+        # in a cancellable, state-changing form.
+        val = None if allow_cancel else default
     finally:
         curses.noecho()
         _safe_curs_set(0)
         # Restore the 100 ms timeout set in main() so callers get expected
         # behaviour without having to remember to reset it themselves.
         stdscr.timeout(100)
-    return val or default
+    if val is None:
+        return None
+    return (val or default) if empty_uses_default else val
 
 def cycle_input(stdscr, prompt: str, y: int, x: int,
                 options: list, default=None, allow_cancel: bool = False):
     h, w = stdscr.getmaxyx()
     if y < 0 or y >= h - 1:
-        return default if default is not None else options[0]
+        return (None if allow_cancel else
+                (default if default is not None else options[0]))
     idx = options.index(default) if default in options else 0
     _safe_curs_set(0)
     while True:
@@ -4521,7 +6190,14 @@ def cycle_input(stdscr, prompt: str, y: int, x: int,
         hint = f"< {options[idx]} >  (Tab/arrows to change, Enter to confirm)"
         safe_addstr(stdscr, y, x + len(prompt), hint, color(C_TITLE) | curses.A_BOLD)
         stdscr.refresh()
-        k = stdscr.getch()
+        try:
+            k = stdscr.getch()
+        except curses.error:
+            return None if allow_cancel else (
+                default if default is not None else options[0])
+        if k == -1:
+            time.sleep(0.02)
+            continue
         if k == curses.KEY_RESIZE:          # Issue #1: absorb resize events
             curses.update_lines_cols()
             h, w = stdscr.getmaxyx()
@@ -4537,7 +6213,10 @@ def cycle_input(stdscr, prompt: str, y: int, x: int,
 
 def confirm_box(stdscr, question: str, title: str = "Confirm") -> bool:
     # Issue #4: use _popup_dims so the box is never drawn off-screen.
-    lines = [question, "", "  [Y] Yes      [N / Esc] No"]
+    # Preserve deliberate newlines in safety/preflight questions.  Older
+    # versions passed the whole string to one curses row and silently clipped
+    # every line after the first.
+    lines = str(question).splitlines() + ["", "  [Y] Yes      [N / Esc] No"]
     bh, bw, by, bx = _popup_dims(stdscr, lines, title)
     try:
         win = curses.newwin(bh, bw, by, bx)
@@ -4584,7 +6263,8 @@ def message_box(stdscr, lines: list, title: str = "Info",
 
 def draw_header_banner(stdscr) -> None:
     _, w = stdscr.getmaxyx()
-    brand = "◈  PS5 CHEAT MAKER  ◈"
+    backend = "MemDBG EXP" if state.get("backend") == "memdbg-experimental" else "ps5debug"
+    brand = f"◈  RDX CHEATMAKER {RDX_VERSION}  [{backend}]  ◈"
     safe_addstr(stdscr, 1, max(0, (w - len(brand)) // 2),
                 brand, color(C_TITLE) | curses.A_BOLD)
 
@@ -4593,14 +6273,18 @@ def screen_connect(stdscr) -> str:
     draw_border(stdscr, "CONNECT")
     draw_header_banner(stdscr)
     for i, hint in enumerate([
-        "Ensure ps5debug payload is loaded on your PS5.",
+        "Load ps5debug-NG, or MemDBG (native 9020; legacy 744 is optional).",
         "Find PS5 IP:  Settings > Network > View Connection Status",
+        "Press Esc to exit.",
     ]):
         safe_addstr(stdscr, 3 + i, 3, hint, color(C_NORM))
     stdscr.refresh()
 
     ip = input_box(stdscr, "PS5 IP address : ", 6, 3, 40,
-                   state["ip"] or "192.168.0.88")
+                   state["ip"] or "192.168.0.88", allow_cancel=True,
+                   cancel_with_q=False)
+    if ip is None:
+        return "quit"
     state["ip"] = ip
     # Issue #9: a new connection means a new session — stop any freeze that
     # was left running from a previous connection before we try to talk to
@@ -4609,6 +6293,19 @@ def screen_connect(stdscr) -> str:
     safe_addstr(stdscr, 8, 3, "Connecting…", color(C_WARN))
     stdscr.refresh()
     try:
+        native = memdbg_probe(ip)
+        if native is not None:
+            state["backend"] = "memdbg-experimental"
+            state["memdbg"] = native
+            # Early MemDBG revisions did not advertise native memory reads.
+            # Those builds still need the optional compatibility listener;
+            # current payloads can run the entire RDX scan workflow on 9020.
+            if not _memdbg_has(MEMDBG_CAP_MEMORY_READ):
+                bridge = ps5_connect(ip, timeout=3.0)
+                bridge.close()
+        else:
+            state["backend"] = "ps5debug"
+            state["memdbg"] = None
         procs = ps5_proc_list(ip)
         # A successful connection starts a new protocol session.  PIDs can be
         # reused after rest mode/restart and can coincide across consoles, so
@@ -4620,12 +6317,20 @@ def screen_connect(stdscr) -> str:
         state["pid"] = None
         state["proc_name"] = ""
         state["connected"] = True
-        add_log(f"Connected to {ip}, {len(procs)} processes")
+        _save_preferences({"last_ip": ip})
+        if native is not None:
+            native_io = (_memdbg_has(MEMDBG_CAP_MEMORY_READ) and
+                         _memdbg_has(MEMDBG_CAP_MEMORY_WRITE))
+            add_log(f"Connected to {ip} via experimental MemDBG "
+                    f"{native.get('version') or ''}; "
+                    f"{'native memory I/O' if native_io else 'compatibility fallback'}")
+        else:
+            add_log(f"Connected to {ip} via ps5debug, {len(procs)} processes")
         return screen_proc_select(stdscr, procs)
     except Exception as e:
         safe_addstr(stdscr, 8, 3, f"X Failed: {e}".ljust(60), color(C_ERR))
         safe_addstr(stdscr, 10, 3,
-                    "Reminder: start the ps5debug payload on your console,",
+                    "Start ps5debug-NG or MemDBG on your console,",
                     color(C_WARN) | curses.A_BOLD)
         safe_addstr(stdscr, 11, 3,
                     "then verify the PS5 IP address and try again.", color(C_WARN))
@@ -4634,9 +6339,10 @@ def screen_connect(stdscr) -> str:
         stdscr.getch()
         return "connect"
 
-def _clear_scan_state() -> None:
-    """Wipe all scan-related state. Called whenever the attached process changes."""
-    _stop_freeze_worker()
+def _clear_scan_state(stop_freezes: bool = True) -> None:
+    """Wipe scan state; process/session changes also stop active toggles."""
+    if stop_freezes:
+        _stop_freeze_worker()
     _close_turbo_session()
     state["scan_results"]   = _make_addr_array()
     state["scan_values"]    = None
@@ -4663,7 +6369,9 @@ def screen_proc_select(stdscr, procs: list) -> str:
         return sorted(lst, key=lambda p: p['name'].lower())
 
     procs = _sorted(procs_orig)
-    sel        = 0
+    preferred = str(state.get("last_process", "eboot.bin") or "eboot.bin")
+    sel = next((i for i, p in enumerate(procs)
+                if str(p.get("name", "")) == preferred), 0)
     filter_str = ""
     while True:
         stdscr.clear()
@@ -4719,6 +6427,9 @@ def screen_proc_select(stdscr, procs: list) -> str:
                 _clear_scan_state()
             state["pid"]       = p["pid"]
             state["proc_name"] = p["name"]
+            state["last_process"] = p["name"]
+            _save_preferences({"last_ip": state["ip"],
+                               "last_process": p["name"]})
             add_log(f"Attached to PID {state['pid']} ({state['proc_name']})")
             return "main"
         elif key in (ord('q'), ord('Q')):
@@ -4737,8 +6448,12 @@ def _draw_main_header(stdscr) -> None:
     safe_addstr(stdscr, 2, 3, conn[:max(w - 6, 0)], color(C_OK) | curses.A_BOLD)
     results = len(state["scan_results"])
     cheats = len(state["cheats"])
-    width = WIDTH_LABEL.get(state["scan_width"], "?")
-    scan_note = f"Results {results:,}   Cheats {cheats}   {width}"
+    project = state.get("pointer_project_summary") or {
+        "count": 0, "survivals": 0}
+    project_note = (f"   Pointer project {project['survivals']}/2"
+                    if project["count"] else "")
+    scan_note = (f"Results {results:,}   Cheats {cheats}   "
+                 f"{_current_scan_label()}{project_note}")
     safe_addstr(stdscr, 3, 3, scan_note[:max(w - 6, 0)], color(C_WARN))
 
 
@@ -4764,12 +6479,13 @@ def do_command_palette(stdscr) -> None:
     commands = [
         ("First Scan", "scan_first"), ("Next Scan", "scan_next"),
         ("Results", "results"), ("Cheat List", "cheat_list"),
-        ("Pointer Scan", "pointer_scan"), ("Write Address", "write"),
-        ("Freeze Address", "freeze"), ("Import Cheats", "import"),
-        ("Export Cheats", "export"), ("Scan Settings", "scan_settings"),
+        ("Pointer Project", "pointer_project"),
+        ("Find Permanent Pointer", "pointer_scan"), ("Write Address", "write"),
+        ("Freeze Address", "freeze"), ("Import RDX Trainer", "import"),
+        ("Export Trainers", "export"), ("Scan Settings", "scan_settings"),
         ("Logs", "log"), ("Clear Results", "clear"),
         ("Clear Scan History", "clear_history"), ("Change Process", "proc"),
-        ("Verify Pointer", "ptr_verify"),
+        ("Reconnect Console", "reconnect"), ("Verify Pointer", "ptr_verify"),
     ]
     query = ""
     sel = 0
@@ -4801,8 +6517,8 @@ def do_command_palette(stdscr) -> None:
             sel = min(max(len(matches) - 1, 0), sel + 1)
         elif key in (curses.KEY_ENTER, 10, 13) and matches:
             result = dispatch(stdscr, matches[sel][1])
-            if result == "proc":
-                return "proc"
+            if result in {"proc", "connect"}:
+                return result
             return
         elif key in (curses.KEY_BACKSPACE, 127, 8):
             query = query[:-1]; sel = 0
@@ -4820,6 +6536,7 @@ def _main_menu_entries():
         ("S", "First Scan", "scan_first", C_NORM),
         ("N", "Next Scan",  "scan_next",  C_NORM),
         ("R", "Results",    "results",    C_ACC),
+        ("P", "Pointer Project", "pointer_project", C_ACC),
         ("C", "Cheats",     "cheat_list", C_NORM),
         ("T", "Settings",   "scan_settings", C_ACC),
         ("Q", "Quit",       None,          C_ERR),
@@ -4830,6 +6547,8 @@ def screen_main(stdscr):
     """Compact primary navigation: workflow first, advanced tools elsewhere."""
     menu = _main_menu_entries()
     sel = 0
+    state["pointer_project_summary"] = _pointer_project_summary(
+        state.get("proc_name", ""))
     stdscr.timeout(100)
     while True:
         stdscr.clear()
@@ -4840,9 +6559,9 @@ def screen_main(stdscr):
         # The primary workflow is intentionally linear and small.  Do not
         # expose low-frequency destructive/debug utilities here.
         sections = [
-            ("SCAN", 0, 3),
-            ("CHEATS", 3, 1),
-            ("SETUP", 4, 2),
+            ("SCAN", 0, 4),
+            ("CHEATS", 4, 1),
+            ("SETUP", 5, 2),
         ]
         if w >= 78:
             col_x = [3, max(25, w // 3), max(50, (2 * w) // 3)]
@@ -4897,12 +6616,12 @@ def screen_main(stdscr):
             if action is None:
                 return None
             result = dispatch(stdscr, action)
-            if result == "proc":
-                return "proc"
+            if result in {"proc", "connect"}:
+                return result
         elif key == ord('/'):
             result = do_command_palette(stdscr)
-            if result == "proc":
-                return "proc"
+            if result in {"proc", "connect"}:
+                return result
         elif key == ord('?'):
             do_help(stdscr)
         else:
@@ -4918,8 +6637,8 @@ def screen_main(stdscr):
                     if action is None:
                         return None
                     result = dispatch(stdscr, action)
-                    if result == "proc":
-                        return "proc"
+                    if result in {"proc", "connect"}:
+                        return result
                     break
 
 def do_help(stdscr) -> None:
@@ -4927,8 +6646,9 @@ def do_help(stdscr) -> None:
         "Navigation   ↑↓ Select   Enter Run   Esc Back   Q Quit",
         "Global       / Command Palette   ? Help",
         "Scanning     S First Scan   N Next Scan   R Results",
-        "Results      A Apply   C Cheat   P Pointer   R Permanent",
-        "Cheats       Enter Inspect   A Apply   D Delete",
+        "Pointers     P Pointer Project (persisted 2-reload workflow)",
+        "Results      A Apply   C Cheat   R Find permanent   N Refine",
+        "Cheats       F/Space Toggle   A Apply   E Edit   D Delete",
         "Advanced     / Command Palette → import/export/logs/pointer tools",
         "Setup        T Settings",
         "",
@@ -4940,6 +6660,7 @@ def do_help(stdscr) -> None:
 def dispatch(stdscr, action: str):
     actions = {
         "pointer_scan": do_pointer_scan,
+        "pointer_project": do_pointer_project,
         "ptr_verify":   do_ptr_verify_manual,
         "scan_first":    do_scan_first,
         "scan_next":     do_scan_next,
@@ -4956,6 +6677,10 @@ def dispatch(stdscr, action: str):
     }
     if action == "proc":
         return "proc"
+    if action == "reconnect":
+        _stop_freeze_worker()
+        state["connected"] = False
+        return "connect"
     fn = actions.get(action)
     if fn:
         fn(stdscr)
@@ -5094,69 +6819,141 @@ def do_scan_settings(stdscr) -> None:
     options = ["Auto (Turbo → Console → Host)", "Turbo only", "Console only", "Host only"]
     keys = ["auto", "turbo", "console", "host"]
     current = state.get("scan_engine", "auto")
-    selected = cycle_input(stdscr, "Scan engine: ", 5, 3, options, options[keys.index(current)])
+    if current not in keys:
+        current = "auto"
+    stdscr.clear()
+    draw_border(stdscr, "SCAN SETTINGS")
+    safe_addstr(stdscr, 2, 3,
+                "Auto tries the fastest available engine and falls back safely.",
+                color(C_NORM))
+    selected = cycle_input(
+        stdscr, "Scan engine: ", 5, 3, options, options[keys.index(current)],
+        allow_cancel=True)
+    if selected is None:
+        add_log("Scan settings unchanged")
+        return
     state["scan_engine"] = keys[options.index(selected)]
     add_log(f"Scan engine set to {state['scan_engine']}")
-    message_box(stdscr, [f"Scan engine: {selected}"], "Scan Settings", C_OK)
+
+
+def _current_scan_type() -> str:
+    """Return the active scan type, including legacy width-only sessions."""
+    return _normalise_value_type(state.get("scan_type"),
+                                 state.get("scan_width", 4))
+
+
+def _current_scan_label() -> str:
+    key = _current_scan_type()
+    if key == "bytes" and state.get("scan_pattern"):
+        return f"AOB ({state['scan_pattern']})"
+    return VALUE_TYPES[key]["label"]
 
 def do_scan_first(stdscr) -> None:
     stdscr.clear()
-    _, w = stdscr.getmaxyx()
     draw_border(stdscr, "FIRST SCAN")
     safe_addstr(stdscr, 2, 3,
-        "Enter the current in-game value to search for.", color(C_WARN))
+        "Choose the value's real in-memory type before entering it.",
+        color(C_WARN))
     stdscr.refresh()
 
-    safe_addstr(stdscr, 12, 3, "Esc/Q cancels setup", color(C_NORM))
-    val_s = input_box(stdscr, "Value (blank = unknown): ", 4, 3, 20,
+    labels = [VALUE_TYPES[key]["label"] for key in VALUE_TYPE_ORDER]
+    current_type = _current_scan_type()
+    type_label = cycle_input(
+        stdscr, "Value type      : ", 4, 3, labels,
+        VALUE_TYPES[current_type]["label"], allow_cancel=True)
+    if type_label is None:
+        add_log("First scan setup cancelled")
+        return
+    type_key = (VALUE_TYPE_ORDER[labels.index(type_label)]
+                if type_label in labels else _normalise_value_type(type_label))
+
+    if type_key == "bytes":
+        value_prompt = "Pattern (AA BB ?? CC): "
+        value_default = state.get("scan_pattern", "")
+    else:
+        value_prompt = "Value (blank = unknown): "
+        value_default = ""
+    val_s = input_box(stdscr, value_prompt, 6, 3, 38, value_default,
                       allow_cancel=True)
     if val_s is None:
         add_log("First scan setup cancelled")
         return
-    unknown_mode = (val_s.strip() == "")
+    unknown_mode = type_key != "bytes" and not val_s.strip()
 
-    _wlabels  = [WIDTH_LABEL[ww] for ww in VALID_WIDTHS]
-    _wsel     = cycle_input(stdscr, "Scan width      : ", 6, 3, _wlabels,
-                            WIDTH_LABEL.get(state["scan_width"], "uint32"),
-                            allow_cancel=True)
-    if _wsel is None:
-        add_log("First scan setup cancelled")
-        return
-    width     = VALID_WIDTHS[_wlabels.index(_wsel)]
+    if type_key == "bytes":
+        try:
+            pattern, pattern_mask, canonical = _parse_byte_pattern(val_s, True)
+        except ValueError as exc:
+            message_box(stdscr, [str(exc)], "Invalid Pattern", C_ERR)
+            return
+        width = len(pattern)
+        align_options = ["every byte (recommended)", "pattern-width aligned"]
+        align_default = align_options[0]
+    else:
+        width = _value_width(type_key)
+        pattern = pattern_mask = None
+        canonical = ""
+        align_options = ["aligned (faster)", "unaligned (thorough)"]
+        align_default = (align_options[0] if state["scan_aligned"]
+                         else align_options[1])
+
     align_lbl = cycle_input(stdscr, "Scan alignment  : ", 8, 3,
-                            ["aligned (faster)", "unaligned (thorough)"],
-                            "aligned (faster)" if state["scan_aligned"] else "unaligned (thorough)",
-                            allow_cancel=True)
+                            align_options, align_default, allow_cancel=True)
     if align_lbl is None:
         add_log("First scan setup cancelled")
         return
-    aligned = align_lbl.startswith("aligned")
-    scope_lbl = cycle_input(stdscr, "Scan scope      : ", 10, 3,
-                            ["writable only (fast)", "all readable (thorough)"],
-                            "writable only (fast)" if state["scan_writable_only"]
-                            else "all readable (thorough)",
-                            allow_cancel=True)
+    aligned = (align_lbl.startswith("aligned") or
+               align_lbl.startswith("pattern-width"))
+    scope_options = [
+        "recommended game regions",
+        "all writable regions",
+        "all readable regions (thorough)",
+    ]
+    scope_keys = ["recommended", "writable", "readable"]
+    current_scope = state.get("scan_scope", "recommended")
+    if current_scope not in scope_keys:
+        current_scope = "writable" if state["scan_writable_only"] else "readable"
+    scope_lbl = cycle_input(
+        stdscr, "Scan scope      : ", 10, 3, scope_options,
+        scope_options[scope_keys.index(current_scope)], allow_cancel=True)
     if scope_lbl is None:
         add_log("First scan setup cancelled")
         return
-    writable_only = scope_lbl.startswith("writable")
+    region_scope = scope_keys[scope_options.index(scope_lbl)]
+    writable_only = region_scope != "readable"
 
     state["scan_width"]        = width
+    state["scan_type"]         = type_key
+    state["scan_pattern"]      = canonical
     state["scan_aligned"]      = aligned
     state["scan_writable_only"] = writable_only
+    state["scan_scope"]        = region_scope
 
     val = None
     if not unknown_mode:
         try:
-            val = int(val_s, 0)
+            val = (canonical if type_key == "bytes" else
+                   _parse_value_text(val_s, type_key, width))
+        except ValueError as exc:
+            message_box(stdscr, [str(exc)], "Invalid Value", C_ERR)
+            return
+
+    if VALUE_TYPES[type_key]["kind"] == "float":
+        tol_s = input_box(stdscr, "Float tolerance : ", 12, 3, 20,
+                          str(state.get("scan_tolerance", 0.0001)),
+                          allow_cancel=True)
+        if tol_s is None:
+            add_log("First scan setup cancelled")
+            return
+        try:
+            tolerance = float(tol_s)
+            if not math.isfinite(tolerance) or tolerance < 0:
+                raise ValueError
         except ValueError:
-            message_box(stdscr, ["Invalid — enter decimal or hex (0x…), or leave blank for unknown."], "Error", C_ERR)
+            message_box(stdscr, ["Tolerance must be a finite number >= 0."],
+                        "Invalid Tolerance", C_ERR)
             return
-        if val < 0 or val > WIDTH_MAX[width]:
-            message_box(stdscr,
-                [f"Value {val} out of range for {WIDTH_LABEL[width]}.",
-                 f"Max: {WIDTH_MAX[width]}"], "Error", C_ERR)
-            return
+        state["scan_tolerance"] = tolerance
 
     # A new first scan supersedes any retained resident refinement session,
     # including when this scan is unknown-value or uses a fallback engine.
@@ -5166,14 +6963,28 @@ def do_scan_first(stdscr) -> None:
     progress     = {"done": 0, "total": 1, "results": None, "values": None,
                     "error": None, "truncated": False}
 
-    if unknown_mode:
+    if type_key == "bytes":
+        def run():
+            try:
+                progress["results"] = scan_first_pattern(
+                    state["ip"], state["pid"], pattern, pattern_mask,
+                    width if aligned else 1,
+                    lambda d, t: progress.update(done=d, total=max(t, 1)),
+                    cancel_event, writable_only=writable_only,
+                    region_scope=region_scope)
+                progress["truncated"] = getattr(cancel_event, "truncated", False)
+            except Exception as exc:
+                progress["error"] = str(exc)
+        scan_label = "Scanning byte pattern…"
+    elif unknown_mode:
         def run():
             try:
                 addrs, vals = scan_first_unknown(
                     state["ip"], state["pid"], width, aligned,
                     lambda d, t: progress.update(done=d, total=max(t, 1)),
                     cancel_event,
-                    writable_only=writable_only)
+                    writable_only=writable_only, value_type=type_key,
+                    region_scope=region_scope)
                 progress["results"]   = addrs
                 progress["values"]    = vals
                 progress["truncated"] = getattr(cancel_event, "truncated", False)
@@ -5187,7 +6998,8 @@ def do_scan_first(stdscr) -> None:
                     state["ip"], state["pid"], val, width, aligned,
                     lambda d, t: progress.update(done=d, total=max(t, 1)),
                     cancel_event,
-                    writable_only=writable_only)
+                    writable_only=writable_only, value_type=type_key,
+                    region_scope=region_scope)
                 progress["results"]   = res
                 progress["truncated"] = getattr(cancel_event, "truncated", False)
             except Exception as exc:
@@ -5220,17 +7032,10 @@ def do_scan_first(stdscr) -> None:
     state["scan_truncated"] = progress.get("truncated", False)
     state["scan_unknown"]  = unknown_mode
     add_log(f"{'Unknown' if unknown_mode else 'First'} scan "
-            f"w={width} aligned={aligned}: {len(results):,} candidates, "
+            f"type={type_key} w={width} aligned={aligned}: "
+            f"{len(results):,} candidates, "
             f"RSS {_rss_mb():.0f} MB")
 
-    trunc_lines = (
-        [f"⚠  Scan capped at {MAX_SCAN_RESULTS:,} results — {len(results):,} shown.",
-         "   Additional matches are retained in the console scan session.",
-         "   Run Next Scan (N) with a changed value to narrow results",
-         "   across the complete result set.",
-         ""]
-        if progress["truncated"] else []
-    )
     if unknown_mode:
         add_log(f"Snapshot complete — {len(results):,} candidates", "warn" if progress["truncated"] else "info")
         do_show_results(stdscr)
@@ -5261,9 +7066,11 @@ def do_scan_next(stdscr) -> None:
     _, w = stdscr.getmaxyx()
     draw_border(stdscr, "NEXT SCAN")
     width   = state["scan_width"]
+    type_key = _current_scan_type()
     is_unkn = state.get("scan_unknown", False)
     safe_addstr(stdscr, 2, 3,
         f"Candidates: {len(state['scan_results']):,}  "
+        f"{_current_scan_label()}  "
         f"({'unknown-value' if is_unkn else 'exact-value'} session)",
         color(C_WARN))
     stdscr.refresh()
@@ -5271,7 +7078,62 @@ def do_scan_next(stdscr) -> None:
     cancel_event = threading.Event()
     prev_addrs   = state["scan_results"]
 
-    if is_unkn:
+    if type_key == "bytes":
+        pattern_s = input_box(
+            stdscr, "Pattern          : ", 5, 3, 38,
+            state.get("scan_pattern", ""), allow_cancel=True)
+        if pattern_s is None:
+            add_log("Next scan setup cancelled")
+            return
+        try:
+            pattern, pattern_mask, canonical = _parse_byte_pattern(
+                pattern_s, True)
+        except ValueError as exc:
+            message_box(stdscr, [str(exc)], "Invalid Pattern", C_ERR)
+            return
+        if len(pattern) != width:
+            message_box(
+                stdscr,
+                [f"This scan expects {width} pattern bytes.",
+                 "Start a new First Scan to change pattern length."],
+                "Pattern Length", C_ERR)
+            return
+
+        progress = {"done": 0, "total": max(len(prev_addrs), 1),
+                    "results": None, "error": None}
+
+        def run_pattern():
+            try:
+                progress["results"] = scan_next_pattern(
+                    state["ip"], state["pid"], pattern, pattern_mask,
+                    prev_addrs, cancel_event,
+                    lambda d, t: progress.update(done=d, total=max(t, 1)))
+            except Exception as exc:
+                progress["error"] = str(exc)
+
+        ok = _run_scan_with_progress(
+            stdscr, run_pattern, "Revalidating byte pattern…",
+            cancel_event, progress)
+        if not ok:
+            add_log("Next pattern scan cancelled", "warn")
+            return
+        if progress["error"]:
+            message_box(stdscr, [f"Error: {progress['error']}"],
+                        "Scan Error", C_ERR)
+            return
+        results = (progress["results"] if progress["results"] is not None
+                   else _make_addr_array())
+        removed_a = np.setdiff1d(prev_addrs, results, assume_unique=True)
+        _push_undo(removed_a, None, set(state["scan_dropped"]),
+                   state.get("scan_truncated", False))
+        state["scan_results"] = results
+        state["scan_values"] = None
+        state["scan_pattern"] = canonical
+        state["scan_dropped"] &= set(results.tolist())
+        add_log(f"AOB next scan: {len(results):,} candidates remain")
+        do_show_results(stdscr)
+
+    elif is_unkn:
         # ── relational (unknown-value) path ───────────────────────────────────
         prev_values = state.get("scan_values")
         if prev_values is None or len(prev_values) != len(prev_addrs):
@@ -5282,14 +7144,25 @@ def do_scan_next(stdscr) -> None:
             return
 
         mode_lbl = cycle_input(stdscr, "Filter mode      : ", 4, 3,
-                               RELATIONAL_MODES, RELATIONAL_MODES[0])
+                               RELATIONAL_MODES, RELATIONAL_MODES[0],
+                               allow_cancel=True)
+        if mode_lbl is None:
+            add_log("Next scan setup cancelled")
+            return
 
-        delta = 0
+        delta = 0.0 if VALUE_TYPES[type_key]["kind"] == "float" else 0
         if mode_lbl in ("decreased by", "increased by"):
-            delta_s = input_box(stdscr, "Delta amount     : ", 6, 3, 20, "1")
+            delta_s = input_box(
+                stdscr, "Delta amount     : ", 6, 3, 20, "1",
+                allow_cancel=True)
+            if delta_s is None:
+                add_log("Next scan setup cancelled")
+                return
             try:
-                delta = int(delta_s, 0)
-                if delta < 0 or delta > WIDTH_MAX[width]:
+                delta = (float(delta_s)
+                         if VALUE_TYPES[type_key]["kind"] == "float"
+                         else int(delta_s, 0))
+                if not math.isfinite(float(delta)) or delta < 0:
                     raise ValueError("out of range")
             except ValueError:
                 message_box(stdscr, ["Invalid delta — enter a positive integer."],
@@ -5306,7 +7179,9 @@ def do_scan_next(stdscr) -> None:
                     prev_addrs, prev_values,
                     mode_lbl, delta,
                     cancel_event,
-                    lambda d, t: progress.update(done=d, total=max(t, 1)))
+                    lambda d, t: progress.update(done=d, total=max(t, 1)),
+                    value_type=type_key,
+                    tolerance=float(state.get("scan_tolerance", 0.0)))
                 progress["results"] = na
                 progress["values"]  = nv
             except Exception as exc:
@@ -5323,7 +7198,9 @@ def do_scan_next(stdscr) -> None:
             return
 
         new_addrs  = progress["results"] if progress["results"] is not None else _make_addr_array()
-        new_values = progress["values"]  if progress["values"]  is not None else np.empty(0, dtype=_NP_VALUE_DTYPE[width])
+        new_values = (progress["values"] if progress["values"] is not None
+                      else np.empty(
+                          0, dtype=np.dtype(VALUE_TYPES[type_key]["dtype"])))
 
         # Delta undo — store only removed addresses/values, not a full copy.
         # prev_addrs is sorted; new_addrs may not be (batch order) → sort for
@@ -5350,14 +7227,6 @@ def do_scan_next(stdscr) -> None:
         add_log(f"Relational next scan ({mode_lbl}): {len(new_addrs):,} remain, "
                 f"undo {hist_mb:.1f} MB, RSS {_rss_mb():.0f} MB")
 
-        tip = ("Perfect! Use Results (R)."
-               if len(new_addrs) <= 10
-               else "Still many — trigger another change and scan again.")
-        undo_hint = ""
-        if state["scan_history"]:
-            last_delta = state["scan_history"][-1]
-            undo_hint  = (f"  (U to undo — restores "
-                          f"{len(new_addrs) + len(last_delta[0]):,} candidates)")
         add_log(f"Next scan complete — {len(new_addrs):,} candidates remain",
                 "info" if len(new_addrs) <= 10 else "warn")
         do_show_results(stdscr)
@@ -5368,15 +7237,15 @@ def do_scan_next(stdscr) -> None:
             "Enter the new in-game value.", color(C_NORM))
         stdscr.refresh()
 
-        val_s = input_box(stdscr, "New value        : ", 6, 3, 20)
-        try:
-            val = int(val_s, 0)
-        except ValueError:
-            message_box(stdscr, ["Invalid value."], "Error", C_ERR)
+        val_s = input_box(stdscr, "New value        : ", 6, 3, 20,
+                          allow_cancel=True)
+        if val_s is None:
+            add_log("Next scan setup cancelled")
             return
-        if val < 0 or val > WIDTH_MAX[width]:
-            message_box(stdscr,
-                [f"Value {val} out of range for {WIDTH_LABEL[width]}."], "Error", C_ERR)
+        try:
+            val = _parse_value_text(val_s, type_key, width)
+        except ValueError as exc:
+            message_box(stdscr, [str(exc)], "Invalid Value", C_ERR)
             return
 
         cancel_event.truncated = bool(state.get("scan_truncated", False))
@@ -5389,7 +7258,9 @@ def do_scan_next(stdscr) -> None:
                 progress["results"] = scan_next(
                     state["ip"], state["pid"], val, width, prev_addrs,
                     cancel_event,
-                    lambda d, t: progress.update(done=d, total=max(t, 1)))
+                    lambda d, t: progress.update(done=d, total=max(t, 1)),
+                    value_type=type_key,
+                    tolerance=float(state.get("scan_tolerance", 0.0)))
                 progress["truncated"] = getattr(cancel_event, "truncated", False)
             except Exception as exc:
                 progress["error"] = str(exc)
@@ -5425,16 +7296,10 @@ def do_scan_next(stdscr) -> None:
         state["scan_truncated"] = progress.get("truncated", False)
 
         hist_mb = _history_bytes() / 1_048_576
-        add_log(f"Exact next scan val={val}: {len(results):,} remain, "
+        add_log(f"Exact next scan type={type_key} val={val}: "
+                f"{len(results):,} remain, "
                 f"undo {hist_mb:.1f} MB, RSS {_rss_mb():.0f} MB")
 
-        tip = ("Perfect! Use Results (R)."
-               if len(results) <= 10 else "Still many — change value and scan again.")
-        undo_hint = ""
-        if state["scan_history"]:
-            last_delta = state["scan_history"][-1]
-            undo_hint  = (f"  (U to undo — restores "
-                          f"{len(results) + len(last_delta[0]):,} candidates)")
         add_log(f"Next scan complete — {len(results):,} candidates remain",
                 "info" if len(results) <= 10 and not state["scan_truncated"] else "warn")
         do_show_results(stdscr)
@@ -5445,7 +7310,8 @@ def do_scan_next(stdscr) -> None:
 def _refresh_visible_locked(ip: str, pid: int, addrs: list, width: int,
                              cache: dict, lock: threading.Lock,
                              cancel_event: Optional[threading.Event] = None,
-                             expected_pid: Optional[int] = None) -> None:
+                             expected_pid: Optional[int] = None,
+                             value_type: Optional[str] = None) -> None:
     """
     Read live values for `addrs` and update `cache` under `lock`.
     `expected_pid` is checked before each read; if state["pid"] has changed
@@ -5457,7 +7323,7 @@ def _refresh_visible_locked(ip: str, pid: int, addrs: list, width: int,
     """
     if not addrs:
         return
-    fmt  = WIDTH_FMT[width]
+    type_key = _normalise_value_type(value_type, width)
     sock = None
     try:
         # Build a _ScanSocket with an aggressively short timeout
@@ -5473,7 +7339,8 @@ def _refresh_visible_locked(ip: str, pid: int, addrs: list, width: int,
                 # Issue #12: reject partial reads — only unpack when we got
                 # exactly the number of bytes we asked for.
                 if len(raw) == width:
-                    vstr = str(struct.unpack(fmt, raw)[0])
+                    value = _unpack_typed_value(raw, type_key, width)
+                    vstr = _format_typed_value(value, type_key, width)
                 else:
                     vstr = "?"   # partial read — don't trust the data
             except Exception:
@@ -5575,8 +7442,24 @@ def _snapshot_anchor_window(ip: str, pid: int, anchor: int, width: int,
     return addresses, values
 
 
+def _unsigned_inventory_action_ok(stdscr, action: str) -> bool:
+    """The visual inventory helpers intentionally operate on counters only."""
+    type_key = _current_scan_type()
+    if VALUE_TYPES[type_key]["kind"] == "uint":
+        return True
+    message_box(
+        stdscr,
+        [f"{action} is designed for unsigned inventory counters.",
+         f"The active scan type is {VALUE_TYPES[type_key]['label']}.",
+         "Use Apply/Create Cheat for this type, or start an unsigned scan."],
+        "Action Not Applicable", C_WARN)
+    return False
+
+
 def do_browse_nearby(stdscr, anchor: int) -> None:
     """Populate Results with plausible nearby values without requiring a change."""
+    if not _unsigned_inventory_action_ok(stdscr, "Nearby browsing"):
+        return
     width = int(state.get("scan_width", 4))
     try:
         addresses, values = _snapshot_anchor_window(
@@ -5618,11 +7501,16 @@ def do_browse_nearby(stdscr, anchor: int) -> None:
 
 def do_discover_nearby(stdscr, anchor: int) -> None:
     """Find neighboring fields that change after an anchored item change."""
+    if not _unsigned_inventory_action_ok(stdscr, "Nearby change discovery"):
+        return
     width = int(state.get("scan_width", 4))
     stdscr.clear()
     draw_border(stdscr, "ANCHORED GROUP DISCOVERY")
     radius_text = input_box(stdscr, "Radius (hex): ", 3, 3,
-                            width=12, default="0x400")
+                            width=12, default="0x400", allow_cancel=True)
+    if radius_text is None:
+        add_log("Nearby discovery cancelled")
+        return
     try:
         radius = int(radius_text, 0)
     except ValueError:
@@ -5688,6 +7576,8 @@ def do_discover_nearby(stdscr, anchor: int) -> None:
 
 def do_preview_candidate(stdscr, address: int) -> None:
     """Temporarily change one candidate, then always restore its original value."""
+    if not _unsigned_inventory_action_ok(stdscr, "Safe candidate preview"):
+        return
     width = int(state.get("scan_width", 4))
     validation = _validate_addr_in_maps(
         state["ip"], int(state["pid"]), int(address), width,
@@ -5708,7 +7598,11 @@ def do_preview_candidate(stdscr, address: int) -> None:
     draw_border(stdscr, "SAFE CANDIDATE PREVIEW")
     safe_addstr(stdscr, 2, 3, f"Current value: {original}", color(C_NORM))
     preview_text = input_box(stdscr, "Temporary value: ", 4, 3,
-                             width=24, default=str(original + 1))
+                             width=24, default=str(original + 1),
+                             allow_cancel=True)
+    if preview_text is None:
+        add_log("Candidate preview cancelled")
+        return
     try:
         preview = int(preview_text, 0)
         if not 0 <= preview <= WIDTH_MAX[width]:
@@ -5833,6 +7727,8 @@ def do_trace_item_write(stdscr, address: int) -> None:
 
 def do_batch_preview_matching(stdscr) -> None:
     """Temporarily rewrite matching Results as one verified transaction."""
+    if not _unsigned_inventory_action_ok(stdscr, "Transactional batch preview"):
+        return
     width = int(state.get("scan_width", 4))
     results = state.get("scan_results")
     if results is None or len(results) == 0:
@@ -5843,9 +7739,15 @@ def do_batch_preview_matching(stdscr) -> None:
     stdscr.clear()
     draw_border(stdscr, "TRANSACTIONAL BATCH PREVIEW")
     match_text = input_box(stdscr, "Current value to match: ", 3, 3,
-                           width=20, default="1")
+                           width=20, default="1", allow_cancel=True)
+    if match_text is None:
+        add_log("Batch preview cancelled")
+        return
     replacement_text = input_box(stdscr, "Temporary replacement: ", 5, 3,
-                                 width=20, default="3")
+                                 width=20, default="3", allow_cancel=True)
+    if replacement_text is None:
+        add_log("Batch preview cancelled")
+        return
     try:
         match_value = int(match_text, 0)
         replacement = int(replacement_text, 0)
@@ -6061,7 +7963,6 @@ def do_show_results(stdscr) -> None:
     REFRESH_INTERVAL  = 2.0
     refresh_thread    = None
     refresh_cancel    = threading.Event()
-    value_filter      = None
 
     stdscr.nodelay(True)
     try:
@@ -6087,7 +7988,8 @@ def do_show_results(stdscr) -> None:
                     target=_refresh_visible_locked,
                     args=(state["ip"], state["pid"], list(visible_addrs),
                           state["scan_width"], val_cache, cache_lock,
-                          refresh_cancel, state["pid"]),   # expected_pid
+                          refresh_cancel, state["pid"],
+                          _current_scan_type()),
                     daemon=True)
                 refresh_thread.start()
                 refresh_deadline = now
@@ -6095,13 +7997,13 @@ def do_show_results(stdscr) -> None:
 
             stdscr.clear()
             draw_border(stdscr, f"RESULTS  ({len(results)} addresses)")
-            wlabel = WIDTH_LABEL.get(state["scan_width"], str(state["scan_width"]))
+            wlabel = _current_scan_label()
             trunc_warn = "  ⚠ CAPPED — additional matches not displayed" if state.get("scan_truncated") else ""
             safe_addstr(stdscr, 2, 3,
                 f"Type: {wlabel}   Process: {state['proc_name']} (PID {state['pid']}){trunc_warn}",
                 color(C_ERR) if trunc_warn else color(C_WARN))
             safe_addstr(stdscr, 3, 3,
-                "↑↓/PgUp/PgDn navigate   G jump   F filter   Enter inspect   D drop   U undo   M more   Q back",
+                "↑↓/PgUp/PgDn navigate   G jump   Enter inspect   D drop   U undo   M more   Q back",
                 color(C_NORM))
 
             split_view = w >= 92
@@ -6110,10 +8012,6 @@ def do_show_results(stdscr) -> None:
             for idx in range(offset, min(offset + visible, len(results))):
                 addr = results[idx]
                 with cache_lock: vstr = val_cache.get(addr, "…")
-                if value_filter is not None and vstr not in ("…", "?"):
-                    try:
-                        if int(vstr, 0) != value_filter: continue
-                    except ValueError: continue
                 marker = ">" if idx == sel else " "
                 line = f"{marker} {idx+1:4d}  {hex(addr):<18} {vstr:>12}"
                 attr = color(C_SEL) | curses.A_BOLD if idx == sel else color(C_NORM)
@@ -6131,11 +8029,11 @@ def do_show_results(stdscr) -> None:
                 safe_addstr(stdscr, 8, pane_x, f"Type      {wlabel}", color(C_NORM))
                 safe_addstr(stdscr, 10, pane_x, "A  Apply value", color(C_OK))
                 safe_addstr(stdscr, 11, pane_x, "C  Create cheat", color(C_OK))
-                safe_addstr(stdscr, 12, pane_x, "P  Pointer scan", color(C_ACC))
-                safe_addstr(stdscr, 13, pane_x, "R  Resolve permanent", color(C_ACC))
-                safe_addstr(stdscr, 14, pane_x, "D  Drop result", color(C_ERR))
-                safe_addstr(stdscr, 15, pane_x, "N  Next scan", color(C_ACC))
-                safe_addstr(stdscr, 16, pane_x, "M  More actions", color(C_WARN))
+                safe_addstr(stdscr, 12, pane_x,
+                            "R  Find permanent pointer", color(C_ACC))
+                safe_addstr(stdscr, 13, pane_x, "D  Drop result", color(C_ERR))
+                safe_addstr(stdscr, 14, pane_x, "N  Next scan", color(C_ACC))
+                safe_addstr(stdscr, 15, pane_x, "M  More actions", color(C_WARN))
 
             # Age = how long since the last completed refresh, not since it started
             data_age      = int(now - refresh_complete) if refresh_complete else 0
@@ -6148,12 +8046,10 @@ def do_show_results(stdscr) -> None:
                 age_label = f"⚠ stale (~{data_age}s)"
             draw_statusbar(stdscr, [
                 (f"{len(results):,} results", C_WARN),
-                ("↑↓/PgUp/PgDn", C_NORM),
-                ("Enter inspect", C_OK), ("A apply", C_OK), ("C cheat", C_OK),
-                ("P pointer", C_ACC), ("R permanent", C_ACC), ("N next", C_ACC),
-                ("D drop", C_ERR), ("M more", C_WARN),
+                ("↑↓ Enter inspect", C_NORM), ("Q back", C_NORM),
+                ("N next", C_ACC), ("R permanent", C_ACC),
+                ("C cheat", C_OK), ("M more", C_WARN),
                 (age_label, C_ERR if stale else C_ACC if is_refreshing else C_NORM),
-                ("Q back", C_NORM),
             ])
             stdscr.refresh()
 
@@ -6177,38 +8073,37 @@ def do_show_results(stdscr) -> None:
                 sel = min(len(results)-1, sel + visible)
             elif key in (ord('g'), ord('G')):
                 stdscr.nodelay(False)
-                idx_s = input_box(stdscr, "Jump to result index: ", h-2, 3, 12, str(sel+1))
+                idx_s = input_box(
+                    stdscr, "Jump to result index: ", h-2, 3, 12,
+                    str(sel+1), allow_cancel=True)
                 stdscr.nodelay(True)
+                if idx_s is None:
+                    continue
                 try: sel = max(0, min(int(idx_s)-1, len(results)-1))
                 except ValueError: pass
-            elif key in (ord('f'), ord('F')):
-                stdscr.nodelay(False)
-                fs = input_box(stdscr, "Live value filter (blank clears): ", h-2, 3, 24,
-                               "" if value_filter is None else str(value_filter))
-                stdscr.nodelay(True)
-                if not fs.strip(): value_filter = None
-                else:
-                    try: value_filter = int(fs, 0)
-                    except ValueError:
-                        message_box(stdscr, ["Enter decimal or hex (0x...)."], "Invalid Filter", C_ERR)
-                        continue
-                sel = 0; offset = 0
             elif key in (ord('a'), ord('A')) and len(results) > 0:
                 stdscr.nodelay(False)
                 addr = int(results[sel])
                 try:
-                    value_s = input_box(stdscr, "Apply value: ", h-2, 3, 20)
-                    value = int(value_s, 0)
+                    value_s = input_box(
+                        stdscr, "Apply value: ", h-2, 3, 20,
+                        allow_cancel=True)
+                    if value_s is None:
+                        continue
                     width = state["scan_width"]
-                    if value < 0 or value > WIDTH_MAX[width]:
-                        raise ValueError(f"Value out of range for {WIDTH_LABEL[width]}")
-                    ack, verified, actual = _write_value_verified(state["ip"], state["pid"], addr, value, width)
+                    type_key = _current_scan_type()
+                    value = _parse_value_text(value_s, type_key, width)
+                    ack, verified, actual = _write_value_verified(
+                        state["ip"], state["pid"], addr, value, width,
+                        value_type=type_key)
                     if ack and verified:
                         add_log(f"Applied {value} → {hex(addr)} verified")
                     elif ack and verified is None:
                         add_log(f"Applied {value} → {hex(addr)} but read-back failed", "warn")
                     elif ack:
-                        actual_val = struct.unpack(WIDTH_FMT[width], actual)[0]
+                        actual_val = _format_typed_value(
+                            _unpack_typed_value(actual, type_key, width),
+                            type_key, width)
                         add_log(f"Write mismatch {hex(addr)}: wanted {value}, read {actual_val}", "error")
                     else:
                         add_log(f"Write rejected at {hex(addr)}", "error")
@@ -6234,7 +8129,7 @@ def do_show_results(stdscr) -> None:
                     val_cache.clear()
             elif key in (ord('p'), ord('P')) and len(results) > 0:
                 stdscr.nodelay(False)
-                do_pointer_scan(stdscr, int(results[sel]))
+                do_resolve_permanent(stdscr, int(results[sel]))
                 stdscr.nodelay(True)
                 results = state["scan_results"]
             elif key in (ord('r'), ord('R')) and len(results) > 0:
@@ -6286,7 +8181,8 @@ def do_show_results(stdscr) -> None:
                         prev_addrs = np.union1d(cur_addrs, removed_a)
                         if removed_v is not None and state.get("scan_values") is not None:
                             cur_v = state["scan_values"]
-                            dtype = _NP_VALUE_DTYPE[state["scan_width"]]
+                            dtype = np.dtype(
+                                VALUE_TYPES[_current_scan_type()]["dtype"])
                             prev_vals = np.zeros(len(prev_addrs), dtype=dtype)
                             prev_vals[np.searchsorted(prev_addrs, cur_addrs)] = cur_v
                             prev_vals[np.searchsorted(prev_addrs, removed_a)] = removed_v
@@ -6342,7 +8238,8 @@ def do_show_results(stdscr) -> None:
                     if removed_v is not None and state.get("scan_values") is not None:
                         cur_v   = state["scan_values"]
                         width_w = state["scan_width"]
-                        dtype   = _NP_VALUE_DTYPE[width_w]
+                        dtype = np.dtype(
+                            VALUE_TYPES[_current_scan_type()]["dtype"])
                         # Build merged value map via searchsorted (no dict)
                         prev_vals = np.zeros(len(prev_addrs), dtype=dtype)
                         # Fill from current
@@ -6368,14 +8265,6 @@ def do_show_results(stdscr) -> None:
                     sel = 0; offset = 0
                     add_log(f"Undo: restored {len(results):,} candidates, "
                             f"RSS {_rss_mb():.0f} MB")
-            elif key in (ord('m'), ord('M')):
-                # Force map-cache flush: useful when the game reallocated memory
-                # without a PID change (e.g. level reload, NG+).
-                with _map_cache_lock:
-                    _map_cache.clear()
-                with cache_lock:
-                    val_cache.clear()
-                add_log("Map cache flushed — next scan/write will re-fetch regions", "warn")
             elif key in (ord('q'), ord('Q'), 27):   # Issue #15: Esc also exits
                 break
     finally:
@@ -6394,7 +8283,8 @@ def _inspect_result(stdscr, addr: int, live_value: str = "…") -> None:
         h, w = stdscr.getmaxyx()
         draw_border(stdscr, "ADDRESS INSPECTOR")
         width = state["scan_width"]
-        wlabel = WIDTH_LABEL.get(width, str(width))
+        type_key = _current_scan_type()
+        wlabel = _current_scan_label()
         safe_addstr(stdscr, 2, 3, f"Address   {hex(addr)}", color(C_OK) | curses.A_BOLD)
         safe_addstr(stdscr, 3, 3, f"Current   {live_value}", color(C_WARN))
         safe_addstr(stdscr, 4, 3, f"Type      {wlabel}", color(C_NORM))
@@ -6402,9 +8292,11 @@ def _inspect_result(stdscr, addr: int, live_value: str = "…") -> None:
         safe_addstr(stdscr, 7, 3, "Actions", color(C_TITLE) | curses.A_BOLD)
         safe_addstr(stdscr, 8, 5, "A  Apply value", color(C_OK))
         safe_addstr(stdscr, 9, 5, "C  Create cheat", color(C_OK))
-        safe_addstr(stdscr, 10, 5, "P  Pointer scan", color(C_ACC))
+        safe_addstr(stdscr, 10, 5, "P  Find permanent pointer", color(C_ACC))
         safe_addstr(stdscr, 11, 5, "D  Drop result", color(C_ERR))
-        draw_statusbar(stdscr, [("A apply", C_OK), ("C cheat", C_OK), ("P pointer", C_ACC), ("D drop", C_ERR), ("Esc back", C_NORM)])
+        draw_statusbar(stdscr, [("A apply", C_OK), ("C cheat", C_OK),
+                                ("P permanent", C_ACC), ("D drop", C_ERR),
+                                ("Esc back", C_NORM)])
         stdscr.refresh()
         key = stdscr.getch()
         if key == curses.KEY_RESIZE:
@@ -6412,18 +8304,24 @@ def _inspect_result(stdscr, addr: int, live_value: str = "…") -> None:
         if key in (27, ord('q'), ord('Q')):
             return
         if key in (ord('a'), ord('A')):
-            value_s = input_box(stdscr, "Apply value: ", h - 2, 3, 20)
+            value_s = input_box(
+                stdscr, "Apply value: ", h - 2, 3, 20,
+                allow_cancel=True)
+            if value_s is None:
+                continue
             try:
-                value = int(value_s, 0)
-                if value < 0 or value > WIDTH_MAX[width]:
-                    raise ValueError(f"Value out of range for {WIDTH_LABEL[width]}")
-                ack, verified, actual = _write_value_verified(state["ip"], state["pid"], addr, value, width)
+                value = _parse_value_text(value_s, type_key, width)
+                ack, verified, actual = _write_value_verified(
+                    state["ip"], state["pid"], addr, value, width,
+                    value_type=type_key)
                 if ack and verified:
                     add_log(f"Applied {value} → {hex(addr)} verified")
                 elif ack and verified is None:
                     add_log(f"Applied {value} → {hex(addr)} but read-back failed", "warn")
                 elif ack:
-                    actual_val = struct.unpack(WIDTH_FMT[width], actual)[0]
+                    actual_val = _format_typed_value(
+                        _unpack_typed_value(actual, type_key, width),
+                        type_key, width)
                     add_log(f"Write mismatch {hex(addr)}: wanted {value}, read {actual_val}", "error")
                 else:
                     add_log(f"Write rejected at {hex(addr)}", "error")
@@ -6431,14 +8329,16 @@ def _inspect_result(stdscr, addr: int, live_value: str = "…") -> None:
                 add_log(f"Apply failed at {hex(addr)}: {exc}", "error")
             try:
                 raw = ps5_read(state["ip"], state["pid"], addr, width)
-                live_value = str(struct.unpack(WIDTH_FMT[width], raw)[0]) if len(raw) == width else "?"
+                live_value = (_format_typed_value(
+                    _unpack_typed_value(raw, type_key, width), type_key, width)
+                    if len(raw) == width else "?")
             except Exception:
                 live_value = "?"
         elif key in (ord('c'), ord('C')):
             _add_cheat_at(stdscr, addr)
             return
         elif key in (ord('p'), ord('P')):
-            do_pointer_scan(stdscr, addr)
+            do_resolve_permanent(stdscr, addr)
             return
         elif key in (ord('d'), ord('D')):
             old_results = state["scan_results"]
@@ -6454,8 +8354,9 @@ def _inspect_result(stdscr, addr: int, live_value: str = "…") -> None:
             return
 
 
-def _write_value_verified(ip: str, pid: int, addr: int, value: int, width: int,
-                          cancel_event: Optional[threading.Event] = None) -> tuple:
+def _write_value_verified(ip: str, pid: int, addr: int, value, width: int,
+                          cancel_event: Optional[threading.Event] = None,
+                          value_type: Optional[str] = None) -> tuple:
     """Validate, write, and verify one memory value using the standard write path."""
     err = _validate_write_addr(addr)
     if err:
@@ -6463,7 +8364,7 @@ def _write_value_verified(ip: str, pid: int, addr: int, value: int, width: int,
     map_err = _validate_addr_in_maps(ip, pid, addr, width)
     if map_err:
         raise ValueError(map_err)
-    data = struct.pack(WIDTH_FMT[width], value)
+    data = _pack_typed_value(value, value_type, width)
     return ps5_write_verified(ip, pid, addr, data)
 
 
@@ -6471,39 +8372,72 @@ def _add_cheat_at(stdscr, addr: int) -> None:
     stdscr.clear()
     draw_border(stdscr, "ADD CHEAT")
     safe_addstr(stdscr, 2, 3, f"Address : {hex(addr)}", color(C_OK) | curses.A_BOLD)
+    type_key = _current_scan_type()
+    scan_w = state["scan_width"]
+    cur = None
     try:
-        raw = ps5_read(state["ip"], state["pid"], addr, state["scan_width"])
-        cur = struct.unpack(WIDTH_FMT[state["scan_width"]], raw)[0]
-        safe_addstr(stdscr, 3, 3, f"Current : {cur}", color(C_WARN))
+        raw = ps5_read(state["ip"], state["pid"], addr, scan_w)
+        cur = _unpack_typed_value(raw, type_key, scan_w)
+        safe_addstr(stdscr, 3, 3,
+                    f"Current : {_format_typed_value(cur, type_key, scan_w)}",
+                    color(C_WARN))
     except Exception:
         pass
     stdscr.refresh()
-    name  = input_box(stdscr, "Cheat name       : ", 5, 3, 40)
-    val_s = input_box(stdscr, "Lock-in value    : ", 7, 3, 20)
+    name = input_box(stdscr, "Cheat name       : ", 5, 3, 40,
+                     allow_cancel=True, cancel_with_q=False)
+    if name is None:
+        add_log("Add cheat cancelled")
+        return
+    val_s = input_box(
+        stdscr, "Lock-in value    : ", 7, 3, 38,
+        _format_typed_value(cur, type_key, scan_w) if cur is not None else "",
+        allow_cancel=True)
+    if val_s is None:
+        add_log("Add cheat cancelled")
+        return
     typ   = cycle_input(stdscr, "Cheat type       : ", 9, 3,
-                        ["freeze", "write"], "freeze")
-    scan_w = state["scan_width"]
+                        ["freeze", "write"], "freeze", allow_cancel=True)
+    if typ is None:
+        add_log("Add cheat cancelled")
+        return
     try:
-        val = int(val_s, 0)
-        if val < 0 or val > WIDTH_MAX[scan_w]:
-            message_box(stdscr,
-                [f"Value {val} exceeds maximum for {WIDTH_LABEL[scan_w]}.",
-                 f"Max allowed: {WIDTH_MAX[scan_w]}"],
-                "Value Out of Range", C_ERR)
-            return
+        val = _parse_value_text(val_s, type_key, scan_w)
+        module_metadata = {}
+        try:
+            maps = _get_maps_cached(state["ip"], state["pid"])
+            starts, rows = _build_region_lookup(maps)
+            region = _region_for_addr(int(addr), starts, rows)
+            if region is not None and _is_static_region(region):
+                module_name, _module_base, module_rel = (
+                    _module_info_for_addr(int(addr), maps))
+                if module_name and module_rel is not None:
+                    module_metadata = {
+                        "module_name": str(module_name),
+                        "module_relative_offset": int(module_rel),
+                        "game_identity": _pointer_game_identity(
+                            state.get("proc_name", ""), maps),
+                    }
+        except Exception as exc:
+            add_log(f"Could not classify cheat address {hex(int(addr))}: {exc}",
+                    "warn")
         entry = {
             "name":    name or f"Cheat@{hex(addr)}",
             "address": addr,
             "value":   val,
             "type":    typ,
             "width":   scan_w,
+            "value_type": type_key,
+            **({"original_value": cur} if cur is not None else {}),
             # Local safety metadata; generate_cht intentionally does not export it.
             "pid":     state["pid"],
             "process": state["proc_name"],
             "session": state["session"],
+            **module_metadata,
         }
         state["cheats"].append(entry)
-        add_log(f"Added '{entry['name']}' @ {hex(addr)} = {val}")
+        add_log(f"Added '{entry['name']}' @ {hex(addr)} = "
+                f"{_format_typed_value(val, type_key, scan_w)} ({type_key})")
 
         add_log(f"Created cheat '{entry['name']}' @ {hex(addr)} — not applied")
         # Creation and application are deliberately separate actions.
@@ -6525,56 +8459,61 @@ def do_write(stdscr) -> None:
     if addr_s is None:
         add_log("Write setup cancelled")
         return
-    val_s = input_box(stdscr, "Value         : ", 6, 3, 20,
-                      allow_cancel=True)
+    labels = [VALUE_TYPES[key]["label"] for key in VALUE_TYPE_ORDER]
+    type_label = cycle_input(
+        stdscr, "Value type    : ", 6, 3, labels,
+        VALUE_TYPES[_current_scan_type()]["label"], allow_cancel=True)
+    if type_label is None:
+        add_log("Write setup cancelled")
+        return
+    type_key = (VALUE_TYPE_ORDER[labels.index(type_label)]
+                if type_label in labels else _normalise_value_type(type_label))
+    val_s = input_box(stdscr,
+                      "Raw bytes     : " if type_key == "bytes" else "Value         : ",
+                      8, 3, 38, allow_cancel=True)
     if val_s is None:
         add_log("Write setup cancelled")
         return
-    _wl    = [WIDTH_LABEL[ww] for ww in VALID_WIDTHS]
-    _ws    = cycle_input(stdscr, "Width         : ", 8, 3, _wl,
-                         WIDTH_LABEL.get(state["scan_width"], "uint32"),
-                         allow_cancel=True)
-    if _ws is None:
-        add_log("Write setup cancelled")
-        return
-    width  = VALID_WIDTHS[_wl.index(_ws)]
     try:
         addr = int(addr_s, 0)
         err  = _validate_write_addr(addr)
         if err:
             raise ValueError(err)
-        val  = int(val_s, 0)
-        if val < 0 or val > WIDTH_MAX[width]:
-            raise ValueError(f"Value out of range for {WIDTH_LABEL[width]}")
+        val = _parse_value_text(val_s, type_key)
+        width = (len(bytes.fromhex(val)) if type_key == "bytes" else
+                 _value_width(type_key))
         # Verify address is inside a writable mapped region (fail-CLOSED: surfaces error to user)
         map_err = _validate_addr_in_maps(state["ip"], state["pid"], addr, width)
         if map_err:
             if not confirm_box(stdscr, f"{map_err}\nWrite anyway?", "Unmapped Address"):
                 return
-        data = struct.pack(WIDTH_FMT[width], val)
+        data = _pack_typed_value(val, type_key, width)
         ack, verified, actual = ps5_write_verified(
             state["ip"], state["pid"], addr, data)
         if ack and verified:
-            add_log(f"Write {hex(addr)} = {val} verified")
+            add_log(f"Write {hex(addr)} = "
+                    f"{_format_typed_value(val, type_key, width)} verified")
         elif ack and verified is None:
             add_log(f"Write {hex(addr)} = {val} acknowledged; read-back failed", "warn")
             message_box(stdscr,
-                ["ps5debug acknowledged the write,",
+                ["The debug payload acknowledged the write,",
                  "but the address could not be read back.",
                  "Check the Log and connection."],
                 "Write Unverified", C_WARN)
         elif ack:
-            actual_val = struct.unpack(WIDTH_FMT[width], actual)[0]
+            actual_val = _format_typed_value(
+                _unpack_typed_value(actual, type_key, width), type_key, width)
             add_log(f"Write mismatch {hex(addr)}: wanted {val}, read {actual_val}", "error")
             message_box(stdscr,
-                ["ps5debug acknowledged the command, but memory did not change.",
+                ["The debug payload acknowledged the command, but memory did not change.",
                  f"Requested: {val}", f"Read back: {actual_val}",
                  "The game may restore the value, or this payload/firmware",
                  "may not support writes to that mapping."],
                 "Write Mismatch", C_ERR)
         else:
             add_log(f"Write {hex(addr)} = {val} rejected", "error")
-            message_box(stdscr, ["Write rejected by ps5debug."], "Write Failed", C_ERR)
+            message_box(stdscr, ["Write rejected by the debug payload."],
+                        "Write Failed", C_ERR)
     except Exception as exc:
         message_box(stdscr, [f"Error: {exc}"], "Error", C_ERR)
 
@@ -6582,6 +8521,15 @@ def do_write(stdscr) -> None:
 def _read_cheat_live_value(cheat: dict) -> str:
     """Read the current live value at a cheat's address. Returns str or '?'."""
     try:
+        portable = _is_portable_cheat(cheat)
+        same_process = str(cheat.get("process", "") or "") in (
+            "", str(state.get("proc_name", "") or ""))
+        portable_here = (portable and same_process and
+                         _portable_cheat_matches_current_game(cheat))
+        stale = (cheat.get("pid") != state.get("pid") or
+                 cheat.get("session") != state.get("session"))
+        if stale and not portable_here:
+            return "stale"
         width = int(cheat["width"])
         is_pointer = "offsets" in cheat and cheat.get("offsets") is not None
         if is_pointer:
@@ -6592,10 +8540,12 @@ def _read_cheat_live_value(cheat: dict) -> str:
             if not ok:
                 return "?(chain)"
         else:
-            addr = int(cheat["address"])
+            addr = _runtime_scalar_address(cheat)
         raw = ps5_read(state["ip"], state["pid"], addr, width)
         if len(raw) == width:
-            return str(struct.unpack(WIDTH_FMT[width], raw)[0])
+            type_key = _cheat_value_type(cheat)
+            return _format_typed_value(
+                _unpack_typed_value(raw, type_key, width), type_key, width)
     except Exception:
         pass
     return "?"
@@ -6611,16 +8561,53 @@ def _inspect_cheat(stdscr, idx: int) -> None:
         draw_border(stdscr, "CHEAT INSPECTOR")
         safe_addstr(stdscr, 2, 3, c["name"], color(C_TITLE) | curses.A_BOLD)
         is_pointer = "offsets" in c and c.get("offsets") is not None
-        addr_text = (hex(c["base"]) if isinstance(c.get("base"), int) else str(c.get("base"))) if is_pointer else hex(int(c["address"]))
+        if is_pointer and c.get("module_name") and c.get("module_relative_offset") is not None:
+            addr_text = (f"{c['module_name']} + "
+                         f"{hex(int(c['module_relative_offset']))}")
+        elif is_pointer:
+            addr_text = (hex(c["base"]) if isinstance(c.get("base"), int)
+                         else str(c.get("base")))
+        elif _is_module_relative_scalar(c):
+            addr_text = (f"{c['module_name']} + "
+                         f"{hex(int(c['module_relative_offset']))}")
+        else:
+            addr_text = hex(int(c["address"]))
         safe_addstr(stdscr, 4, 3, f"Address   {addr_text}{' (pointer)' if is_pointer else ''}", color(C_OK))
-        safe_addstr(stdscr, 5, 3, f"Set       {c.get('value')}", color(C_NORM))
-        safe_addstr(stdscr, 6, 3, f"Live      {live}", color(C_OK) if str(live) == str(c.get('value')) else color(C_WARN))
+        type_key = _cheat_value_type(c)
+        set_value = _format_typed_value(c.get("value"), type_key,
+                                        int(c.get("width", 4)))
+        safe_addstr(stdscr, 5, 3, f"Set       {set_value}", color(C_NORM))
+        safe_addstr(stdscr, 6, 3, f"Live      {live}", color(C_OK) if str(live) == set_value else color(C_WARN))
         safe_addstr(stdscr, 7, 3, f"Mode      {c.get('type')}", color(C_NORM))
-        safe_addstr(stdscr, 8, 3, f"Width     {WIDTH_LABEL.get(int(c.get('width', state['scan_width'])), c.get('width'))}", color(C_NORM))
+        safe_addstr(stdscr, 8, 3,
+                    f"Type      {VALUE_TYPES[type_key]['label']} "
+                    f"({int(c.get('width', state['scan_width']))} byte(s))",
+                    color(C_NORM))
         if is_pointer:
-            offs = "+".join(hex(int(o, 0) if isinstance(o, str) else int(o)) for o in c.get("offsets", []))
-            safe_addstr(stdscr, 9, 3, f"Chain     {addr_text} + {offs}", color(C_ACC))
-        draw_statusbar(stdscr, [("A apply", C_OK), ("E edit", C_WARN), ("F freeze", C_ACC), ("D delete", C_ERR), ("Esc back", C_NORM)])
+            offsets = [int(o, 0) if isinstance(o, str) else int(o)
+                       for o in c.get("offsets", [])]
+            offs = " → ".join(f"{off:+#x}" for off in offsets)
+            terminal = int(c.get("terminal_offset", 0))
+            if terminal:
+                offs += f"; field {terminal:+#x}"
+            safe_addstr(stdscr, 9, 3,
+                        f"Chain     {addr_text} → {offs}", color(C_ACC))
+            lifecycle = ("cross-reload validated" if _is_cross_reload_pointer(c)
+                         else "current session only")
+            safe_addstr(stdscr, 10, 3, f"Lifetime  {lifecycle}",
+                        color(C_OK) if _is_cross_reload_pointer(c) else color(C_WARN))
+        elif _is_module_relative_scalar(c):
+            safe_addstr(stdscr, 9, 3, "Lifetime  module-relative static patch",
+                        color(C_OK))
+        frozen = _is_cheat_frozen(c)
+        freeze_indicator = _cheat_freeze_indicator(c)
+        safe_addstr(stdscr, 11, 3,
+                    f"Toggle    {freeze_indicator}",
+                    (color(C_ERR) if freeze_indicator == "ERR" else
+                     color(C_OK) if frozen else color(C_NORM)))
+        draw_statusbar(stdscr, [("A apply", C_OK), ("E edit", C_WARN),
+                                ("F/Space toggle", C_ACC),
+                                ("D delete", C_ERR), ("Esc back", C_NORM)])
         stdscr.refresh()
         key = stdscr.getch()
         if key == curses.KEY_RESIZE:
@@ -6631,12 +8618,13 @@ def _inspect_cheat(stdscr, idx: int) -> None:
             _apply_cheat_once(stdscr, c)
         elif key in (ord('e'), ord('E')):
             _edit_cheat(stdscr, idx)
-        elif key in (ord('f'), ord('F')):
-            # Reuse the existing freeze manager; it can target this saved cheat.
-            do_freeze(stdscr)
+        elif key in (ord('f'), ord('F'), ord(' ')):
+            do_freeze(stdscr, c)
         elif key in (ord('d'), ord('D')):
             if confirm_box(stdscr, f"Delete '{c['name']}'?", "Delete Cheat"):
                 name = c["name"]
+                if _is_cheat_frozen(c):
+                    _toggle_cheat_freeze(c)
                 del state["cheats"][idx]
                 add_log(f"Deleted cheat '{name}'", "warn")
                 return
@@ -6689,7 +8677,8 @@ def do_cheat_list(stdscr) -> None:
                     "No cheats yet — scan and add some!", color(C_WARN))
             else:
                 safe_addstr(stdscr, 2, 3,
-                    "↑↓ select   Enter inspect   A apply once   D delete   Q back", color(C_NORM))
+                    "↑↓ select   Enter inspect   F/Space toggle   A apply once   D delete",
+                    color(C_NORM))
                 hdr = f"  {'Name':<26}  {'Address':<22}  {'Set':<8}  {'Live':<10}  Type"
                 safe_addstr(stdscr, 3, 2, hdr[:w - 4],
                             color(C_TITLE) | curses.A_UNDERLINE)
@@ -6698,20 +8687,32 @@ def do_cheat_list(stdscr) -> None:
                 for i, c in enumerate(cheats[offset:offset + visible]):
                     ri   = offset + i
                     attr = color(C_SEL) | curses.A_BOLD if ri == sel else color(C_NORM)
-                    _disp_addr = ((hex(c["base"]) if isinstance(c["base"], int) else c["base"]) + " (ptr)"
-                                  if "offsets" in c and c.get("offsets") is not None
-                                  else hex(c["address"]))
+                    is_pointer = ("offsets" in c and
+                                  c.get("offsets") is not None)
+                    if ((is_pointer or _is_module_relative_scalar(c)) and
+                            c.get("module_name") and
+                            c.get("module_relative_offset") is not None):
+                        _disp_addr = (f"{c['module_name']}+"
+                                      f"{hex(int(c['module_relative_offset']))}")
+                    elif is_pointer:
+                        raw_base = c.get("base")
+                        _disp_addr = ((hex(raw_base) if isinstance(raw_base, int)
+                                       else str(raw_base)) + " (ptr)")
+                    else:
+                        _disp_addr = hex(int(c["address"]))
                     with cache_lock:
                         live_val = live_cache.get(ri, "…")
                     # Colour live value: green if matches set value, yellow if differs
-                    set_val_str = str(c["value"])
+                    set_val_str = _format_typed_value(
+                        c["value"], _cheat_value_type(c), int(c["width"]))
                     if live_val not in ("…", "?", "?(chain)"):
                         live_attr = color(C_OK) if live_val == set_val_str else color(C_WARN)
                     else:
                         live_attr = color(C_NORM)
                     line_base = (f"  {c['name']:<26}  {_disp_addr:<22}  "
                                  f"{set_val_str:<8}  ")
-                    live_part = f"{live_val:<10}  [{c['type']}]"
+                    toggle = _cheat_freeze_indicator(c)
+                    live_part = f"{live_val:<10}  [{toggle}] {c['type']}"
                     if ri == sel:
                         safe_addstr(stdscr, 5 + i, 2,
                                     (line_base + live_part)[:w - 4].ljust(w - 4), attr)
@@ -6729,6 +8730,7 @@ def do_cheat_list(stdscr) -> None:
             is_refreshing = refresh_thread is not None and refresh_thread.is_alive()
             draw_statusbar(stdscr, [
                 ("↑↓ navigate", C_NORM), ("Enter inspect", C_OK),
+                ("F/Space toggle", C_ACC),
                 ("A apply once", C_WARN), ("D delete", C_ERR),
                 ("⟳ live" if is_refreshing else "live values", C_ACC),
                 ("Q back", C_NORM),
@@ -6758,10 +8760,17 @@ def do_cheat_list(stdscr) -> None:
                 stdscr.nodelay(True)
                 with cache_lock:
                     live_cache.pop(sel, None)   # force re-read after apply
+            elif key in (ord('f'), ord('F'), ord(' ')) and cheats:
+                try:
+                    _toggle_cheat_freeze(cheats[sel])
+                except Exception as exc:
+                    add_log(f"Freeze toggle failed: {exc}", "error")
             elif key in (ord('d'), ord('D')) and cheats:
                 stdscr.nodelay(False)
                 name = cheats[sel]["name"]
                 if confirm_box(stdscr, f"Delete '{name}'?", "Delete Cheat"):
+                    if _is_cheat_frozen(cheats[sel]):
+                        _toggle_cheat_freeze(cheats[sel])
                     del cheats[sel]
                     state["cheats"] = cheats
                     add_log(f"Deleted cheat '{name}'", "warn")
@@ -6785,6 +8794,12 @@ def do_cheat_list(stdscr) -> None:
 def _apply_cheat_once(stdscr, cheat: dict) -> None:
     """Apply one saved cheat value immediately and verify the result.
     Supports both flat (address) cheats and pointer-chain cheats."""
+    is_pointer = "offsets" in cheat and cheat.get("offsets") is not None
+    portable_cheat = _is_portable_cheat(cheat)
+    same_process = str(cheat.get("process", "") or "") in (
+        "", str(state.get("proc_name", "") or ""))
+    portable_here = (portable_cheat and same_process and
+                     _portable_cheat_matches_current_game(cheat))
     owner_pid = cheat.get("pid")
     if owner_pid is None:
         message_box(stdscr,
@@ -6792,14 +8807,15 @@ def _apply_cheat_once(stdscr, cheat: dict) -> None:
              "Re-add it from current scan results before applying it."],
             "Unowned Cheat", C_WARN)
         return
-    if cheat.get("session") != state["session"]:
+    if (cheat.get("session") != state["session"] and
+            not portable_here):
         message_box(stdscr,
             ["This cheat belongs to an earlier PS5 connection session.",
              "The game or payload may have restarted and reused its PID.",
-             "Re-add the address from fresh scan results."],
+             "Only module-relative or validated pointer cheats can be rebased."],
             "Stale Cheat", C_ERR)
         return
-    if owner_pid != state["pid"]:
+    if owner_pid != state["pid"] and not portable_here:
         owner_name = cheat.get("process") or "unknown process"
         message_box(stdscr,
             [f"This address belongs to PID {owner_pid} ({owner_name}).",
@@ -6809,15 +8825,23 @@ def _apply_cheat_once(stdscr, cheat: dict) -> None:
         return
 
     width = int(cheat["width"])
-    value = int(cheat["value"])
-    is_pointer = "offsets" in cheat and cheat.get("offsets") is not None
+    type_key = _cheat_value_type(cheat)
+    value = cheat["value"]
 
     if is_pointer:
         # ── pointer cheat: resolve chain first ───────────────────────────
-        base    = _runtime_pointer_base(cheat)
-        offsets = [int(o, 0) if isinstance(o, str) else int(o) for o in cheat["offsets"]]
-        ok, addr, steps = _resolve_pointer_chain(
-            state["ip"], state["pid"], base, offsets)
+        try:
+            base = _runtime_pointer_base(cheat)
+            offsets = [int(o, 0) if isinstance(o, str) else int(o)
+                       for o in cheat["offsets"]]
+            ok, addr, steps = _resolve_pointer_chain(
+                state["ip"], state["pid"], base, offsets,
+                int(cheat.get("terminal_offset", 0)))
+        except Exception as exc:
+            add_log(f"Pointer base unavailable for '{cheat['name']}': {exc}",
+                    "error")
+            message_box(stdscr, [str(exc)], "Pointer Module Unavailable", C_ERR)
+            return
         if not ok:
             add_log(f"Pointer chain broken for '{cheat['name']}' "
                     f"base={hex(base)}", "error")
@@ -6831,13 +8855,18 @@ def _apply_cheat_once(stdscr, cheat: dict) -> None:
         add_log(f"Pointer chain resolved: {hex(base)} → {hex(addr)} "
                 f"(steps: {[hex(s) for s in steps]})")
     else:
-        addr = int(cheat["address"])
+        try:
+            addr = _runtime_scalar_address(cheat)
+        except Exception as exc:
+            message_box(stdscr, [str(exc)],
+                        "Cheat Module Unavailable", C_ERR)
+            return
 
     map_err = _validate_addr_in_maps(state["ip"], state["pid"], addr, width)
     if map_err and not confirm_box(stdscr, f"{map_err}\nWrite anyway?", "Unmapped Address"):
         return
 
-    data = struct.pack(WIDTH_FMT[width], value)
+    data = _cheat_value_bytes(cheat)
     ack, verified, actual = ps5_write_verified(
         state["ip"], state["pid"], addr, data)
 
@@ -6851,7 +8880,8 @@ def _apply_cheat_once(stdscr, cheat: dict) -> None:
     elif ack:
         with _map_cache_lock:
             _map_cache.clear()
-        actual_value = struct.unpack(WIDTH_FMT[width], actual)[0]
+        actual_value = _format_typed_value(
+            _unpack_typed_value(actual, type_key, width), type_key, width)
         add_log(f"Apply mismatch '{cheat['name']}': read {actual_value}", "error")
         message_box(stdscr,
                     ["Write acknowledged but did not stick.",
@@ -6859,7 +8889,8 @@ def _apply_cheat_once(stdscr, cheat: dict) -> None:
                     "Apply Mismatch", C_ERR)
     else:
         add_log(f"Apply rejected for '{cheat['name']}'", "error")
-        message_box(stdscr, ["Write rejected by ps5debug."], "Apply Failed", C_ERR)
+        message_box(stdscr, ["Write rejected by the debug payload."],
+                    "Apply Failed", C_ERR)
 
 
 def _edit_cheat(stdscr, idx: int) -> None:
@@ -6873,58 +8904,44 @@ def _edit_cheat(stdscr, idx: int) -> None:
         base_hex = hex(c["base"]) if isinstance(c["base"], int) else c["base"]
         safe_addstr(stdscr, 4, 3, f"Pointer chain — base: {base_hex}", color(C_WARN))
     stdscr.refresh()
-    new_name = input_box(stdscr, "Name  : ", 5, 3, 40, c["name"])
-    val_s    = input_box(stdscr, "Value : ", 7, 3, 20, str(c["value"]))
+    new_name = input_box(
+        stdscr, "Name  : ", 5, 3, 40, c["name"],
+        allow_cancel=True, cancel_with_q=False)
+    if new_name is None:
+        add_log("Edit cheat cancelled")
+        return
+    type_key = _cheat_value_type(c)
+    val_s = input_box(
+        stdscr, "Value : ", 7, 3, 38,
+        _format_typed_value(c["value"], type_key, int(c["width"])),
+        allow_cancel=True)
+    if val_s is None:
+        add_log("Edit cheat cancelled")
+        return
     # Pointer cheats use pointer_freeze/pointer_write; flat cheats use freeze/write.
     # Offering the wrong set would crash cycle_input (options.index raises ValueError).
     if is_pointer:
         type_opts = ["pointer_freeze", "pointer_write"]
     else:
         type_opts = ["freeze", "write"]
-    new_type = cycle_input(stdscr, "Type  : ", 9, 3, type_opts, c["type"])
+    new_type = cycle_input(
+        stdscr, "Type  : ", 9, 3, type_opts, c["type"],
+        allow_cancel=True)
+    if new_type is None:
+        add_log("Edit cheat cancelled")
+        return
     try:
-        new_val = int(val_s, 0)
-        if new_val < 0 or new_val > WIDTH_MAX[c["width"]]:
-            message_box(stdscr,
-                [f"Value {new_val} exceeds maximum for {WIDTH_LABEL[c['width']]}.",
-                 f"Max allowed: {WIDTH_MAX[c['width']]}  — keeping old value."],
-                "Value Out of Range", C_WARN)
-            new_val = c["value"]
-    except ValueError:
+        new_val = _parse_value_text(val_s, type_key, int(c["width"]))
+    except ValueError as exc:
+        message_box(stdscr, [str(exc), "Keeping the previous value."],
+                    "Invalid Value", C_WARN)
         new_val = c["value"]
-    old_val = int(c["value"])
     state["cheats"][idx].update({"name": new_name, "value": new_val, "type": new_type})
-    apply_status = "Value unchanged."
-    apply_color = C_OK
-    if new_val != old_val:
-        try:
-            if is_pointer:
-                base = _runtime_pointer_base(c)
-                offsets = [int(o, 0) if isinstance(o, str) else int(o) for o in c["offsets"]]
-                ok_chain, target_addr, _ = _resolve_pointer_chain(
-                    state["ip"], state["pid"], base, offsets, int(c.get("terminal_offset", 0)))
-                if not ok_chain:
-                    raise ValueError("pointer chain could not be resolved")
-                ack, verified, actual = _write_value_verified(state["ip"], state["pid"], target_addr, new_val, int(c["width"]))
-            else:
-                ack, verified, actual = _write_value_verified(state["ip"], state["pid"], int(c["address"]), new_val, int(c["width"]))
-            if ack and verified:
-                apply_status = f"Applied new value: {new_val} (verified)."
-            elif ack and verified is None:
-                apply_status = "Value saved; write acknowledged but read-back failed."
-                apply_color = C_WARN
-            elif ack and actual is not None:
-                actual_val = struct.unpack(WIDTH_FMT[int(c["width"])], actual)[0]
-                apply_status = f"Value saved, but memory read back {actual_val}."
-                apply_color = C_ERR
-            else:
-                apply_status = "Value saved, but the memory write was rejected."
-                apply_color = C_ERR
-        except Exception as exc:
-            apply_status = f"Value saved, but could not apply: {exc}"
-            apply_color = C_ERR
     add_log(f"Edited '{new_name}' val={new_val} type={new_type}")
-    message_box(stdscr, [f"Updated '{new_name}'", apply_status], "Saved", apply_color)
+    message_box(
+        stdscr,
+        [f"Updated '{new_name}'.", "Memory was not changed; use Apply explicitly."],
+        "Cheat Updated", C_OK)
 
 
 def _parse_int_field(value, field_name):
@@ -6936,26 +8953,67 @@ def _parse_int_field(value, field_name):
 
 def do_import(stdscr) -> None:
     stdscr.clear()
-    draw_border(stdscr, "IMPORT CHEATS")
-    path = Path(input_box(stdscr, "JSON path: ", 4, 3, 70, str(Path.home()))).expanduser()
+    draw_border(stdscr, "IMPORT RDX TRAINER")
+    safe_addstr(stdscr, 2, 3,
+                "Imports RDX cheatList JSON; etaHEN patches are deploy-only.",
+                color(C_NORM))
+    raw_path = input_box(
+        stdscr, "RDX JSON path: ", 4, 3, 70,
+        state.get("export_dir", str(Path.home())),
+        allow_cancel=True, cancel_with_q=False)
+    if raw_path is None:
+        add_log("Trainer import cancelled")
+        return
+    path = Path(raw_path).expanduser()
     if not path.exists() or not path.is_file():
         message_box(stdscr, [f"File not found: {path}"], "Import Failed", C_ERR)
         return
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
+        trainer_process = str(data.get("process", "") or "")
+        if trainer_process and trainer_process != str(state.get("proc_name", "") or ""):
+            raise ValueError(
+                f"trainer targets process '{trainer_process}', but RDX is "
+                f"attached to '{state.get('proc_name', '')}'")
         items = data.get("cheatList", [])
         if not isinstance(items, list): raise ValueError("cheatList is not an array")
+        trainer_identity = str(data.get("game_identity", "") or "")
+        identities = {str(c.get("game_identity", trainer_identity) or "")
+                      for c in items if isinstance(c, dict)
+                      and (c.get("game_identity") or trainer_identity)}
+        if identities:
+            current_maps = _get_maps_cached(state["ip"], state["pid"])
+            current_identity = _pointer_game_identity(
+                state.get("proc_name", ""), current_maps)
+            if identities != {current_identity}:
+                raise ValueError(
+                    "trainer game-image fingerprint does not match the "
+                    "currently attached title")
         imported = []
         for c in items:
             if not isinstance(c, dict) or not c.get("name"): continue
             width = int(c.get("bytes", 4))
-            value = _parse_int_field(c.get("value", 0), "value")
-            if width not in WIDTH_MAX or not 0 <= value <= WIDTH_MAX[width]:
-                raise ValueError(f"Invalid width/value in '{c['name']}'")
+            value_type = _normalise_value_type(c.get("value_type"), width)
+            if value_type == "bytes":
+                if not 1 <= width <= 256:
+                    raise ValueError(f"Invalid raw-byte width in '{c['name']}'")
+            elif _value_width(value_type) != width:
+                raise ValueError(f"Type/width mismatch in '{c['name']}'")
+            value = _parse_value_text(str(c.get("value", 0)),
+                                      value_type, width)
             e = {"name": str(c["name"]), "type": str(c.get("type", "write")),
-                 "value": value, "width": width, "pid": state["pid"],
+                 "value": value, "value_type": value_type, "width": width,
+                 "pid": state["pid"],
                  "process": state["proc_name"], "session": state["session"],
                  "imported_from": str(path)}
+            item_identity = str(
+                c.get("game_identity", trainer_identity) or "")
+            if item_identity:
+                e["game_identity"] = item_identity
+            if c.get("original_value") is not None:
+                original = _parse_value_text(str(c["original_value"]),
+                                             value_type, width)
+                e["original_value"] = original
             if "base" in c:
                 base = _parse_int_field(c["base"], "base")
                 if not (_ADDR_MIN <= base <= _ADDR_MAX):
@@ -6969,23 +9027,74 @@ def do_import(stdscr) -> None:
                 e["base"] = base
                 e["offsets"] = offsets
                 e["address"] = 0
-                if c.get("module_name") is not None:
-                    module_name = str(c.get("module_name")).strip()
+                # v1 release keys are round-trippable. Accept the shorter key
+                # names written by late prerelease builds for compatibility.
+                raw_module_name = c.get("module_name", c.get("module"))
+                raw_module_offset = c.get(
+                    "module_relative_offset", c.get("module_offset"))
+                if raw_module_name is not None:
+                    module_name = str(raw_module_name).strip()
                     if not module_name or len(module_name) > 512:
                         raise ValueError(f"'{e['name']}' has an invalid module name")
                     e["module_name"] = module_name
-                if c.get("module_relative_offset") is not None:
-                    mrel = _parse_int_field(c["module_relative_offset"], "module relative offset")
+                if raw_module_offset is not None:
+                    mrel = _parse_int_field(raw_module_offset,
+                                            "module relative offset")
                     if mrel < 0 or mrel > _ADDR_MAX:
                         raise ValueError(f"'{e['name']}' has an invalid module-relative offset")
                     e["module_relative_offset"] = mrel
+                if c.get("terminal_offset") is not None:
+                    terminal = _parse_int_field(
+                        c["terminal_offset"], "terminal offset")
+                    if abs(terminal) > _PTR_RESOLVE_OFFSET_MAX:
+                        raise ValueError(
+                            f"'{e['name']}' has an unreasonable terminal offset")
+                    if terminal:
+                        e["terminal_offset"] = terminal
+                if e["type"] in {"freeze", "write"}:
+                    e["type"] = "pointer_" + e["type"]
+                if e["type"] not in {"pointer_freeze", "pointer_write"}:
+                    raise ValueError(f"'{e['name']}' has an invalid pointer type")
+                if (c.get("cross_reload_validated") is True and
+                        e.get("module_name") and
+                        e.get("module_relative_offset") is not None and
+                        e.get("game_identity")):
+                    e["cross_reload_validated"] = True
             elif "address" in c:
                 address = _parse_int_field(c["address"], "address")
                 if not (_ADDR_MIN <= address <= _ADDR_MAX):
                     raise ValueError(f"'{e['name']}' has an invalid address")
                 e["address"] = address
+                raw_module_name = c.get("module_name", c.get("module"))
+                raw_module_offset = c.get(
+                    "module_relative_offset", c.get("module_offset"))
+                if ((raw_module_name is None) !=
+                        (raw_module_offset is None)):
+                    raise ValueError(
+                        f"'{e['name']}' has incomplete module-relative metadata")
+                if raw_module_name is not None:
+                    module_name = str(raw_module_name).strip()
+                    mrel = _parse_int_field(
+                        raw_module_offset, "module relative offset")
+                    if (not module_name or len(module_name) > 512 or
+                            mrel < 0 or mrel > _ADDR_MAX):
+                        raise ValueError(
+                            f"'{e['name']}' has invalid module-relative metadata")
+                    e["module_name"] = module_name
+                    e["module_relative_offset"] = mrel
+                if e["type"] not in {"freeze", "write"}:
+                    raise ValueError(f"'{e['name']}' has an invalid scalar type")
             else:
                 raise ValueError(f"'{e['name']}' has no address/base")
+            # A file cannot prove that an absolute address or provisional
+            # pointer belongs to this runtime session. Keep it visible for
+            # inspection, but do not stamp it as current and thereby turn an
+            # old address into an authorized write target. Portable entries
+            # have already passed the process/game-image checks above.
+            if not _is_portable_cheat(e):
+                e["pid"] = None
+                e["session"] = None
+                e["import_locked"] = True
             imported.append(e)
         if not imported: raise ValueError("No usable cheats found")
         if state["cheats"] and not confirm_box(stdscr,
@@ -6994,8 +9103,11 @@ def do_import(stdscr) -> None:
             return
         state["cheats"].extend(imported)
         add_log(f"Imported {len(imported)} cheats from {path}")
+        portable = sum(1 for cheat in imported if _is_portable_cheat(cheat))
+        locked = sum(1 for cheat in imported if cheat.get("import_locked"))
         message_box(stdscr, [f"Imported {len(imported)} cheats.",
-                             "They are bound to the current process/session."],
+                             f"Portable entries ready: {portable}.",
+                             f"Absolute/provisional entries locked: {locked}."],
                     "Import Complete", C_OK)
     except Exception as exc:
         add_log(f"Import failed: {exc}", "error")
@@ -7004,19 +9116,57 @@ def do_import(stdscr) -> None:
 
 def do_export(stdscr) -> None:
     stdscr.clear()
-    draw_border(stdscr, "EXPORT GOLDHEN CHEAT JSON")
-    safe_addstr(stdscr, 2, 3,
-        f"Cheats to export: {len(state['cheats'])}", color(C_WARN))
+    draw_border(stdscr, "EXPORT TRAINERS")
     if not state["cheats"]:
         message_box(stdscr,
             ["No cheats to export.", "Build your cheat list first."], "Error", C_ERR)
         return
+
+    # Resolve ownership before collecting metadata.  Asking for four fields and
+    # only then discovering that every entry belongs to a stale session or a
+    # different title makes Export feel broken and risks packaging the wrong
+    # game's entries when several sessions remain in the cheat list.
+    process = str(state.get("proc_name", "") or "eboot.bin")
+    try:
+        maps = _get_maps_cached(state["ip"], state["pid"])
+    except Exception as exc:
+        maps = []
+        add_log(f"Trainer export map lookup failed: {exc}", "warn")
+    current_identity = (_pointer_game_identity(process, maps) if maps else "")
+
+    def belongs_to_current_game(cheat):
+        current_session = (cheat.get("pid") == state.get("pid") and
+                           cheat.get("session") == state.get("session"))
+        portable_current = (
+            _is_portable_cheat(cheat)
+            and str(cheat.get("process", "") or "") in ("", process)
+            and str(cheat.get("game_identity", "") or "") == current_identity)
+        return current_session or portable_current
+
+    export_cheats = [c for c in state["cheats"] if belongs_to_current_game(c)]
+    excluded_count = len(state["cheats"]) - len(export_cheats)
+    if not export_cheats:
+        message_box(
+            stdscr,
+            ["No cheats belong to the currently attached game/session.",
+             "Switch to the owning process or build a new cheat first."],
+            "Nothing to Export", C_WARN)
+        return
+    safe_addstr(stdscr, 2, 3,
+        f"Eligible cheats: {len(export_cheats)}", color(C_WARN))
+    if excluded_count:
+        safe_addstr(stdscr, 3, 3,
+            f"Excluded stale/other-game cheats: {excluded_count}", color(C_NORM))
     stdscr.refresh()
 
     # Require a non-empty Title ID before proceeding
     while True:
         gid = input_box(stdscr, "Title ID  (e.g. PPSA01234) : ", 4, 3, 20,
-                        state["game_id"])
+                        state["game_id"], allow_cancel=True,
+                        cancel_with_q=False)
+        if gid is None:
+            add_log("Trainer export cancelled")
+            return
         if not gid:
             if not confirm_box(stdscr, "Title ID is empty — really continue?",
                                "Missing Title ID"):
@@ -7031,146 +9181,300 @@ def do_export(stdscr) -> None:
             continue   # let them re-enter
         break
 
-    VERSION_RE = re.compile(r'^\d{2}\.\d{2}$')
-    gver = input_box(stdscr, "Version   (e.g. 01.00)     : ", 6, 3, 10, state["game_ver"])
+    # PS4 package versions normally use 01.00; native PS5 entries in etaHEN's
+    # database use the longer 01.004.000 form.
+    VERSION_RE = re.compile(r'^(?:\d{2}\.\d{2}|\d{2}\.\d{3}\.\d{3})$')
+    gver = input_box(stdscr, "Version (01.00 / 01.004.000): ",
+                     6, 3, 16, state["game_ver"], allow_cancel=True,
+                     cancel_with_q=False)
+    if gver is None:
+        add_log("Trainer export cancelled")
+        return
     if gver and not VERSION_RE.match(gver):
         if not confirm_box(stdscr,
-                f"Version '{gver}' doesn't match NN.NN format.\nContinue anyway?",
+                f"Version '{gver}' is not a standard PS4/PS5 form.\nContinue anyway?",
                 "Version Format"):
             return
-    gtit = input_box(stdscr, "Game Title                 : ", 8, 3, 40, state["game_title"])
-    val_fmt = cycle_input(stdscr, "Value format               : ", 10, 3,
-                          ["hex (GoldHEN 2.x)", "decimal (older loaders)"],
-                          "hex (GoldHEN 2.x)")
-    hex_values = val_fmt.startswith("hex")
+    gtit = input_box(
+        stdscr, "Game Title                 : ", 8, 3, 40,
+        state["game_title"], allow_cancel=True, cancel_with_q=False)
+    if gtit is None:
+        add_log("Trainer export cancelled")
+        return
+    author = input_box(stdscr, "Cheat author               : ", 10, 3, 30,
+                       "RDX CheatMaker", allow_cancel=True,
+                       cancel_with_q=False)
+    if author is None:
+        add_log("Trainer export cancelled")
+        return
+    out_raw = input_box(
+        stdscr, "Output directory           : ", 12, 3, 60,
+        state.get("export_dir", str(Path.home())), allow_cancel=True,
+        cancel_with_q=False)
+    if out_raw is None:
+        add_log("Trainer export cancelled")
+        return
+    output_dir = Path(out_raw).expanduser()
+    if output_dir.exists() and not output_dir.is_dir():
+        message_box(stdscr, [f"Not a directory: {output_dir}"],
+                    "Export Failed", C_ERR)
+        return
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        message_box(stdscr, [f"Cannot create output directory: {exc}"],
+                    "Export Failed", C_ERR)
+        return
     state.update(game_id=gid, game_ver=gver, game_title=gtit)
+    state["export_dir"] = str(output_dir)
+    _save_preferences({"export_dir": str(output_dir)})
 
     safe_gid  = sanitize_filename(gid)
-    safe_gver = sanitize_filename(gver.replace('.', '_'))
-    fname     = f"{safe_gid or 'UNKNOWN'}_{safe_gver or '00_00'}.json"
-    save_path = Path.home() / fname
+    safe_gver = sanitize_filename(gver)
+    base_name = f"{safe_gid or 'UNKNOWN'}_{safe_gver or '00.00'}"
+    rdx_name = base_name + ".rdx.json"
+    process_suffix = ("" if process.lower() == "eboot.bin" else
+                      "_" + sanitize_filename(process))
+    etahen_name = base_name + process_suffix + ".json"
+    rdx_path = output_dir / rdx_name
+    etahen_path = output_dir / etahen_name
 
-    # Overwrite confirmation if file already exists
-    if save_path.exists():
-        if not confirm_box(stdscr,
-                f"'{fname}' already exists.\nOverwrite?", "Confirm Overwrite"):
-            return
+    # Capture the disable value at creation time whenever possible.  Older
+    # in-memory entries predate that field, so make one best-effort live read
+    # before export; never invent an etaHEN "off" byte sequence.
+    for cheat in export_cheats:
+        if cheat.get("offsets") is not None or cheat.get("original_value") is not None:
+            continue
+        try:
+            width = int(cheat["width"])
+            raw = ps5_read(state["ip"], state["pid"],
+                           _runtime_scalar_address(cheat), width)
+            if len(raw) == width:
+                cheat["original_value"] = _unpack_typed_value(
+                    raw, _cheat_value_type(cheat), width)
+        except Exception as exc:
+            add_log(f"Could not capture off-value for '{cheat.get('name', '?')}': "
+                    f"{exc}", "warn")
 
-    cht = generate_cht(state["cheats"], gid, gver, gtit, hex_values)
+    # Upgrade older in-memory flat cheats when their current address is in a
+    # static module. This turns a session address into a relocatable native RDX
+    # trainer entry and an etaHEN-compatible module patch where possible.
+    if maps:
+        region_starts, region_rows = _build_region_lookup(maps)
+        for cheat in export_cheats:
+            if (cheat.get("offsets") is not None or
+                    cheat.get("module_name") or
+                    cheat.get("pid") != state.get("pid") or
+                    cheat.get("session") != state.get("session")):
+                continue
+            address = int(cheat.get("address", 0))
+            region = _region_for_addr(address, region_starts, region_rows)
+            if region is None or not _is_static_region(region):
+                continue
+            module_name, _module_base, module_rel = _module_info_for_addr(
+                address, maps)
+            if module_name and module_rel is not None:
+                cheat["module_name"] = str(module_name)
+                cheat["module_relative_offset"] = int(module_rel)
+                cheat["game_identity"] = _pointer_game_identity(process, maps)
+
+    rdx_text = generate_cht(
+        export_cheats, gid, gver, gtit, True, process)
+    etahen_text, etahen_mods, skipped = generate_etahen_json(
+        export_cheats, gid, gver, gtit, process, maps, author)
+    if str(gid).upper().startswith("CUSA"):
+        platform_name = "GoldHEN"
+        deploy_dir = "/user/data/GoldHEN/cheats/json/"
+    elif str(gid).upper().startswith("PPSA"):
+        platform_name = "etaHEN"
+        deploy_dir = "/data/etaHEN/cheats/json/"
+    else:
+        platform_name = "GoldHEN/etaHEN-compatible"
+        deploy_dir = "the console manager's cheats/json directory"
+
+    preflight = [
+        f"Native RDX entries: {len(export_cheats)}",
+        f"{platform_name} static patches: {len(etahen_mods)}",
+        f"Static export skipped: {len(skipped)}",
+        f"Other-game/stale excluded: {excluded_count}",
+        f"Destination: {output_dir}",
+    ]
+    if etahen_mods:
+        preflight.append(f"Console deploy: {deploy_dir}{etahen_name}")
+    if not confirm_box(stdscr, "\n".join(preflight) + "\n\nWrite these files?",
+                       "Export Preflight"):
+        add_log("Trainer export cancelled at preflight")
+        return
+    existing = [p.name for p in (rdx_path, etahen_path)
+                if p.exists() and (p == rdx_path or etahen_mods)]
+    if existing and not confirm_box(
+            stdscr, "Overwrite existing file(s)?\n" + "\n".join(existing),
+            "Confirm Overwrite"):
+        return
+
     try:
-        save_path.write_text(cht)
-        add_log(f"Exported {save_path}")
-        message_box(stdscr, [
-            f"Saved: {save_path}",
-            "",
-            "Transfer to PS5 via FTP:",
-            f"  /data/GoldHEN/cheats/{gid}/{fname}",
-            "",
-            "Activate: GoldHEN overlay > Options > Cheats",
-            "",
-            f"Values exported as: {'hex (GoldHEN 2.x)' if hex_values else 'decimal'}",
-        ], "Export OK", C_OK)
+        _atomic_write_text(rdx_path, rdx_text)
+        add_log(f"Exported RDX trainer {rdx_path}")
+        lines = [f"RDX trainer: {rdx_path}",
+                 f"  {len(export_cheats)} entry/entries; pointer chains supported."]
+        if excluded_count:
+            lines.append(
+                f"  Skipped {excluded_count} stale/other-game entry/entries.")
+        if etahen_mods:
+            _atomic_write_text(etahen_path, etahen_text)
+            add_log(f"Exported {platform_name} patch {etahen_path} "
+                    f"({len(etahen_mods)} mods, {len(skipped)} skipped)")
+            lines.extend([
+                "",
+                f"{platform_name} patch: {etahen_path}",
+                f"  {len(etahen_mods)} static module patch(es).",
+                "Upload via FTP to:",
+                f"  {deploy_dir}{etahen_name}",
+            ])
+        else:
+            lines.extend([
+                "",
+                f"No {platform_name} JSON was written: it cannot execute pointer",
+                "chains or live freezes; use the RDX trainer for those entries.",
+            ])
+        if skipped:
+            lines.append(
+                f"Static-manager-incompatible entries kept in RDX: {len(skipped)}")
+        message_box(stdscr, lines, "Export OK", C_OK)
     except Exception as exc:
         message_box(stdscr, [f"Could not write: {exc}"], "Export Failed", C_ERR)
 
 
-def do_freeze(stdscr) -> None:
-    """Freeze a manual address or resolve a saved pointer chain every tick."""
-    global _freeze_thread
-    _stop_freeze_worker()
-    with _freeze_lock:
-        if _freeze_thread and _freeze_thread.is_alive():
-            message_box(stdscr, ["Previous freeze worker is still shutting down."],
-                        "Freeze Still Active", C_ERR)
-            return
-    stdscr.clear(); draw_border(stdscr, "FREEZE ADDRESS / CHEAT")
-    choices = ["Manual address"] + (["Saved cheat"] if state["cheats"] else [])
-    mode = cycle_input(stdscr, "Target            : ", 4, 3, choices, choices[0])
-    is_pointer = False; cheat = None; base = None; offsets = []
-    if mode == "Saved cheat":
-        names = [c.get("name", "Unnamed") for c in state["cheats"]]
-        selected = cycle_input(stdscr, "Cheat             : ", 6, 3, names, names[0])
-        cheat = state["cheats"][names.index(selected)]
-        if cheat.get("pid") != state["pid"] or cheat.get("session") != state["session"]:
-            message_box(stdscr, ["Selected cheat belongs to another process/session."], "Stale Cheat", C_ERR); return
-        width = int(cheat["width"]); val = int(cheat["value"])
-        is_pointer = "offsets" in cheat and cheat.get("offsets") is not None
-        if is_pointer:
-            base = _runtime_pointer_base(cheat)
-            offsets = [int(x,0) if isinstance(x,str) else int(x) for x in cheat["offsets"]]
-            addr = 0
-        else: addr = int(cheat["address"])
-    else:
-        addr_s = input_box(stdscr, "Address (hex)    : ", 6, 3, 20)
-        val_s = input_box(stdscr, "Freeze value     : ", 8, 3, 20)
-        labels = [WIDTH_LABEL[x] for x in VALID_WIDTHS]
-        ws = cycle_input(stdscr, "Width            : ", 10, 3, labels, WIDTH_LABEL.get(state["scan_width"],"uint32"))
-        width = VALID_WIDTHS[labels.index(ws)]
+def do_freeze(stdscr, selected_cheat: Optional[dict] = None) -> None:
+    """Toggle saved cheats persistently or run an isolated timed manual freeze."""
+    stdscr.clear()
+    draw_border(stdscr, "FREEZE ADDRESS / CHEAT")
+    choices = ["Manual timed freeze"] + (
+        ["Saved cheat toggle"] if state["cheats"] else [])
+    mode = ("Saved cheat toggle" if selected_cheat is not None else
+            cycle_input(stdscr, "Target            : ", 4, 3,
+                        choices, choices[0], allow_cancel=True))
+    if mode is None:
+        add_log("Freeze setup cancelled")
+        return
+
+    if mode == "Saved cheat toggle":
+        cheat = selected_cheat
+        if cheat is None:
+            names = [c.get("name", "Unnamed") for c in state["cheats"]]
+            selected = cycle_input(
+                stdscr, "Cheat             : ", 6, 3, names, names[0],
+                allow_cancel=True)
+            if selected is None:
+                add_log("Freeze setup cancelled")
+                return
+            cheat = state["cheats"][names.index(selected)]
         try:
-            addr = int(addr_s,0); val = int(val_s,0)
-            err = _validate_write_addr(addr)
-            if err: raise ValueError(err)
-            if not 0 <= val <= WIDTH_MAX[width]: raise ValueError("Value out of range")
+            enabled = _toggle_cheat_freeze(cheat)
         except Exception as exc:
-            message_box(stdscr,[f"Bad input: {exc}"],"Error",C_ERR); return
+            message_box(stdscr, [f"Could not toggle freeze: {exc}"],
+                        "Freeze Failed", C_ERR)
+            return
+        message_box(
+            stdscr,
+            [f"'{cheat.get('name', 'Unnamed')}' is now "
+             f"{'ON' if enabled else 'OFF'}.",
+             "Other enabled cheats remain active.",
+             "Use F or Space in Cheat List to toggle it again."],
+            "Cheat Toggle", C_OK if enabled else C_WARN)
+        return
+
+    addr_s = input_box(stdscr, "Address (hex)    : ", 6, 3, 20,
+                       allow_cancel=True)
+    if addr_s is None:
+        add_log("Freeze setup cancelled")
+        return
+    labels = [VALUE_TYPES[key]["label"] for key in VALUE_TYPE_ORDER]
+    type_label = cycle_input(
+        stdscr, "Value type       : ", 8, 3, labels,
+        VALUE_TYPES[_current_scan_type()]["label"], allow_cancel=True)
+    if type_label is None:
+        add_log("Freeze setup cancelled")
+        return
+    type_key = (VALUE_TYPE_ORDER[labels.index(type_label)]
+                if type_label in labels else _normalise_value_type(type_label))
+    val_s = input_box(stdscr, "Freeze value     : ", 10, 3, 38,
+                      allow_cancel=True)
+    sec_s = input_box(stdscr, "Duration (secs)  : ", 12, 3, 6, "30",
+                      allow_cancel=True) if val_s is not None else None
+    interval_s = input_box(stdscr, "Interval (ms)    : ", 14, 3, 6, "200",
+                           allow_cancel=True) if sec_s is not None else None
+    if val_s is None or sec_s is None or interval_s is None:
+        add_log("Freeze setup cancelled")
+        return
     try:
-        sec = max(1,int(input_box(stdscr,"Duration (secs)  : ",12,3,6,"30")))
-        interval = max(50,int(input_box(stdscr,"Interval (ms)    : ",14,3,6,"200")))/1000.0
-        data = struct.pack(WIDTH_FMT[width], val)
+        address = int(addr_s, 0)
+        err = _validate_write_addr(address)
+        if err:
+            raise ValueError(err)
+        value = _parse_value_text(val_s, type_key)
+        width = (len(bytes.fromhex(value)) if type_key == "bytes" else
+                 _value_width(type_key))
+        map_error = _validate_addr_in_maps(
+            state["ip"], state["pid"], address, width, 0.0)
+        if map_error:
+            raise ValueError(map_error)
+        data = _pack_typed_value(value, type_key, width)
+        seconds = max(1, int(sec_s))
+        interval = max(50, int(interval_s)) / 1000.0
     except Exception as exc:
-        message_box(stdscr,[f"Bad input: {exc}"],"Error",C_ERR); return
-    frozen_ip, frozen_pid = state["ip"], state["pid"]
-    frozen_session = state["session"]
-    stop_event = threading.Event(); errors=[0]; deadline=time.time()+sec
-    def _freeze_worker():
-        while time.time() < deadline:
-            if stop_event.is_set() or _freeze_stop.is_set(): break
-            if state["ip"] != frozen_ip or state["pid"] != frozen_pid:
-                add_log("Freeze aborted — process or connection changed","warn"); break
-            target = addr
-            if state.get("session") != frozen_session:
-                add_log("Freeze aborted — session changed", "warn"); break
-            if is_pointer:
-                try:
-                    base_now = _runtime_pointer_base(cheat)
-                except Exception as exc:
-                    add_log(f"Pointer freeze: module unavailable — {exc}", "warn")
-                    break
-                ok,target,_ = _resolve_pointer_chain(
-                    frozen_ip, frozen_pid, base_now, offsets, int(cheat.get("terminal_offset", 0)))
-                if not ok:
-                    add_log("Pointer freeze: chain broken — retrying next tick","warn")
-                    if stop_event.wait(interval) or _freeze_stop.is_set(): break
-                    continue
-            validation_error = _validate_addr_in_maps(frozen_ip,frozen_pid,target,width,10.0)
-            if validation_error is not None:
+        message_box(stdscr, [f"Bad input: {exc}"], "Freeze Failed", C_ERR)
+        return
+
+    frozen_endpoint = (state["ip"], state["pid"], state["session"])
+    deadline = time.time() + seconds
+    stop_event = threading.Event()
+    errors = [0]
+
+    def worker_fn():
+        while time.time() < deadline and not stop_event.is_set():
+            if frozen_endpoint != (state["ip"], state["pid"], state["session"]):
+                add_log("Manual freeze stopped because the session changed", "warn")
+                break
+            if not ps5_write(state["ip"], state["pid"], address, data,
+                             cancel_event=stop_event, timeout=1.0):
                 errors[0] += 1
-                add_log(f"Freeze write blocked: {validation_error}", "warn")
-                with _map_cache_lock: _map_cache.clear()
-                if stop_event.wait(interval) or _freeze_stop.is_set(): break
-                continue
-            if not ps5_write(frozen_ip,frozen_pid,target,data,cancel_event=_freeze_stop,timeout=1.0):
-                errors[0]+=1
-                with _map_cache_lock: _map_cache.clear()
-            if stop_event.wait(interval) or _freeze_stop.is_set(): break
-    with _freeze_lock:
-        _freeze_stop.clear(); worker=threading.Thread(target=_freeze_worker,daemon=True); _freeze_thread=worker
-    worker.start(); stdscr.nodelay(True)
+            if stop_event.wait(interval):
+                break
+
+    worker = threading.Thread(target=worker_fn, name="rdx-manual-freeze",
+                              daemon=True)
+    worker.start()
+    stdscr.nodelay(True)
     try:
         while worker.is_alive():
-            h,w=stdscr.getmaxyx(); frac=min((time.time()-(deadline-sec))/sec,1.0)
-            safe_addstr(stdscr,20,3,f"Time left: {max(0,int(deadline-time.time())):3d}s",color(C_OK))
-            draw_progress_bar(stdscr,21,3,min(max(w-8,10),50),frac,f"  {int(frac*100)}%")
-            if errors[0]: safe_addstr(stdscr,22,3,f"Write errors: {errors[0]}",color(C_ERR))
-            stdscr.refresh(); k=stdscr.getch()
-            if k==curses.KEY_RESIZE: curses.update_lines_cols(); stdscr.clear(); draw_border(stdscr,"FREEZE ADDRESS / CHEAT")
-            elif k in (ord('q'),ord('Q'),27): stop_event.set(); break
-            time.sleep(.05)
+            h, w = stdscr.getmaxyx()
+            elapsed = seconds - max(0.0, deadline - time.time())
+            fraction = min(max(elapsed / seconds, 0.0), 1.0)
+            safe_addstr(stdscr, 18, 3,
+                        f"Time left: {max(0, int(deadline-time.time())):3d}s",
+                        color(C_OK))
+            draw_progress_bar(stdscr, 19, 3, min(max(w - 8, 10), 50),
+                              fraction, f"  {int(fraction * 100)}%")
+            if errors[0]:
+                safe_addstr(stdscr, 20, 3, f"Write errors: {errors[0]}",
+                            color(C_ERR))
+            draw_statusbar(stdscr, [("Esc/Q stop", C_WARN)])
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key == curses.KEY_RESIZE:
+                curses.update_lines_cols()
+                stdscr.clear()
+                draw_border(stdscr, "MANUAL TIMED FREEZE")
+            elif key in (27, ord('q'), ord('Q')):
+                stop_event.set()
+                break
+            time.sleep(0.05)
     finally:
-        stdscr.nodelay(False); stop_event.set(); worker.join(timeout=interval+1.0)
-        with _freeze_lock:
-            if _freeze_thread is worker: _freeze_thread=None
-    message_box(stdscr,["Freeze complete."],"Done",C_OK)
+        stdscr.nodelay(False)
+        stop_event.set()
+        worker.join(timeout=interval + 1.0)
+    add_log(f"Manual freeze finished with {errors[0]} write error(s)")
 
 
 def do_ptr_verify_manual(stdscr) -> None:
@@ -7192,7 +9496,11 @@ def do_ptr_verify_manual(stdscr) -> None:
         color(C_WARN))
     stdscr.refresh()
 
-    base_s = input_box(stdscr, "Static base address (hex) : ", 4, 3, 20)
+    base_s = input_box(stdscr, "Static base address (hex) : ", 4, 3, 20,
+                       allow_cancel=True)
+    if base_s is None:
+        add_log("Manual pointer verification cancelled")
+        return
     try:
         base = int(base_s, 0)
         if base < _ADDR_MIN or base > _ADDR_MAX:
@@ -7201,7 +9509,12 @@ def do_ptr_verify_manual(stdscr) -> None:
         message_box(stdscr, [f"Invalid address: {exc}"], "Error", C_ERR)
         return
 
-    target_s = input_box(stdscr, "Target address (hex, 0=unknown): ", 6, 3, 20, "0")
+    target_s = input_box(
+        stdscr, "Target address (hex, 0=unknown): ", 6, 3, 20, "0",
+        allow_cancel=True)
+    if target_s is None:
+        add_log("Manual pointer verification cancelled")
+        return
     try:
         target = int(target_s, 0)
     except ValueError:
@@ -7219,7 +9532,12 @@ def do_ptr_verify_manual(stdscr) -> None:
     stdscr.refresh()
     for i in range(MAX_CHAIN_DEPTH):
         default_val = "0x0" if i == 0 else ""
-        val_s = input_box(stdscr, f"  Offset [{i+1}] : ", 5 + i, 3, 20, default_val)
+        val_s = input_box(
+            stdscr, f"  Offset [{i+1}] : ", 5 + i, 3, 20,
+            default_val, allow_cancel=True)
+        if val_s is None:
+            add_log("Manual pointer verification cancelled")
+            return
         # Empty input on any slot after the first means the user is done.
         if not val_s:
             if i == 0:
@@ -7245,6 +9563,82 @@ def do_ptr_verify_manual(stdscr) -> None:
     do_pointer_chain_verify(stdscr, candidate, target)
 
 
+def do_pointer_project(stdscr) -> None:
+    """Visible home for the persisted scan → reload → rescan workflow."""
+    try:
+        maps = _get_maps_cached(state["ip"], state["pid"])
+    except Exception:
+        maps = []
+    summary = _pointer_project_summary(state.get("proc_name", ""), maps)
+    state["pointer_project_summary"] = summary
+    options = []
+    if len(state["scan_results"]):
+        options.append("Resume using a scan result")
+        options.append("Open current Results")
+    options.append("Start a value scan")
+    if summary["count"]:
+        options.append("Clear this pointer project")
+    options.append("Back")
+
+    while True:
+        stdscr.clear()
+        draw_border(stdscr, "POINTER PROJECT")
+        safe_addstr(stdscr, 2, 3,
+                    f"Reload validation: {summary['survivals']}/2",
+                    color(C_OK) if summary["complete"] else color(C_WARN) |
+                    curses.A_BOLD)
+        safe_addstr(stdscr, 3, 3,
+                    f"Persisted candidates: {summary['count']}", color(C_NORM))
+        if summary["target"]:
+            safe_addstr(stdscr, 4, 3,
+                        f"Previous temporary address: {hex(summary['target'])}",
+                        color(C_NORM))
+        safe_addstr(stdscr, 6, 3,
+                    "After each real game reload, find the value's new address,",
+                    color(C_ACC))
+        safe_addstr(stdscr, 7, 3,
+                    "then resume with that result. Two survivals unlock saving.",
+                    color(C_ACC))
+        selected = cycle_input(stdscr, "Action: ", 10, 3, options,
+                               options[0], allow_cancel=True)
+        if selected is None or selected == "Back":
+            return
+        if selected == "Open current Results":
+            do_show_results(stdscr)
+            return
+        if selected == "Start a value scan":
+            do_scan_first(stdscr)
+            return
+        if selected == "Clear this pointer project":
+            if confirm_box(stdscr,
+                           "Remove the persisted candidates for this game?",
+                           "Clear Pointer Project"):
+                removed = _clear_pointer_project(
+                    state.get("proc_name", ""), maps)
+                state["pointer_project_summary"] = _pointer_project_summary(
+                    state.get("proc_name", ""), maps)
+                add_log(f"Cleared {removed} pointer-project candidate(s)",
+                        "warn")
+            return
+        if selected == "Resume using a scan result":
+            result_count = len(state["scan_results"])
+            idx_s = input_box(
+                stdscr, f"Result index (1-{result_count}): ", 12, 3, 12,
+                "1", allow_cancel=True)
+            if idx_s is None:
+                continue
+            try:
+                idx = int(idx_s) - 1
+                if not 0 <= idx < result_count:
+                    raise ValueError
+            except ValueError:
+                message_box(stdscr, ["Invalid result index."],
+                            "Pointer Project", C_ERR)
+                continue
+            do_resolve_permanent(stdscr, int(state["scan_results"][idx]))
+            return
+
+
 def do_resolve_permanent(stdscr, target_addr: int) -> None:
     """Resolve a known temporary address to the best verified permanent chain."""
     target_addr = int(target_addr)
@@ -7253,23 +9647,57 @@ def do_resolve_permanent(stdscr, target_addr: int) -> None:
                     "Resolve Permanent Address", C_ERR)
         return
 
+    try:
+        # A scene reload can remap sections without changing the PID. Bypass
+        # the normal 30-second UI cache before deciding section identity/base.
+        with _map_cache_lock:
+            _map_cache.pop((state["ip"], state["pid"]), None)
+        current_maps = _get_maps_cached(state["ip"], state["pid"])
+    except Exception as exc:
+        message_box(stdscr, [f"Could not read the current memory map: {exc}"],
+                    "Resolve Permanent Address", C_ERR)
+        return
+    game_identity = _pointer_game_identity(
+        state.get("proc_name", ""), current_maps)
+
     # A chain cannot be called permanent from same-session reads.  If a prior
     # search exists and the game PID changed, validate that saved set first.
-    saved = _load_pointer_provisionals()
+    all_saved = _load_pointer_provisionals()
+    saved = [x for x in all_saved
+             if str(x.get("observed_process", "")) in
+             ("", str(state.get("proc_name", "") or ""))
+             and str(x.get("observed_game", "")) == game_identity]
     reload_result = None
-    if saved and any(int(x.get("observed_pid", state["pid"])) != int(state["pid"])
-                     for x in saved):
+    relocation_detected = any(
+            int(x.get("observed_pid", state["pid"])) != int(state["pid"]) or
+            int(x.get("observed_target", target_addr)) != target_addr
+            for x in saved)
+    if saved and not relocation_detected:
+        message_box(
+            stdscr,
+            ["A provisional search already exists for this exact address.",
+             "RDX cannot count another same-session scan as validation.",
+             "",
+             "Reload the game or scene, isolate the moved value again,",
+             "then choose Find Permanent Pointer on its new address."],
+            "Reload Not Detected", C_WARN)
+        return
+    if saved and relocation_detected:
         try:
             reload_result = _validate_pointer_provisionals(
                 state["ip"], state["pid"], state["proc_name"], target_addr,
-                saved)
+                saved, current_maps)
         except Exception as exc:
             add_log(f"Reload pointer validation failed: {exc}", "warn")
             reload_result = {"survivors": [], "rejected": saved}
         add_log(f"Reload validation: {len(reload_result['survivors'])} survived, "
                 f"{len(reload_result['rejected'])} rejected")
         # Do not repeatedly reconsider chains that already failed this reload.
-        _save_pointer_provisionals(reload_result["survivors"])
+        _merge_pointer_provisionals(
+            reload_result["survivors"], state.get("proc_name", ""),
+            game_identity=game_identity)
+        state["pointer_project_summary"] = _pointer_project_summary(
+            state.get("proc_name", ""), current_maps)
 
     reload_survivors = (reload_result or {}).get("survivors", [])
     promoted = [c for c in reload_survivors
@@ -7329,16 +9757,23 @@ def do_resolve_permanent(stdscr, target_addr: int) -> None:
         message_box(
             stdscr,
             ["No stable location was found.",
-             "Try again after the value has been used in-game."],
+             "Confirm the selected address still holds the intended value.",
+             "Change it in-game and run Next Scan again if results are broad.",
+             "For difficult titles, use all-readable scope in First Scan,",
+             "then retry after the object has been created/used in-game."],
             "Permanent Location Not Found", C_WARN)
         return
 
 
     if data.get("method") != "cross-reload-validation":
-        maps = data.get("maps") or _get_maps_cached(state["ip"], state["pid"])
+        maps = data.get("maps") or current_maps
         provisional = _make_pointer_provisionals(
             candidates, maps, state["pid"], state["proc_name"], target_addr)
-        _save_pointer_provisionals(provisional)
+        _merge_pointer_provisionals(
+            provisional, state.get("proc_name", ""),
+            game_identity=game_identity)
+        state["pointer_project_summary"] = _pointer_project_summary(
+            state.get("proc_name", ""), current_maps)
         message_box(
             stdscr,
             [f"Saved {len(provisional)} provisional pointer chain(s).",
@@ -7351,7 +9786,9 @@ def do_resolve_permanent(stdscr, target_addr: int) -> None:
 
     # Keep only the strongest verified choices; the user should choose between
     # a few meaningful alternatives, not inspect raw pointer-search output.
-    candidates = candidates[:8]
+    # The compact chooser renders one primary plus four alternatives. Never
+    # leave additional selectable rows off-screen.
+    candidates = candidates[:5]
     sel = 0
     while True:
         stdscr.clear()
@@ -7370,7 +9807,9 @@ def do_resolve_permanent(stdscr, target_addr: int) -> None:
         safe_addstr(stdscr, 6, 3, f"Permanent: {module} + {rel}",
                     color(C_OK) | curses.A_BOLD)
         safe_addstr(stdscr, 7, 3, f"Pointer path: {path or 'direct'}", color(C_WARN))
-        safe_addstr(stdscr, 8, 3, "Verification: ✓ Survived game reload", color(C_OK))
+        safe_addstr(stdscr, 8, 3,
+                    "Verification: ✓ Survived two relocation epochs",
+                    color(C_OK))
         safe_addstr(stdscr, 9, 3, f"Confidence: {int(c.get('confidence', 0))}%",
                     color(C_OK))
 
@@ -7387,7 +9826,7 @@ def do_resolve_permanent(stdscr, target_addr: int) -> None:
 
         draw_statusbar(stdscr, [
             ("↑↓ choose", C_NORM), ("Enter save", C_OK),
-            ("R search again", C_WARN), ("Q back", C_NORM)])
+            ("Q back", C_NORM)])
         stdscr.refresh()
         key = stdscr.getch()
         if key == curses.KEY_RESIZE:
@@ -7402,35 +9841,32 @@ def do_resolve_permanent(stdscr, target_addr: int) -> None:
             c2["module_name"] = module
             c2["module_relative_offset"] = int(c.get("module_relative_offset", 0))
             do_pointer_chain_verify(stdscr, c2, target_addr)
-        elif key in (ord('r'), ord('R')):
-            _invalidate_pointer_index(state["ip"], state["pid"])
-            return do_resolve_permanent(stdscr, target_addr)
         elif key in (ord('q'), ord('Q'), 27):
             return
 
 
-def do_pointer_scan(stdscr, target_addr: Optional[int] = None) -> None:
+def do_pointer_scan(stdscr, target_addr: Optional[int] = None,
+                    diagnostic: bool = False) -> None:
     """
-    Guided pointer-scan wizard.
+    Pick a temporary address and start the cross-reload permanent resolver.
 
-    Step 1: pick the temporary address (from scan results list or manual entry).
-    Step 2: scan runs at MAX_CHAIN_DEPTH automatically.
-    Step 3: auto-test all static candidates and highlight matches.
-    Step 3: user picks a verified chain and saves it as a permanent cheat.
+    ``diagnostic=True`` retains the same-session candidate browser for
+    troubleshooting, but those candidates are explicitly provisional and
+    cannot be represented as permanent trainers.
     """
     # ── STEP 1: pick the target address ──────────────────────────────────────
     stdscr.clear()
     draw_border(stdscr, "POINTER SCAN — Step 1 of 3: Pick Address")
 
     guide = [
-        "Pointer Scan finds a PERMANENT address for a value that moves",
-        "every time the game restarts (a 'temporary' address).",
+        "Find Permanent Pointer follows a value that moves after reloads.",
+        "It never treats same-session evidence as a reusable trainer chain.",
         "",
         "How it works:",
         "  1. Pick the temporary address you found via scanning.",
-        "  2. The tool searches memory for anything that POINTS to it.",
-        "  3. Static (permanent) pointer candidates are highlighted.",
-        "  4. Verified chains are saved as cheats that survive restarts.",
+        "  2. RDX finds and records module-rooted pointer candidates.",
+        "  3. Reload, isolate the moved value, then run this again.",
+        "  4. Two relocation survivals promote a reusable trainer chain.",
     ]
     for i, line in enumerate(guide):
         safe_addstr(stdscr, 2 + i, 3, line,
@@ -7511,7 +9947,11 @@ def do_pointer_scan(stdscr, target_addr: Optional[int] = None) -> None:
             "You can find it in Results (R) — look at the hex address column.",
             color(C_NORM))
         stdscr.refresh()
-        addr_s = input_box(stdscr, "Temporary address (hex) : ", 5, 3, 24)
+        addr_s = input_box(stdscr, "Temporary address (hex) : ", 5, 3, 24,
+                           allow_cancel=True)
+        if addr_s is None:
+            add_log("Permanent pointer setup cancelled")
+            return
         try:
             target_addr = int(addr_s, 0)
             if target_addr < _ADDR_MIN or target_addr > _ADDR_MAX:
@@ -7520,10 +9960,16 @@ def do_pointer_scan(stdscr, target_addr: Optional[int] = None) -> None:
             message_box(stdscr, [f"Invalid address: {exc}"], "Error", C_ERR)
             return
 
+    # The normal UI has one pointer workflow. The legacy candidate browser is
+    # retained only as an explicit diagnostic mode so same-session evidence is
+    # never presented to users as a permanent trainer.
+    if not diagnostic:
+        return do_resolve_permanent(stdscr, target_addr)
+
     # ── STEP 2: scan ─────────────────────────────────────────────────────────
-    # Four levels cover the common static -> heap -> object -> value layout
-    # without forcing every user through six full memory passes.  The pointer
-    # scanner itself still accepts deeper values for advanced callers.
+    # Five levels cover common module -> manager -> object -> component ->
+    # value layouts. The permanent resolver can exhaustively fall back through
+    # six levels and the scanner API supports up to MAX_CHAIN_DEPTH.
     max_depth    = _PTR_DEPTH_DEFAULT
     cancel_event = threading.Event()
     progress     = {"done": 0, "total": max_depth, "results": None, "error": None}
@@ -7550,12 +9996,14 @@ def do_pointer_scan(stdscr, target_addr: Optional[int] = None) -> None:
         return
 
     candidates = progress["results"] or []
+    for candidate in candidates:
+        candidate["status"] = "provisional"
     if not candidates:
         message_box(stdscr,
             ["No pointer candidates found.",
              "",
              "Tips:",
-             "  • Try a deeper scan depth (3 or 4).",
+             "  • Use Resolve permanent for the exhaustive fallback.",
              "  • Make sure the game is running and the value",
              "    is still at the address you selected.",
              "  • Run a fresh First Scan → Next Scan to confirm",
@@ -7620,7 +10068,7 @@ def do_pointer_scan(stdscr, target_addr: Optional[int] = None) -> None:
                     "✓ These chains currently point to your target address.",
                     color(C_OK) | curses.A_BOLD)
                 safe_addstr(stdscr, 3, 3,
-                    "Select one and press Enter to save it as a permanent cheat.",
+                    "Same-session diagnostic only; Enter inspects the chain.",
                     color(C_NORM))
             else:
                 safe_addstr(stdscr, 2, 3,
@@ -7724,6 +10172,7 @@ def do_pointer_chain_verify(stdscr, candidate: dict, original_target: int) -> No
 
     base    = candidate["base"]
     terminal_offset = int(candidate.get("terminal_offset", 0))
+    chain_edited = False
     # Use a one-element list so closures always see the current offsets list
     # even after reassignment in the E branch (closures capture the cell, not
     # the value; a mutable container avoids the stale-reference problem).
@@ -7734,7 +10183,7 @@ def do_pointer_chain_verify(stdscr, candidate: dict, original_target: int) -> No
         f"Base address : {hex(base)}  [{region}]", color(C_OK) | curses.A_BOLD)
     if terminal_offset:
         safe_addstr(stdscr, 3, 3,
-                    f"Terminal field offset: +{hex(terminal_offset)}", color(C_ACC))
+                    f"Terminal field offset: {terminal_offset:+#x}", color(C_ACC))
 
     def _test_chain():
         """Resolve chain and return (ok, final_addr, steps)."""
@@ -7749,7 +10198,7 @@ def do_pointer_chain_verify(stdscr, candidate: dict, original_target: int) -> No
             f"[base]  {hex(base)}", color(C_OK))
         row += 1
         for i, off in enumerate(_offsets[0]):
-            label = f"[+{i+1}]  +{hex(off)}"
+            label = f"[{i+1}]  {int(off):+#x}"
             safe_addstr(stdscr, row, 5, label, color(C_WARN))
             row += 1
         return row
@@ -7770,11 +10219,15 @@ def do_pointer_chain_verify(stdscr, candidate: dict, original_target: int) -> No
         ok, final_addr, steps = _test_chain()
         status_row = chain_end_row + 1
         if ok:
-            match = (final_addr == original_target)
+            target_known = _ADDR_MIN <= int(original_target) <= _ADDR_MAX
+            match = (not target_known or final_addr == original_target)
             status_color = C_OK if match else C_WARN
+            match_text = ("✓ MATCHES target" if target_known and match else
+                          "target not supplied" if not target_known else
+                          "✗ differs from original target")
             safe_addstr(stdscr, status_row, 3,
                 f"→ Resolves to: {hex(final_addr)}"
-                f"  {'✓ MATCHES target' if match else '✗ differs from original target'}",
+                f"  {match_text}",
                 color(status_color) | curses.A_BOLD)
             if steps:
                 safe_addstr(stdscr, status_row + 1, 5,
@@ -7821,7 +10274,12 @@ def do_pointer_chain_verify(stdscr, candidate: dict, original_target: int) -> No
             row = 6
             for i in range(MAX_CHAIN_DEPTH):
                 cur = hex(offsets[i]) if i < len(offsets) else ""
-                val_s = input_box(stdscr, f"  Offset [{i+1}] : ", row + i, 3, 20, cur)
+                val_s = input_box(
+                    stdscr, f"  Offset [{i+1}] : ", row + i, 3, 20,
+                    cur, allow_cancel=True)
+                if val_s is None:
+                    new_offsets = []
+                    break
                 if not val_s:
                     break
                 try:
@@ -7831,6 +10289,7 @@ def do_pointer_chain_verify(stdscr, candidate: dict, original_target: int) -> No
                     break
             if new_offsets:
                 _offsets[0] = new_offsets   # update shared container; closures see it
+                chain_edited = True
 
         elif key in (ord('t'), ord('T')):
             # Re-test (loop redraws automatically)
@@ -7846,6 +10305,15 @@ def do_pointer_chain_verify(stdscr, candidate: dict, original_target: int) -> No
                      "Resolve permanent to perform cross-reload validation."],
                     "Reload Validation Required", C_WARN)
                 continue
+            save_ok, save_addr, _ = _test_chain()
+            target_known = _ADDR_MIN <= int(original_target) <= _ADDR_MAX
+            if not save_ok or (target_known and save_addr != int(original_target)):
+                message_box(
+                    stdscr,
+                    ["This chain is broken or no longer resolves to the target.",
+                     "Re-test it or return to Find Permanent Pointer."],
+                    "Cannot Save Chain", C_ERR)
+                continue
             offsets = _offsets[0]   # re-alias after any edits
             stdscr.clear()
             draw_border(stdscr, "SAVE POINTER CHEAT")
@@ -7854,22 +10322,51 @@ def do_pointer_chain_verify(stdscr, candidate: dict, original_target: int) -> No
                 color(C_OK))
             stdscr.refresh()
 
-            name  = input_box(stdscr, "Cheat name   : ", 4, 3, 40)
-            val_s = input_box(stdscr, "Lock-in value: ", 6, 3, 20)
-            _wl   = [WIDTH_LABEL[ww] for ww in VALID_WIDTHS]
-            _ws   = cycle_input(stdscr, "Width        : ", 8, 3, _wl,
-                                WIDTH_LABEL.get(state["scan_width"], "uint32"))
-            width = VALID_WIDTHS[_wl.index(_ws)]
+            name = input_box(
+                stdscr, "Cheat name   : ", 4, 3, 40,
+                allow_cancel=True, cancel_with_q=False)
+            if name is None:
+                add_log("Save pointer cheat cancelled")
+                continue
+            type_labels = [VALUE_TYPES[key]["label"]
+                           for key in VALUE_TYPE_ORDER]
+            type_label = cycle_input(
+                stdscr, "Value type   : ", 6, 3, type_labels,
+                VALUE_TYPES[_current_scan_type()]["label"],
+                allow_cancel=True)
+            if type_label is None:
+                add_log("Save pointer cheat cancelled")
+                continue
+            value_type = VALUE_TYPE_ORDER[type_labels.index(type_label)]
+            val_s = input_box(stdscr, "Lock-in value: ", 8, 3, 38,
+                              allow_cancel=True)
+            if val_s is None:
+                add_log("Save pointer cheat cancelled")
+                continue
             typ   = cycle_input(stdscr, "Type         : ", 10, 3,
                                 ["pointer_freeze", "pointer_write"],
-                                "pointer_freeze")
+                                "pointer_freeze", allow_cancel=True)
+            if typ is None:
+                add_log("Save pointer cheat cancelled")
+                continue
             try:
-                val = int(val_s, 0)
-                if val < 0 or val > WIDTH_MAX[width]:
-                    raise ValueError(f"out of range for {WIDTH_LABEL[width]}")
+                val = _parse_value_text(val_s, value_type)
+                width = (len(bytes.fromhex(val)) if value_type == "bytes"
+                         else _value_width(value_type))
             except ValueError as exc:
                 message_box(stdscr, [f"Invalid value: {exc}"], "Error", C_ERR)
                 continue
+
+            original_value = None
+            try:
+                original_raw = ps5_read(
+                    state["ip"], state["pid"], save_addr, width)
+                if len(original_raw) == width:
+                    original_value = _unpack_typed_value(
+                        original_raw, value_type, width)
+            except Exception as exc:
+                add_log(f"Could not capture pointer cheat off-value: {exc}",
+                        "warn")
 
             entry = {
                 "name":    name or f"PTR@{hex(base)}",
@@ -7878,10 +10375,19 @@ def do_pointer_chain_verify(stdscr, candidate: dict, original_target: int) -> No
                 "offsets": list(offsets),
                 **({"terminal_offset": terminal_offset} if terminal_offset else {}),
                 "value":   val,
+                "value_type": value_type,
                 "width":   width,
+                **({"original_value": original_value}
+                   if original_value is not None else {}),
                 "pid":     state["pid"],
                 "process": state["proc_name"],
                 "session": state["session"],
+                "cross_reload_validated": bool(
+                    candidate.get("status") == "permanent"
+                    and not chain_edited
+                    and candidate.get("module_name")
+                    and candidate.get("module_relative_offset") is not None),
+                "game_identity": str(candidate.get("observed_game", "") or ""),
                 # Smart resolver metadata: survives ASLR/module relocation.
                 **({"module_name": candidate["module_name"],
                     "module_relative_offset": int(candidate["module_relative_offset"])}
@@ -7892,14 +10398,31 @@ def do_pointer_chain_verify(stdscr, candidate: dict, original_target: int) -> No
             state["cheats"].append(entry)
             add_log(f"Added pointer cheat '{entry['name']}' "
                     f"base={hex(base)} offsets={[hex(o) for o in offsets]} val={val}")
+            if entry["cross_reload_validated"]:
+                try:
+                    current_maps = _get_maps_cached(state["ip"], state["pid"])
+                    _clear_pointer_project(state.get("proc_name", ""),
+                                           current_maps)
+                    state["pointer_project_summary"] = (
+                        _pointer_project_summary(
+                            state.get("proc_name", ""), current_maps))
+                except Exception as exc:
+                    add_log(f"Could not clear completed pointer project: {exc}",
+                            "warn")
+                lifecycle = [
+                    "Cross-reload validation retained.",
+                    "RDX will rebase the module and resolve it after reconnects.",
+                ]
+            else:
+                lifecycle = [
+                    "Saved for this connection session only.",
+                    "Use Find Permanent Pointer to validate it across reloads.",
+                ]
             message_box(stdscr,
                 [f"  {entry['name']}",
                  f"  base={hex(base)}",
                  f"  offsets=[{'+'.join(hex(o) for o in offsets)}]",
-                 f"  value={val}  [{typ}]",
-                 "",
-                 "This cheat resolves the chain at apply-time,",
-                 "so it works even after the game restarts."],
+                 f"  value={val}  [{typ}]", ""] + lifecycle,
                 "Pointer Cheat Saved", C_OK)
             break
 
@@ -7917,7 +10440,7 @@ def do_clear_results(stdscr) -> None:
             f"Clear {n:,} scan results and {len(state['scan_history'])} "
             f"undo levels ({hist_mb:.1f} MB)?",
             "Clear Results"):
-        _clear_scan_state()
+        _clear_scan_state(stop_freezes=False)
         add_log(f"Scan results cleared — RSS now {_rss_mb():.0f} MB", "warn")
         message_box(stdscr, ["Results cleared.", "Ready for a fresh First Scan (S)."],
                     "Cleared", C_OK)
@@ -8013,8 +10536,8 @@ def main(stdscr) -> None:
                 message_box(stdscr, [
                     f"Error: {exc}",
                     "",
-                    "Reminder: make sure the ps5debug payload is running",
-                    "on your console, then verify its IP address.",
+                    "Make sure ps5debug-NG or MemDBG is running on your console,",
+                    "then verify the console IP address.",
                 ], "Connection Error", C_ERR)
                 screen = "connect"
         else:
@@ -8029,4 +10552,4 @@ if __name__ == '__main__':
     finally:
         _stop_freeze_worker()
         _close_turbo_session()
-    print("\nps5cheats_tui exited.")
+    print("\nRDX CheatMaker exited.")

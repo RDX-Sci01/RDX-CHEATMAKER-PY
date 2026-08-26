@@ -48,7 +48,8 @@ try:
     _NUMBA_OK = True
 
     @nb.njit(parallel=True, cache=True, fastmath=True)
-    def _nb_relational_mask(cur_vals, prv_vals, mode_id: int, delta: int):
+    def _nb_relational_mask(cur_vals, prv_vals, mode_id: int, delta: int,
+                            width_mask: int):
         """
         Compute a boolean mask for the relational filter in parallel.
 
@@ -57,8 +58,16 @@ try:
             1 = increased       cur > prv
             2 = changed         cur != prv
             3 = unchanged       cur == prv
-            4 = decreased by    cur == prv - delta
-            5 = increased by    cur == prv + delta
+            4 = decreased by    cur == (prv - delta) & width_mask
+            5 = increased by    cur == (prv + delta) & width_mask
+
+        cur_vals/prv_vals arrive zero-extended to uint64 from their native
+        scan width, so modes 0-3 compare correctly as-is. Modes 4-5 perform
+        real subtraction/addition, which must wrap at the value's own width
+        (e.g. a u8 counter) rather than at 64 bits, or a legitimate wrapped
+        match (say u8 3 "decreased by" 10 == 249) is silently missed —
+        width_mask (WIDTH_MAX[width]) reproduces the same wraparound the
+        pure-NumPy fallback applies.
 
         prange compiles to a parallel for-loop (OpenMP on Linux/macOS,
         TBB on Windows); all iterations are independent and GIL-free.
@@ -72,8 +81,8 @@ try:
             elif mode_id == 1: mask[i] = c > p
             elif mode_id == 2: mask[i] = c != p
             elif mode_id == 3: mask[i] = c == p
-            elif mode_id == 4: mask[i] = c == p - delta
-            else:              mask[i] = c == p + delta
+            elif mode_id == 4: mask[i] = c == ((p - delta) & width_mask)
+            else:              mask[i] = c == ((p + delta) & width_mask)
         return mask
 
     @nb.njit(parallel=True, cache=True, fastmath=True)
@@ -568,6 +577,39 @@ def _push_undo(removed_addrs: np.ndarray,
         evicted  = state["scan_history"].popleft()
         current_b -= _undo_entry_bytes(evicted)
     state["scan_history"].append(new_entry)
+
+
+def _apply_scan_undo() -> Optional[np.ndarray]:
+    """Pop and apply one undo delta from state["scan_history"].
+
+    Reconstructs the previous, sorted/deduplicated candidate set (and, for an
+    unknown-value session, the previous value array) via union1d + searchsorted
+    scatter. Also discards any resident TurboScan session: COUNT narrows the
+    server's candidate list in place with no rewind operation, so a stale
+    session would let the next Next Scan silently rescan the pre-undo
+    server-side list instead of the client-reconstructed one. Returns the new
+    scan_results, or None if there was no history to undo.
+    """
+    if not state["scan_history"]:
+        return None
+    removed_a, removed_v, prev_dropped, prev_truncated = (
+        state["scan_history"].pop())
+    cur_addrs = state["scan_results"]
+    prev_addrs = np.union1d(cur_addrs, removed_a)
+    if removed_v is not None and state.get("scan_values") is not None:
+        cur_v = state["scan_values"]
+        dtype = np.dtype(VALUE_TYPES[_current_scan_type()]["dtype"])
+        prev_vals = np.zeros(len(prev_addrs), dtype=dtype)
+        prev_vals[np.searchsorted(prev_addrs, cur_addrs)] = cur_v
+        prev_vals[np.searchsorted(prev_addrs, removed_a)] = removed_v
+    else:
+        prev_vals = state.get("scan_values")
+    state["scan_results"] = prev_addrs
+    state["scan_values"] = prev_vals
+    state["scan_dropped"] = prev_dropped
+    state["scan_truncated"] = prev_truncated
+    _close_turbo_session()
+    return prev_addrs
 
 # ── shared state & locks ──────────────────────────────────────────────────────
 _log_lock       = threading.Lock()
@@ -1161,7 +1203,25 @@ class _MemDBGClient:
 
     def pointer_holders(self, pid: int, target: int, regions: list,
                         max_results: int = 50000) -> list:
-        """Return native one-hop exact holders, explicitly not full chains."""
+        """Return native one-hop exact holders, explicitly not full chains.
+
+        NEEDS HARDWARE VERIFICATION: the trailing `8` below is passed to
+        MemDBG's native SCAN_POINTER as an alignment/stride parameter, so
+        this native seed only reports 8-byte-aligned holders even though
+        RDX's own software scanner (_scan_pointer_hits) also checks 4-byte
+        alignment. This has no confirmed console behavior either way -- no
+        real MemDBG daemon has been available to test it -- so leave the
+        `8` alone until it can be checked live. It is very unlikely to cause
+        a missed pointer regardless: _resolve_permanent_candidates only
+        trusts this fast path when it returns a verified candidate, and
+        falls through to the alignment-complete pointer_chain_scan whenever
+        it returns nothing (see _fast_direct_pointer_hits). The only
+        theoretical gap is the rarer case where this narrower native scan
+        finds and verifies a *different* holder before the fuller scan ever
+        runs -- confirm on real hardware whether that ever produces a
+        different (not wrong, just less optimal) permanent-pointer choice
+        than the software path would have found on its own.
+        """
         caps = int((self.hello or {}).get("capabilities", 0))
         if not (caps & MEMDBG_CAP_SCAN_POINTER):
             return []
@@ -2370,70 +2430,57 @@ def ps5_read_batch(ip: str, pid: int, addrs: np.ndarray, width: int,
                     item = work_items[work_ptr[0]]
                     work_ptr[0] += 1
 
-                kind = item[0]
-                if kind == 'window':
-                    _, base_addr, span, cand_addrs = item
-                    try:
-                        window = sock.read(base_addr, span, cancel_event)
-                        if len(window) == span:
-                            # Vectorised decode: interpret entire window as packed
-                            # integers, then gather only the candidate offsets.
-                            # Replaces the Python for-loop (one struct.unpack per
-                            # candidate) with a single NumPy advanced-index gather.
-                            #
-                            # Old (Python loop over cand_addrs):
-                            #   for ca in cand_addrs:  # O(N) GIL-held iterations
-                            #       off = int(ca) - base_addr
-                            #       val = struct.unpack(fmt, window[off:off+w])[0]
-                            #
-                            # New: build byte indices for every candidate and
-                            # combine their little-endian bytes in NumPy.
-                            byte_offsets = cand_addrs.astype(np.int64) - base_addr
-                            # Decode at each candidate's exact byte offset.  In
-                            # unaligned scan sessions these offsets need not be
-                            # multiples of `width`, and the window length need
-                            # not be divisible by `width`.
-                            valid    = ((byte_offsets >= 0) &
-                                        (byte_offsets + width <= len(window)))
-                            v_off    = byte_offsets[valid].astype(np.intp)
-                            v_addrs  = cand_addrs[valid]
-                            # An overlapping typed view decodes values at every
-                            # possible byte offset without allocating a 2-D
-                            # byte-index matrix.
-                            all_vals = np.ndarray(
-                                shape=(len(window) - width + 1,),
-                                dtype=val_dtype, buffer=window, strides=(1,))
-                            v_vals = all_vals[v_off]
-                            # Write into local buffer in one slice assignment;
-                            # flush in chunks of LOCAL_BUF if needed.
-                            n_v = len(v_addrs)
-                            i   = 0
-                            while i < n_v:
-                                space = LOCAL_BUF - local_n
-                                take  = min(space, n_v - i)
-                                local_addrs[local_n:local_n + take] = v_addrs[i:i + take]
-                                local_vals [local_n:local_n + take] = v_vals [i:i + take]
-                                local_n += take
-                                i       += take
-                                if local_n == LOCAL_BUF:
-                                    _flush()
-                        n_done = len(cand_addrs)
-                    except Exception:
-                        n_done = len(cand_addrs)
-                else:
-                    # 'single' fallback — identical to old per-address read
-                    _, addr, _w, _ = item
-                    n_done = 1
-                    try:
-                        data = sock.read(addr, _w, cancel_event)
-                        if len(data) == _w:
-                            local_addrs[local_n] = addr
-                            local_vals [local_n] = struct.unpack(fmt, data)[0]
-                            local_n += 1
+                # Every work item is built as a coalesced ('window', ...)
+                # group above (a lone isolated address is simply a window of
+                # one candidate), so there is only ever this one kind here.
+                _, base_addr, span, cand_addrs = item
+                try:
+                    window = sock.read(base_addr, span, cancel_event)
+                    if len(window) == span:
+                        # Vectorised decode: interpret entire window as packed
+                        # integers, then gather only the candidate offsets.
+                        # Replaces the Python for-loop (one struct.unpack per
+                        # candidate) with a single NumPy advanced-index gather.
+                        #
+                        # Old (Python loop over cand_addrs):
+                        #   for ca in cand_addrs:  # O(N) GIL-held iterations
+                        #       off = int(ca) - base_addr
+                        #       val = struct.unpack(fmt, window[off:off+w])[0]
+                        #
+                        # New: build byte indices for every candidate and
+                        # combine their little-endian bytes in NumPy.
+                        byte_offsets = cand_addrs.astype(np.int64) - base_addr
+                        # Decode at each candidate's exact byte offset.  In
+                        # unaligned scan sessions these offsets need not be
+                        # multiples of `width`, and the window length need
+                        # not be divisible by `width`.
+                        valid    = ((byte_offsets >= 0) &
+                                    (byte_offsets + width <= len(window)))
+                        v_off    = byte_offsets[valid].astype(np.intp)
+                        v_addrs  = cand_addrs[valid]
+                        # An overlapping typed view decodes values at every
+                        # possible byte offset without allocating a 2-D
+                        # byte-index matrix.
+                        all_vals = np.ndarray(
+                            shape=(len(window) - width + 1,),
+                            dtype=val_dtype, buffer=window, strides=(1,))
+                        v_vals = all_vals[v_off]
+                        # Write into local buffer in one slice assignment;
+                        # flush in chunks of LOCAL_BUF if needed.
+                        n_v = len(v_addrs)
+                        i   = 0
+                        while i < n_v:
+                            space = LOCAL_BUF - local_n
+                            take  = min(space, n_v - i)
+                            local_addrs[local_n:local_n + take] = v_addrs[i:i + take]
+                            local_vals [local_n:local_n + take] = v_vals [i:i + take]
+                            local_n += take
+                            i       += take
                             if local_n == LOCAL_BUF:
                                 _flush()
-                    except Exception:
-                        pass
+                    n_done = len(cand_addrs)
+                except Exception:
+                    n_done = len(cand_addrs)
 
                 with ptr_lock:
                     done_ctr[0] += n_done
@@ -2829,10 +2876,9 @@ def scan_first(ip: str, pid: int, value, width: int = 4,
         raise ValueError(f"Console-only scanning does not support {type_key}; use Auto or Host")
 
     # ── build flat work list of (base_addr, size) chunks ─────────────────────
-    # Use region_size for small regions to avoid padding waste on tiny regions.
-    # Many PS5 mappings are 64KB-512KB; sending a 4MB request for 128KB wastes
-    # the connection slot without filling it.
-    MIN_CHUNK = 0x10000    # 64 KB minimum — avoid excessive small requests
+    # csz below already caps to the remaining region size, so small regions
+    # (many PS5 mappings are 64KB-512KB) naturally get a request sized to
+    # their own bytes instead of a padded, wasteful full CHUNK request.
     work: list = []
     for r in scannable:
         size = r['end'] - r['start']
@@ -3737,12 +3783,21 @@ def scan_next_relational(ip: str, pid: int, width: int,
         # OpenMP on Linux/macOS and TBB on Windows — all CPU cores, GIL-free.
         #
         # "decreased by" / "increased by" use uint64 arithmetic; cast both
-        # arrays so the Numba kernel works with a uniform dtype.
+        # arrays so the Numba kernel works with a uniform dtype. Pass the
+        # value's own width mask so the kernel wraps at the scanned width
+        # (e.g. 8 bits for u8) instead of at the full 64 bits it computes in.
+        # delta/width_mask must be np.uint64, not plain Python int: Numba
+        # infers a plain int as signed int64, and mixing that with a uint64
+        # array element in `p - delta` silently produces a signed result
+        # that only happens to survive a narrower mask by coincidence of
+        # two's-complement bit patterns — at width=8 (the full 64 bits, no
+        # narrowing) it does not, and the comparison against `cur` fails.
         keep = _nb_relational_mask(
             cur.astype(np.uint64),
             prv.astype(np.uint64),
             RELATIONAL_MODE_IDS[mode],
-            int(delta) & 0xFFFF_FFFF_FFFF_FFFF,
+            np.uint64(int(delta) & 0xFFFF_FFFF_FFFF_FFFF),
+            np.uint64(WIDTH_MAX[width]),
         ).astype(bool)
     else:
         # Phase 3 fallback: pure NumPy (always correct, single-threaded SIMD).
@@ -4134,6 +4189,38 @@ def _pointer_word_views(raw: bytes, start: int,
             yield holder_base, values
 
 
+def _scan_pointer_hits(raw: bytes, pos: int, holder_limit: int,
+                       starts: np.ndarray, ends: np.ndarray):
+    """Return (values, holders) for plausible pointer candidates in ``raw``.
+
+    Scans both alignment residues via ``_pointer_word_views`` and keeps only
+    values that are a plausible user-space address AND currently fall inside
+    a mapped region (``starts``/``ends``, from
+    ``_build_region_priority_intervals``). Shared by the in-memory and
+    disk-backed reverse pointer indexes so a scanning correction only needs
+    to land in one place.
+    """
+    values_parts, holders_parts = [], []
+    for holder_base, values in _pointer_word_views(
+            raw, pos, holder_limit=holder_limit):
+        plausible = (values >= _ADDR_MIN) & (values <= _ADDR_MAX)
+        map_idx = np.searchsorted(starts, values, side="right") - 1
+        map_idx_i = map_idx.astype(np.int64, copy=False)
+        valid = map_idx_i >= 0
+        if valid.any():
+            safe_idx = np.where(valid, map_idx_i, 0)
+            plausible &= valid & (values < ends[safe_idx])
+        hit_idx = np.flatnonzero(plausible)
+        if hit_idx.size:
+            values_parts.append(values[hit_idx].copy())
+            holders_parts.append(
+                np.uint64(holder_base) +
+                hit_idx.astype(np.uint64, copy=False) * np.uint64(8))
+    if not values_parts:
+        return np.empty(0, dtype=np.uint64), np.empty(0, dtype=np.uint64)
+    return np.concatenate(values_parts), np.concatenate(holders_parts)
+
+
 def _fast_direct_pointer_hits(ip: str, pid: int, target: int, maps: list,
                               cancel_event=None, max_hits: int = _PTR_FAST_DIRECT_HITS) -> list:
     """Cheap first pass: find direct target-near pointers without building the full index."""
@@ -4151,8 +4238,8 @@ def _fast_direct_pointer_hits(ip: str, pid: int, target: int, maps: list,
         client = _MemDBGClient(ip, timeout=10.0)
         try:
             client.connect()
+            region_starts, region_rows = _build_region_lookup(maps)
             for holder in client.pointer_holders(pid, target, readable, max_hits):
-                region_starts, region_rows = _build_region_lookup(maps)
                 region = _region_for_addr(holder, region_starts, region_rows)
                 if region is not None and _is_static_region(region):
                     hits.append((int(holder), 0, region))
@@ -4261,24 +4348,14 @@ class _ReversePointerIndex:
                         if progress_cb:
                             progress_cb(self.done_bytes, total)
                         continue
-                    for holder_base, a in _pointer_word_views(
-                            raw, pos, holder_limit=pos + size):
-                        # A pointer candidate must be a user-space address that
-                        # currently falls inside a mapped region.  This removes
-                        # ordinary integers while retaining heap/module pointers.
-                        plausible = (a >= _ADDR_MIN) & (a <= _ADDR_MAX)
-                        idx = np.searchsorted(starts, a, side="right") - 1
-                        idx_i = idx.astype(np.int64, copy=False)
-                        valid_idx = (idx_i >= 0)
-                        if valid_idx.any():
-                            ii = np.where(valid_idx, idx_i, 0)
-                            plausible &= valid_idx & (a < ends[ii])
-                        hit_idx = np.flatnonzero(plausible)
-                        if hit_idx.size:
-                            vals_parts.append(a[hit_idx].copy())
-                            holder_parts.append(
-                                np.uint64(holder_base) +
-                                hit_idx.astype(np.uint64, copy=False) * np.uint64(8))
+                    # A pointer candidate must be a user-space address that
+                    # currently falls inside a mapped region.  This removes
+                    # ordinary integers while retaining heap/module pointers.
+                    values_hit, holders_hit = _scan_pointer_hits(
+                        raw, pos, pos + size, starts, ends)
+                    if values_hit.size:
+                        vals_parts.append(values_hit)
+                        holder_parts.append(holders_hit)
                     self.done_bytes += size
                     pos += size
                     if progress_cb:
@@ -4369,7 +4446,8 @@ class _ReversePointerIndex:
 class _DiskReversePointerIndex:
     """Shard-backed reverse index for processes too large to retain in RAM.
 
-    Each shard is independently sorted and stored as two ``.npy`` arrays.
+    Each shard is independently sorted and stored as three ``.npy`` arrays
+    (values, holders, and each holder's precomputed region priority).
     Queries binary-search every memory-mapped value shard and globally rank the
     small union of hits.  Peak construction memory is bounded by one shard.
     """
@@ -4401,7 +4479,7 @@ class _DiskReversePointerIndex:
 
     def _build(self, cancel_event=None, progress_cb=None):
         readable = _coalesce_pointer_regions(_pointer_readable_regions(self.maps))
-        starts, ends, _interval_priority = _build_region_priority_intervals(
+        starts, ends, interval_priority = _build_region_priority_intervals(
             self.maps)
         if starts.size == 0:
             return
@@ -4417,7 +4495,11 @@ class _DiskReversePointerIndex:
                 size -= size % 8
                 if size < 8:
                     break
-                tasks.put((shard_no, pos, size))
+                # Request a small transport overlap so a 4-byte-aligned
+                # pointer holder straddling this shard's logical boundary is
+                # still read once, matching the in-memory reverse index.
+                read_size = min(size + _PTR_STRUCT_STEP, region_end - pos)
+                tasks.put((shard_no, pos, size, read_size))
                 shard_no += 1
                 pos += size
 
@@ -4447,45 +4529,50 @@ class _DiskReversePointerIndex:
                     try:
                         if task is None:
                             return
-                        number, pos, size = task
+                        number, pos, size, read_size = task
                         if cancel_event and cancel_event.is_set():
                             continue
-                        raw = sock.read(pos, size, cancel_event)
-                        trim = len(raw) - (len(raw) % 8)
+                        raw = sock.read(pos, read_size, cancel_event)
                         paths = []
-                        if trim >= 8:
-                            values = np.frombuffer(raw[:trim], dtype=np.uint64)
-                            plausible = (values >= _ADDR_MIN) & (values <= _ADDR_MAX)
-                            map_idx = np.searchsorted(starts, values, side="right") - 1
-                            map_idx_i = map_idx.astype(np.int64, copy=False)
-                            valid = map_idx_i >= 0
-                            if valid.any():
-                                safe_idx = np.where(valid, map_idx_i, 0)
-                                plausible &= valid & (values < ends[safe_idx])
-                            hit_idx = np.flatnonzero(plausible)
-                            if hit_idx.size:
-                                kept_values = values[hit_idx].copy()
-                                kept_holders = (np.uint64(pos) +
-                                    hit_idx.astype(np.uint64, copy=False) * np.uint64(8))
-                                # Partition by the pointer's upper 32 bits.  A
-                                # graph query then opens only the address family
-                                # containing its target instead of every shard.
-                                prefixes = kept_values >> np.uint64(32)
-                                for prefix in np.unique(prefixes).tolist():
-                                    group = prefixes == np.uint64(prefix)
-                                    group_values = kept_values[group]
-                                    group_holders = kept_holders[group]
-                                    order = np.argsort(group_values, kind="mergesort")
-                                    value_path = self._tmpdir / (
-                                        f"v{number:05d}_{int(prefix):08x}.npy")
-                                    holder_path = self._tmpdir / (
-                                        f"h{number:05d}_{int(prefix):08x}.npy")
-                                    np.save(value_path, group_values[order],
-                                            allow_pickle=False)
-                                    np.save(holder_path, group_holders[order],
-                                            allow_pickle=False)
-                                    paths.append((int(prefix), value_path,
-                                                  holder_path))
+                        kept_values, kept_holders = _scan_pointer_hits(
+                            raw, pos, pos + size, starts, ends)
+                        if kept_values.size:
+                            # Rank holders by their own region quality once,
+                            # at build time, so a query never needs to look
+                            # this up again per candidate.
+                            holder_map = np.searchsorted(
+                                starts, kept_holders, side="right") - 1
+                            holder_map_i = holder_map.astype(np.int64, copy=False)
+                            holder_valid = holder_map_i >= 0
+                            kept_priority = np.zeros(kept_holders.shape, dtype=np.uint8)
+                            if holder_valid.any():
+                                vi = np.where(holder_valid, holder_map_i, 0)
+                                inside = holder_valid & (kept_holders < ends[vi])
+                                kept_priority[inside] = interval_priority[vi[inside]]
+                            # Partition by the pointer's upper 32 bits.  A
+                            # graph query then opens only the address family
+                            # containing its target instead of every shard.
+                            prefixes = kept_values >> np.uint64(32)
+                            for prefix in np.unique(prefixes).tolist():
+                                group = prefixes == np.uint64(prefix)
+                                group_values = kept_values[group]
+                                group_holders = kept_holders[group]
+                                group_priority = kept_priority[group]
+                                order = np.argsort(group_values, kind="mergesort")
+                                value_path = self._tmpdir / (
+                                    f"v{number:05d}_{int(prefix):08x}.npy")
+                                holder_path = self._tmpdir / (
+                                    f"h{number:05d}_{int(prefix):08x}.npy")
+                                priority_path = self._tmpdir / (
+                                    f"p{number:05d}_{int(prefix):08x}.npy")
+                                np.save(value_path, group_values[order],
+                                        allow_pickle=False)
+                                np.save(holder_path, group_holders[order],
+                                        allow_pickle=False)
+                                np.save(priority_path, group_priority[order],
+                                        allow_pickle=False)
+                                paths.append((int(prefix), value_path,
+                                              holder_path, priority_path))
                         with result_lock:
                             if paths:
                                 self.shards.extend(paths)
@@ -4524,13 +4611,16 @@ class _DiskReversePointerIndex:
     def query(self, target: int, max_offset: int = _PTR_RESOLVE_OFFSET_MAX,
               step: int = _PTR_RESOLVE_OFFSET_STEP,
               max_hits: int = _PTR_RESOLVE_MAX_HITS) -> list:
+        # Holder region priority is precomputed once per shard at build time
+        # (see _build), so a query never has to rebuild the region lookup or
+        # re-resolve each candidate's owning region.
         target = int(target)
+        step = max(1, int(step))
         low = max(_ADDR_MIN, target - max(0, int(max_offset)))
         high = min(_ADDR_MAX, target + max(0, int(max_offset)))
         candidates = []
-        region_starts, region_rows = _build_region_lookup(self.maps)
         wanted_prefixes = set(range(low >> 32, (high >> 32) + 1))
-        for prefix, value_path, holder_path in self.shards:
+        for prefix, value_path, holder_path, priority_path in self.shards:
             if prefix not in wanted_prefixes:
                 continue
             values = np.load(value_path, mmap_mode="r", allow_pickle=False)
@@ -4539,26 +4629,26 @@ class _DiskReversePointerIndex:
             if hi <= lo:
                 continue
             holders = np.load(holder_path, mmap_mode="r", allow_pickle=False)
-            local = []
-            for value, holder in zip(values[lo:hi].tolist(), holders[lo:hi].tolist()):
-                delta = target - int(value)
-                if abs(delta) <= max_offset and delta % max(1, int(step)) == 0:
-                    local.append((int(holder), delta))
+            priorities = np.load(priority_path, mmap_mode="r", allow_pickle=False)
+            seg_values = values[lo:hi].astype(np.int64, copy=False)
+            seg_holders = holders[lo:hi]
+            seg_priorities = priorities[lo:hi]
+            deltas = np.int64(target) - seg_values
+            mask = (np.abs(deltas) <= max_offset) & (deltas % step == 0)
+            idxs = np.flatnonzero(mask)
+            local = [(int(seg_priorities[i]), int(seg_holders[i]), int(deltas[i]))
+                     for i in idxs.tolist()]
             if len(local) > max_hits:
-                local.sort(key=lambda item: (
-                    -_region_priority(_region_for_addr(
-                        item[0], region_starts, region_rows) or {}),
-                    abs(item[1]), item[1] < 0, item[0]))
+                local.sort(key=lambda item: (-item[0], abs(item[2]), item[2] < 0, item[1]))
                 del local[max_hits:]
             candidates.extend(local)
-        candidates.sort(key=lambda item: (
-            -_region_priority(_region_for_addr(item[0], region_starts, region_rows) or {}),
-            abs(item[1]), item[1] < 0, item[0]))
+        candidates.sort(key=lambda item: (-item[0], abs(item[2]), item[2] < 0, item[1]))
         out, seen = [], set()
-        for item in candidates:
-            if item not in seen:
-                seen.add(item)
-                out.append(item)
+        for _priority, holder, delta in candidates:
+            key = (holder, delta)
+            if key not in seen:
+                seen.add(key)
+                out.append(key)
                 if len(out) >= max(1, int(max_hits)):
                     break
         return out
@@ -5430,13 +5520,19 @@ def _validate_addr_in_maps(ip: str, pid: int, addr: int, length: int,
         # Fail-CLOSED: surface the error so the caller can confirm explicitly.
         return f"Could not fetch memory map to validate address: {exc}"
     PROT_WRITE = 0x2
-    for r in maps:
-        if r['start'] <= addr and addr + length <= r['end']:
-            if r['prot'] & PROT_WRITE:
-                return None   # in a writable region — OK
-            return (f"Address {hex(addr)} is mapped but not writable "
-                    f"(prot={hex(r['prot'])}).")
-    return f"Address {hex(addr)} is not in any mapped region of PID {pid}."
+    # PS5 map enumeration can report a large reservation alongside smaller
+    # overlapping augmented rows (see _build_region_lookup's docstring for the
+    # same hazard). Trusting whichever covering row happens to appear first
+    # lets a non-writable overlay stub falsely block a write into a mapping
+    # that is legitimately writable underneath it.
+    covering = [r for r in maps if r['start'] <= addr and addr + length <= r['end']]
+    if not covering:
+        return f"Address {hex(addr)} is not in any mapped region of PID {pid}."
+    for r in covering:
+        if r['prot'] & PROT_WRITE:
+            return None   # some covering region grants write access — OK
+    return (f"Address {hex(addr)} is mapped but not writable "
+            f"(prot={hex(covering[0]['prot'])}).")
 
 
 def sanitize_filename(name: str) -> str:
@@ -7129,7 +7225,10 @@ def do_scan_next(stdscr) -> None:
         state["scan_results"] = results
         state["scan_values"] = None
         state["scan_pattern"] = canonical
-        state["scan_dropped"] &= set(results.tolist())
+        # A dropped address is removed from scan_results at drop time, so it
+        # can never reappear in a later Next Scan's (necessarily narrower)
+        # output -- there is nothing left worth carrying forward.
+        state["scan_dropped"] = set()
         add_log(f"AOB next scan: {len(results):,} candidates remain")
         do_show_results(stdscr)
 
@@ -7221,7 +7320,10 @@ def do_scan_next(stdscr) -> None:
 
         state["scan_results"] = new_addrs
         state["scan_values"]  = new_values
-        state["scan_dropped"] = state["scan_dropped"] & set(new_addrs.tolist())
+        # A dropped address is removed from scan_results at drop time, so it
+        # can never reappear in a later Next Scan's (necessarily narrower)
+        # output -- there is nothing left worth carrying forward.
+        state["scan_dropped"] = set()
 
         hist_mb = _history_bytes() / 1_048_576
         add_log(f"Relational next scan ({mode_lbl}): {len(new_addrs):,} remain, "
@@ -7292,7 +7394,10 @@ def do_scan_next(stdscr) -> None:
 
         state["scan_results"] = results
         state["scan_values"]  = None
-        state["scan_dropped"] = state["scan_dropped"] & set(results.tolist())
+        # A dropped address is removed from scan_results at drop time, so it
+        # can never reappear in a later Next Scan's (necessarily narrower)
+        # output -- there is nothing left worth carrying forward.
+        state["scan_dropped"] = set()
         state["scan_truncated"] = progress.get("truncated", False)
 
         hist_mb = _history_bytes() / 1_048_576
@@ -8174,24 +8279,9 @@ def do_show_results(stdscr) -> None:
                     stdscr.nodelay(True)
                     results = state["scan_results"]
                 if more_result == "undo":
-                    if state["scan_history"]:
-                        entry = state["scan_history"].pop()
-                        removed_a, removed_v, prev_dropped, prev_truncated = entry
-                        cur_addrs = state["scan_results"]
-                        prev_addrs = np.union1d(cur_addrs, removed_a)
-                        if removed_v is not None and state.get("scan_values") is not None:
-                            cur_v = state["scan_values"]
-                            dtype = np.dtype(
-                                VALUE_TYPES[_current_scan_type()]["dtype"])
-                            prev_vals = np.zeros(len(prev_addrs), dtype=dtype)
-                            prev_vals[np.searchsorted(prev_addrs, cur_addrs)] = cur_v
-                            prev_vals[np.searchsorted(prev_addrs, removed_a)] = removed_v
-                        else:
-                            prev_vals = state.get("scan_values")
-                        state["scan_results"] = prev_addrs
-                        state["scan_values"] = prev_vals
-                        state["scan_dropped"] = prev_dropped
-                        state["scan_truncated"] = prev_truncated
+                    if _apply_scan_undo() is not None:
+                        with cache_lock:
+                            val_cache.clear()
                         results = state["scan_results"]
                         sel = min(sel, max(0, len(results) - 1))
                         offset = min(offset, max(0, len(results) - 1))
@@ -8225,40 +8315,7 @@ def do_show_results(stdscr) -> None:
                     break
                 sel = min(sel, len(results) - 1)
             elif key in (ord('u'), ord('U')):
-                if state["scan_history"]:
-                    entry        = state["scan_history"].pop()
-                    removed_a    = entry[0]   # ndarray[uint64]
-                    removed_v    = entry[1]   # ndarray|None
-                    prev_dropped = entry[2]
-                    prev_truncated = entry[3]
-                    # Reconstruct prev = sorted union(current, removed)
-                    cur_addrs  = state["scan_results"]
-                    prev_addrs = np.union1d(cur_addrs, removed_a)  # sorted, unique
-                    # Reconstruct values for unknown-value sessions
-                    if removed_v is not None and state.get("scan_values") is not None:
-                        cur_v   = state["scan_values"]
-                        width_w = state["scan_width"]
-                        dtype = np.dtype(
-                            VALUE_TYPES[_current_scan_type()]["dtype"])
-                        # Build merged value map via searchsorted (no dict)
-                        prev_vals = np.zeros(len(prev_addrs), dtype=dtype)
-                        # Fill from current
-                        idx_cur = np.searchsorted(prev_addrs, cur_addrs)
-                        prev_vals[idx_cur] = cur_v
-                        # Fill from removed (overwrites only the new slots)
-                        idx_rem = np.searchsorted(prev_addrs, removed_a)
-                        prev_vals[idx_rem] = removed_v
-                        prev_values_out = prev_vals
-                    else:
-                        prev_values_out = state.get("scan_values")
-                    state["scan_results"] = prev_addrs
-                    state["scan_values"]  = prev_values_out
-                    state["scan_dropped"] = prev_dropped
-                    state["scan_truncated"] = prev_truncated
-                    # COUNT narrows the server list in place and has no rewind
-                    # operation.  Discard it after UI undo; the next scan will
-                    # safely refine the reconstructed client-side candidates.
-                    _close_turbo_session()
+                if _apply_scan_undo() is not None:
                     results = state["scan_results"]
                     with cache_lock:
                         val_cache.clear()

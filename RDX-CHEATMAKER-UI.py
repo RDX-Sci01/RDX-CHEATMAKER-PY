@@ -236,6 +236,10 @@ CMD_TURBO_COUNT = 0xBDAACC12
 CMD_TURBO_GET   = 0xBDAACC13
 CMD_TURBO_END   = 0xBDAACC14
 CMD_REGION_CLASSIFY = 0xBDAACC16
+CMD_PROC_WRITE_MULTI = 0xBDAACC04
+PROC_WRITE_MULTI_F_STATUS = 0x1
+PROC_WRITE_MULTI_MAX_COUNT = 0xFFFF
+PROC_WRITE_MULTI_MAX_LEN   = 0x100000
 PROC_AUTH_MAGIC = 0xBB40E64D
 # STATUS_SUCCESS / STATUS_ERROR: bit-swapped wire values produced by the server's
 # net_send_int32() helper.  Clients compare raw wire bytes directly.
@@ -813,6 +817,10 @@ def _freeze_manager_worker() -> None:
                 # thread as alive and therefore does not start a replacement.
                 _freeze_stop.wait(0.5)
                 continue
+            # Phase 1: resolve each target's live address + value. This is
+            # inherently per-cheat (a pointer chain dereferences one hop at
+            # a time), so it cannot be batched — only the final writes can.
+            resolved = []   # [(runtime_id, address, data)]
             for runtime_id, cheat in targets:
                 if _freeze_stop.is_set():
                     break
@@ -823,17 +831,48 @@ def _freeze_manager_worker() -> None:
                         state["ip"], state["pid"], address, width, 10.0)
                     if error:
                         raise ValueError(error)
-                    if not ps5_write(
-                            state["ip"], state["pid"], address,
-                            _cheat_value_bytes(cheat),
-                            cancel_event=_freeze_stop, timeout=1.0):
-                        raise IOError("payload rejected the write")
-                    with _freeze_lock:
-                        _freeze_status[runtime_id] = (
-                            f"active @ {hex(address)}")
+                    resolved.append(
+                        (runtime_id, address, _cheat_value_bytes(cheat)))
                 except Exception as exc:
                     with _freeze_lock:
                         _freeze_status[runtime_id] = f"error: {exc}"
+
+            # Phase 2: collapse every resolved write into one round trip via
+            # 0xBDAACC04 (bulk write) instead of one CMD_PROC_WRITE per
+            # cheat. Falls back to the plain per-write path for a single
+            # entry (no batching benefit) or when MemDBG's native write path
+            # is active (bulk write is a ps5debug-wire-protocol command;
+            # native MemDBG writes already go through their own
+            # capability-gated path inside ps5_write).
+            if len(resolved) >= 2 and not _memdbg_has(MEMDBG_CAP_MEMORY_WRITE):
+                try:
+                    results = ps5_write_multi(
+                        state["ip"], state["pid"],
+                        [(addr, data) for _rid, addr, data in resolved],
+                        cancel_event=_freeze_stop, timeout=2.0)
+                except Exception as exc:
+                    results = [False] * len(resolved)
+                    add_log(f"Bulk freeze write failed: {exc}", "warn")
+                with _freeze_lock:
+                    for (runtime_id, address, _data), ok in zip(resolved, results):
+                        _freeze_status[runtime_id] = (
+                            f"active @ {hex(address)}" if ok
+                            else "error: payload rejected the write")
+            else:
+                for runtime_id, address, data in resolved:
+                    if _freeze_stop.is_set():
+                        break
+                    try:
+                        if not ps5_write(
+                                state["ip"], state["pid"], address, data,
+                                cancel_event=_freeze_stop, timeout=1.0):
+                            raise IOError("payload rejected the write")
+                        with _freeze_lock:
+                            _freeze_status[runtime_id] = f"active @ {hex(address)}"
+                    except Exception as exc:
+                        with _freeze_lock:
+                            _freeze_status[runtime_id] = f"error: {exc}"
+
             _freeze_stop.wait(0.2)
     finally:
         with _freeze_lock:
@@ -1903,6 +1942,67 @@ def ps5_write(ip: str, pid: int, addr: int, data: bytes,
                 try: s.close()
                 except Exception: pass
     return False
+
+
+def ps5_write_multi(ip: str, pid: int, entries: list,
+                    cancel_event: Optional[threading.Event] = None,
+                    timeout: float = 15.0) -> list:
+    """Bulk write via 0xBDAACC04 — collapses N single CMD_PROC_WRITEs (e.g.
+    one freeze tick over several cheats) into one exchange.
+
+    `entries` is [(address: int, data: bytes), ...]. Returns a list of bool
+    the same length as `entries` (True = that entry's write succeeded).
+    Server-side application is best-effort and non-atomic — one entry
+    failing does not stop the rest — so a per-entry status array is always
+    requested (PROC_WRITE_MULTI_F_STATUS) rather than only getting a single
+    all-or-nothing result.
+    """
+    if not entries:
+        return []
+    if len(entries) > PROC_WRITE_MULTI_MAX_COUNT:
+        raise ValueError(
+            f"too many entries for one bulk write "
+            f"({len(entries)} > {PROC_WRITE_MULTI_MAX_COUNT})")
+    for addr, data in entries:
+        if len(data) > PROC_WRITE_MULTI_MAX_LEN:
+            raise ValueError(
+                f"entry at {hex(addr)} is {len(data)} bytes, over the "
+                f"{PROC_WRITE_MULTI_MAX_LEN}-byte per-entry cap")
+
+    payload = bytearray()
+    for addr, data in entries:
+        payload += struct.pack("<QI", addr, len(data))
+        payload += data
+    body = struct.pack("<III", pid, len(entries), PROC_WRITE_MULTI_F_STATUS)
+
+    for attempt in range(_UI_MAX_RETRIES):
+        if cancel_event and cancel_event.is_set():
+            return [False] * len(entries)
+        s = None
+        try:
+            s = ps5_connect(ip, timeout=timeout)
+            s.sendall(cmd_header(CMD_PROC_WRITE_MULTI, len(body)) + body)
+            if not check_ok(s):
+                return [False] * len(entries)
+            s.sendall(bytes(payload))
+            status = recv_exact(s, len(entries))
+            if not check_ok(s):
+                return [False] * len(entries)
+            return [b == 0 for b in status]
+        except Exception:
+            if attempt < _UI_MAX_RETRIES - 1:
+                delay = 0.1 * (attempt + 1)
+                if cancel_event:
+                    if cancel_event.wait(delay):
+                        return [False] * len(entries)
+                else:
+                    time.sleep(delay)
+        finally:
+            if s:
+                try: s.close()
+                except Exception: pass
+    return [False] * len(entries)
+
 
 def ps5_write_verified(ip: str, pid: int, addr: int, data: bytes) -> tuple:
     """Write and immediately read back; returns (ack, verified, actual_bytes)."""

@@ -4,7 +4,7 @@
 RDX CheatMaker Final Release with Terminal UI
 
 Usage:
-    python3 RDX-CHEATMAKER-UI-final.py
+    python3 RDX-CHEATMAKER-UI.py
 """
 
 RDX_VERSION = "1.0.0"

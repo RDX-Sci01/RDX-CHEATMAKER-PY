@@ -4,12 +4,13 @@
 RDX CheatMaker Final Release with Terminal UI
 
 Usage:
-    python3 RDX-CHEATMAKER-UI.py
+    python3 RDX-CHEATMAKER-UI-final.py
 """
 
 RDX_VERSION = "1.0.0"
 
 import array as _array
+import base64
 import bisect
 import curses
 import gc
@@ -26,6 +27,7 @@ import threading
 import tempfile
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional   # keep 3.8/3.9 compatibility (no X|Y union syntax)
 
@@ -718,6 +720,25 @@ def _atomic_write_text(path: Path, text: str) -> None:
             pass
 
 
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write a binary/base64 export (e.g. .mc4) without a half-written file."""
+    dst = Path(path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=dst.name + ".", dir=str(dst.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, dst)
+    finally:
+        try:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        except OSError:
+            pass
+
+
 _preferences = _load_preferences()
 
 # Issues #7/#8/#9/#10: track the active freeze worker globally so it can be
@@ -907,6 +928,8 @@ state = {
     "scan_scope":         "recommended",
     "scan_engine": "auto",          # auto / turbo / console / host
     "cheats":       [],
+    "cheats_dirty": False,   # True after add/delete since the last export
+    "last_deleted_cheat": None,   # (cheat_dict, original_index) — single-slot undo
     "game_id":      "",
     "game_ver":     "01.00",
     "game_title":   "",
@@ -5875,6 +5898,12 @@ def _validate_pointer_provisionals(ip: str, pid: int, process: str,
     return {"survivors": survivors, "rejected": rejected}
 
 
+def _hex_or_none(value):
+    """hex(value), or None if value is missing — the common None-guard
+    used repeatedly when serialising optional numeric trainer fields."""
+    return hex(value) if value is not None else None
+
+
 def generate_cht(cheats: list, game_id: str, game_ver: str,
                  game_title: str, hex_values: bool = True,
                  process: str = "eboot.bin") -> str:
@@ -5891,6 +5920,9 @@ def generate_cht(cheats: list, game_id: str, game_ver: str,
     for c in cheats:
         type_key = _cheat_value_type(c)
         is_pointer = "offsets" in c and c.get("offsets") is not None
+        module_rel_hex = _hex_or_none(c.get("module_relative_offset"))
+        original_value_fmt = (fmt_val(c, c["original_value"])
+                              if c.get("original_value") is not None else None)
         if is_pointer:
             entry = {
                 "name":    c["name"],
@@ -5898,16 +5930,13 @@ def generate_cht(cheats: list, game_id: str, game_ver: str,
                 "base":    hex(c["base"]) if isinstance(c.get("base"), int) else c.get("base"),
                 "offsets": [hex(o) for o in c["offsets"]],
                 "module_name": c.get("module_name"),
-                "module_relative_offset": (
-                    hex(c["module_relative_offset"])
-                    if c.get("module_relative_offset") is not None else None),
+                "module_relative_offset": module_rel_hex,
                 "terminal_offset": (hex(int(c["terminal_offset"]))
                                      if c.get("terminal_offset") else None),
                 "value":   fmt_val(c, c["value"]),
                 "value_type": type_key,
                 "bytes":   c["width"],
-                "original_value": (fmt_val(c, c["original_value"])
-                                   if c.get("original_value") is not None else None),
+                "original_value": original_value_fmt,
                 "cross_reload_validated": bool(
                     c.get("cross_reload_validated", False)
                     and c.get("game_identity")),
@@ -5919,14 +5948,11 @@ def generate_cht(cheats: list, game_id: str, game_ver: str,
                 "type":    c["type"],
                 "address": hex(c["address"]),
                 "module_name": c.get("module_name"),
-                "module_relative_offset": (
-                    hex(c["module_relative_offset"])
-                    if c.get("module_relative_offset") is not None else None),
+                "module_relative_offset": module_rel_hex,
                 "value":   fmt_val(c, c["value"]),
                 "value_type": type_key,
                 "bytes":   c["width"],
-                "original_value": (fmt_val(c, c["original_value"])
-                                   if c.get("original_value") is not None else None),
+                "original_value": original_value_fmt,
                 "session_bound": not _is_module_relative_scalar(c),
                 "game_identity": str(c.get("game_identity", "") or ""),
             }
@@ -5962,6 +5988,80 @@ def _etahen_main_module(maps: list, process: str) -> tuple:
         return (min(int(r["start"]) for r in same),
                 {str(r.get("name", "") or "") for r in same})
     return (None, set())
+
+
+def _mods_to_import_entries(mods: list, source_path, module_base: int) -> list:
+    """Convert an eligible-mods list (an etaHEN/GoldHEN JSON 'mods' array, or
+    a decrypted .mc4's Cheat/Cheatline list via mc4_xml_to_mods()) into RDX's
+    internal flat-cheat dicts.
+
+    Neither format carries a value's semantic type (signed/float/etc.) — only
+    raw on/off byte patches — so entries import as raw-byte ("bytes") writes:
+    a faithful, lossless representation of exactly what will be written,
+    rather than guessing a numeric interpretation that could be wrong.
+    Addresses are resolved against `module_base`, the *currently attached*
+    process's live main-module base — never trusted from the file — so a
+    freshly imported entry is session-bound exactly like one built from a
+    fresh scan, and only becomes portable (module_relative + game_identity)
+    the same way any flat cheat does: via Export's own promotion logic.
+    """
+    entries = []
+    for mod in mods:
+        if not isinstance(mod, dict):
+            continue
+        name = str(mod.get("name") or "Unnamed cheat")
+        for mem in mod.get("memory", []):
+            if not isinstance(mem, dict):
+                continue
+            offset_hex = str(mem.get("offset", "")).strip()
+            on_hex = str(mem.get("on", "")).strip().replace("-", "")
+            off_hex = str(mem.get("off", "")).strip().replace("-", "")
+            if not (offset_hex and on_hex):
+                continue
+            try:
+                offset = int(offset_hex, 16)
+                on_bytes = bytes.fromhex(on_hex)
+            except ValueError:
+                continue
+            width = len(on_bytes)
+            if width == 0 or not (_ADDR_MIN <= module_base + offset <= _ADDR_MAX):
+                continue
+            entry = {
+                "name": name, "type": "write",
+                "address": module_base + offset,
+                "value": on_hex.upper(), "value_type": "bytes", "width": width,
+                "pid": state["pid"], "process": state["proc_name"],
+                "session": state["session"], "imported_from": str(source_path),
+            }
+            if off_hex:
+                try:
+                    off_bytes = bytes.fromhex(off_hex)
+                except ValueError:
+                    add_log(f"Import: '{name}' has an invalid off-value "
+                            "hex string — original value omitted.", "warn")
+                else:
+                    if len(off_bytes) == width:
+                        entry["original_value"] = off_hex.upper()
+                    else:
+                        add_log(
+                            f"Import: '{name}' off-value is "
+                            f"{len(off_bytes)} byte(s), on-value is "
+                            f"{width} — inconsistent widths, original "
+                            "value omitted.", "warn")
+            entries.append(entry)
+
+    # A single <Cheat> can carry several <Cheatline>s under one name (RDX's
+    # flat cheat model imports each as a separate entry), and a missing name
+    # always falls back to the same string — either way, make every name
+    # unique so cheat-list lookups that key by name (e.g. Freeze's cheat
+    # picker) can't silently resolve to the wrong entry.
+    seen = {}
+    for entry in entries:
+        base_name = entry["name"]
+        seen[base_name] = seen.get(base_name, 0) + 1
+        if seen[base_name] > 1:
+            entry["name"] = f"{base_name} ({seen[base_name]})"
+    return entries
 
 
 def _scalar_hex_bytes(value, width: int,
@@ -6043,6 +6143,250 @@ def generate_etahen_json(cheats: list, game_id: str, game_ver: str,
         "credits": [str(author or "RDX CheatMaker")],
     }
     return json.dumps(payload, indent=2, ensure_ascii=False), mods, skipped
+
+
+# ── .mc4 (CheatRunner) trainer export ────────────────────────────────────────
+#
+# .mc4 is base64(AES-256-CBC(PKCS7(xml))) of the classic PS3/PS4 "Cheat
+# Device" Trainer/Cheat/Cheatline XML schema.  Key/IV are constants fixed by
+# etaHEN/CheatRunner (vendored in CheatRunner's third_party/mc4, GPLv3) —
+# every consumer on a jailbroken console uses the same pair, so this is a
+# public container format, not a secret.  No third-party crypto package is
+# added for this (numpy is the project's only hard dependency, matching the
+# existing hand-rolled LZ4 decoder for MemDBG); this is a compact from-scratch
+# AES-256 block cipher, verified against the FIPS-197 AES-256 known-answer
+# test and against a real published .mc4 sample decrypting to valid XML.
+
+_MC4_AES256CBC_KEY = b"304c6528f659c766110239a51cl5dd9c"[:32]
+_MC4_AES256CBC_IV = b"u@}kzW2u[u(8DWar"
+
+_AES_SBOX = bytes((
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16))
+_AES_INV_SBOX = bytes(_AES_SBOX.index(i) for i in range(256))
+_AES_RCON = (0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36,0x6c,0xd8,0xab,0x4d)
+
+
+def _aes_mul(a: int, b: int) -> int:
+    """GF(2^8) multiply (AES's field, reduction poly 0x11b)."""
+    p = 0
+    for _ in range(8):
+        if b & 1:
+            p ^= a
+        hi = a & 0x80
+        a = (a << 1) & 0xff
+        if hi:
+            a ^= 0x1b
+        b >>= 1
+    return p
+
+
+def _aes_key_expansion(key: bytes):
+    nk = len(key) // 4
+    nr = nk + 6
+    w = [list(key[4 * i:4 * i + 4]) for i in range(nk)]
+    for i in range(nk, 4 * (nr + 1)):
+        temp = list(w[i - 1])
+        if i % nk == 0:
+            temp = temp[1:] + temp[:1]
+            temp = [_AES_SBOX[b] for b in temp]
+            temp[0] ^= _AES_RCON[i // nk - 1]
+        elif nk > 6 and i % nk == 4:
+            temp = [_AES_SBOX[b] for b in temp]
+        w.append([w[i - nk][j] ^ temp[j] for j in range(4)])
+    return w, nr
+
+
+def _aes_encrypt_block(block: bytes, w, nr: int) -> bytes:
+    state = [[block[r + 4 * c] for c in range(4)] for r in range(4)]
+
+    def add_round_key(rnd):
+        for c in range(4):
+            for r in range(4):
+                state[r][c] ^= w[rnd * 4 + c][r]
+
+    add_round_key(0)
+    for rnd in range(1, nr + 1):
+        for r in range(4):
+            for c in range(4):
+                state[r][c] = _AES_SBOX[state[r][c]]
+        for r in range(1, 4):
+            state[r] = state[r][r:] + state[r][:r]
+        if rnd != nr:
+            for c in range(4):
+                col = [state[r][c] for r in range(4)]
+                state[0][c] = _aes_mul(col[0], 2) ^ _aes_mul(col[1], 3) ^ col[2] ^ col[3]
+                state[1][c] = col[0] ^ _aes_mul(col[1], 2) ^ _aes_mul(col[2], 3) ^ col[3]
+                state[2][c] = col[0] ^ col[1] ^ _aes_mul(col[2], 2) ^ _aes_mul(col[3], 3)
+                state[3][c] = _aes_mul(col[0], 3) ^ col[1] ^ col[2] ^ _aes_mul(col[3], 2)
+        add_round_key(rnd)
+    return bytes(state[r][c] for c in range(4) for r in range(4))
+
+
+def _aes_decrypt_block(block: bytes, w, nr: int) -> bytes:
+    state = [[block[r + 4 * c] for c in range(4)] for r in range(4)]
+
+    def add_round_key(rnd):
+        for c in range(4):
+            for r in range(4):
+                state[r][c] ^= w[rnd * 4 + c][r]
+
+    add_round_key(nr)
+    for rnd in range(nr - 1, -1, -1):
+        for r in range(1, 4):
+            state[r] = state[r][-r:] + state[r][:-r]
+        for r in range(4):
+            for c in range(4):
+                state[r][c] = _AES_INV_SBOX[state[r][c]]
+        add_round_key(rnd)
+        if rnd != 0:
+            for c in range(4):
+                col = [state[r][c] for r in range(4)]
+                state[0][c] = (_aes_mul(col[0], 14) ^ _aes_mul(col[1], 11) ^
+                               _aes_mul(col[2], 13) ^ _aes_mul(col[3], 9))
+                state[1][c] = (_aes_mul(col[0], 9) ^ _aes_mul(col[1], 14) ^
+                               _aes_mul(col[2], 11) ^ _aes_mul(col[3], 13))
+                state[2][c] = (_aes_mul(col[0], 13) ^ _aes_mul(col[1], 9) ^
+                               _aes_mul(col[2], 14) ^ _aes_mul(col[3], 11))
+                state[3][c] = (_aes_mul(col[0], 11) ^ _aes_mul(col[1], 13) ^
+                               _aes_mul(col[2], 9) ^ _aes_mul(col[3], 14))
+    return bytes(state[r][c] for c in range(4) for r in range(4))
+
+
+def _aes256_cbc_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
+    w, nr = _aes_key_expansion(key)
+    pad = 16 - (len(plaintext) % 16)
+    data = plaintext + bytes([pad]) * pad
+    out = bytearray()
+    prev = iv
+    for i in range(0, len(data), 16):
+        block = bytes(a ^ b for a, b in zip(data[i:i + 16], prev))
+        enc = _aes_encrypt_block(block, w, nr)
+        out += enc
+        prev = enc
+    return bytes(out)
+
+
+def _aes256_cbc_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
+    w, nr = _aes_key_expansion(key)
+    out = bytearray()
+    prev = iv
+    for i in range(0, len(ciphertext), 16):
+        block = ciphertext[i:i + 16]
+        dec = _aes_decrypt_block(block, w, nr)
+        out += bytes(a ^ b for a, b in zip(dec, prev))
+        prev = block
+    if out:
+        pad = out[-1]
+        if 1 <= pad <= 16 and out[-pad:] == bytes([pad]) * pad:
+            out = out[:-pad]
+    return bytes(out)
+
+
+def _mc4_encrypt(xml: bytes) -> bytes:
+    cipher = _aes256_cbc_encrypt(_MC4_AES256CBC_KEY, _MC4_AES256CBC_IV, xml)
+    return base64.b64encode(cipher)
+
+
+def _mc4_decrypt(mc4_bytes: bytes) -> bytes:
+    """Inverse of _mc4_encrypt. Used by _do_import_mc4() to decode a real
+    .mc4 for import, and by the regression suite to verify a generated
+    .mc4 round-trips to the exact XML that produced it."""
+    cipher = base64.b64decode(mc4_bytes)
+    return _aes256_cbc_decrypt(_MC4_AES256CBC_KEY, _MC4_AES256CBC_IV, cipher)
+
+
+def _xml_escape(text) -> str:
+    text = str(text)
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+    text = text.replace('"', "&quot;")
+    text = text.replace("'", "&apos;")
+    return text
+
+
+def _dash_hex(hexstr: str) -> str:
+    """'90909090' -> '90-90-90-90', matching the community mc4 convention."""
+    hexstr = str(hexstr).upper()
+    return "-".join(hexstr[i:i + 2] for i in range(0, len(hexstr), 2))
+
+
+def generate_mc4_bytes(mods: list, game_id: str, game_ver: str, game_title: str,
+                       process: str, author: str = "RDX CheatMaker") -> bytes:
+    """Build a CheatRunner-compatible .mc4 trainer.
+
+    Takes the same already-resolved module-relative scalar patch list
+    generate_etahen_json() produces (see its docstring): mc4's <Cheatline>
+    has no field for pointer/dereference chains and CheatRunner applies a
+    toggle as a one-shot write like etaHEN, not a live freeze, so the
+    eligible-cheat set is identical and is computed once by the caller.
+    """
+    lines = ['<?xml version="1.0" encoding="utf-8"?>',
+             '<Trainer xmlns:xsd="http://www.w3.org/2001/XMLSchema" '
+             'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+             f'Game="{_xml_escape(game_title)}" '
+             f'Moder="{_xml_escape(author or "RDX CheatMaker")}" '
+             f'Cusa="{_xml_escape(game_id)}" Version="{_xml_escape(game_ver)}" '
+             f'Process="{_xml_escape(process or "eboot.bin")}">']
+    for mod in mods:
+        name = _xml_escape(mod.get("name", "Unnamed cheat"))
+        lines.append(f'  <Cheat Control="Toggel" Text="{name}">')
+        for entry in mod.get("memory", []):
+            offset = str(entry.get("offset", "")).upper()
+            on_hex = _dash_hex(entry.get("on", ""))
+            off_hex = _dash_hex(entry.get("off", ""))
+            lines.append('    <Cheatline>')
+            lines.append(f'      <Offset>{offset}</Offset>')
+            lines.append('      <Section>0</Section>')
+            lines.append(f'      <ValueOn>{on_hex}</ValueOn>')
+            lines.append(f'      <ValueOff>{off_hex}</ValueOff>')
+            lines.append('    </Cheatline>')
+        lines.append('  </Cheat>')
+    lines.append('</Trainer>')
+    xml_text = "\n".join(lines) + "\n"
+    return _mc4_encrypt(xml_text.encode("utf-8"))
+
+
+def mc4_xml_to_mods(xml_text: str) -> tuple:
+    """Parse a decrypted .mc4 Trainer/Cheat/Cheatline XML document into the
+    same {"name", "memory": [{"offset", "on", "off"}]} mod shape
+    generate_etahen_json()/generate_mc4_bytes() consume, so import can share
+    one converter with the etaHEN/GoldHEN JSON path. Returns
+    (trainer_attrs, mods); a malformed document raises ET.ParseError, and a
+    well-formed but empty/unexpected one simply yields an empty mods list.
+    """
+    root = ET.fromstring(xml_text)
+    trainer_attrs = dict(root.attrib)
+    mods = []
+    for cheat_el in root.findall("Cheat"):
+        name = (cheat_el.get("Text") or cheat_el.get("CheatName") or
+                cheat_el.get("Name") or "Unnamed cheat")
+        memory = []
+        for line_el in cheat_el.findall("Cheatline"):
+            offset = (line_el.findtext("Offset") or "").strip()
+            on = (line_el.findtext("ValueOn") or "").strip().replace("-", "")
+            off = (line_el.findtext("ValueOff") or "").strip().replace("-", "")
+            if offset and on:
+                memory.append({"offset": offset, "on": on, "off": off})
+        if memory:
+            mods.append({"name": name, "memory": memory})
+    return trainer_attrs, mods
+
 
 # ── logging ───────────────────────────────────────────────────────────────────
 LOG_LIMIT = 500   # raised from 200 so older diagnostics are not lost so quickly
@@ -6571,13 +6915,51 @@ def _draw_toast(stdscr, cp=C_OK) -> None:
         safe_addstr(stdscr, h - 2, 3, msg[:max(w - 6, 0)], color(cp))
 
 
+def _fuzzy_subsequence_rank(term: str, text: str):
+    """None if `term`'s characters don't all appear in `text`, in order
+    (case-insensitive callers pass already-lowered strings); otherwise a
+    (span, start) rank where a tighter, earlier match sorts first."""
+    ti = 0
+    first = None
+    last = -1
+    for ci, ch in enumerate(text):
+        if ti < len(term) and ch == term[ti]:
+            if first is None:
+                first = ci
+            last = ci
+            ti += 1
+    if ti < len(term):
+        return None
+    return (last - first, first)
+
+
+def _command_palette_rank(query: str, label: str):
+    """None if `label` doesn't match every whitespace-separated term in
+    `query` as a fuzzy subsequence; otherwise a sort key, best match first.
+    Lets "exp trn" find "Export Trainers" without requiring a contiguous
+    substring."""
+    terms = query.lower().split()
+    if not terms:
+        return (0, 0)
+    text = label.lower()
+    total_span = total_start = 0
+    for term in terms:
+        ranked = _fuzzy_subsequence_rank(term, text)
+        if ranked is None:
+            return None
+        span, start = ranked
+        total_span += span
+        total_start += start
+    return (total_span, total_start)
+
+
 def do_command_palette(stdscr) -> None:
     commands = [
         ("First Scan", "scan_first"), ("Next Scan", "scan_next"),
         ("Results", "results"), ("Cheat List", "cheat_list"),
         ("Pointer Project", "pointer_project"),
         ("Find Permanent Pointer", "pointer_scan"), ("Write Address", "write"),
-        ("Freeze Address", "freeze"), ("Import RDX Trainer", "import"),
+        ("Freeze Address", "freeze"), ("Import Trainer", "import"),
         ("Export Trainers", "export"), ("Scan Settings", "scan_settings"),
         ("Logs", "log"), ("Clear Results", "clear"),
         ("Clear Scan History", "clear_history"), ("Change Process", "proc"),
@@ -6591,8 +6973,10 @@ def do_command_palette(stdscr) -> None:
         draw_border(stdscr, "COMMAND PALETTE")
         safe_addstr(stdscr, 2, 3, f"> {query}_", color(C_ACC) | curses.A_BOLD)
         visible = max(1, min(12, h - 7))
-        q = query.lower()
-        matches = [c for c in commands if q in c[0].lower()]
+        ranked = [(rank, c) for c in commands
+                 if (rank := _command_palette_rank(query, c[0])) is not None]
+        ranked.sort(key=lambda item: item[0])
+        matches = [c for _, c in ranked]
         if matches:
             sel = min(sel, len(matches) - 1)
             for i, (label, _) in enumerate(matches[:visible]):
@@ -6639,6 +7023,19 @@ def _main_menu_entries():
     ]
 
 
+def _confirm_quit(stdscr) -> bool:
+    """True if it's OK to quit — asks first when there are cheats that
+    haven't survived an Export since they were last added/deleted."""
+    if not (state["cheats"] and state.get("cheats_dirty")):
+        return True
+    n = len(state["cheats"])
+    return confirm_box(
+        stdscr,
+        f"{n} cheat{'s' if n != 1 else ''} not exported since the last "
+        "change.\nQuit anyway? This will discard them.",
+        "Unsaved Cheats")
+
+
 def screen_main(stdscr):
     """Compact primary navigation: workflow first, advanced tools elsewhere."""
     menu = _main_menu_entries()
@@ -6671,8 +7068,7 @@ def screen_main(stdscr):
                     key, label, _, cp = menu[i]
                     unavailable = (
                         (label == "Next Scan" and len(state["scan_results"]) == 0) or
-                        (label == "Results" and len(state["scan_results"]) == 0) or
-                        (label == "Export Cheats" and not state["cheats"])
+                        (label == "Results" and len(state["scan_results"]) == 0)
                     )
                     attr = (color(C_SEL) | curses.A_BOLD if i == sel else
                             color(C_NORM) | curses.A_DIM if unavailable else color(cp))
@@ -6683,8 +7079,7 @@ def screen_main(stdscr):
             for i, (key, label, _, cp) in enumerate(menu):
                 unavailable = (
                     (label == "Next Scan" and len(state["scan_results"]) == 0) or
-                    (label == "Results" and len(state["scan_results"]) == 0) or
-                    (label == "Export Cheats" and not state["cheats"])
+                    (label == "Results" and len(state["scan_results"]) == 0)
                 )
                 attr = (color(C_SEL) | curses.A_BOLD if i == sel else
                         color(C_NORM) | curses.A_DIM if unavailable else color(cp))
@@ -6710,7 +7105,9 @@ def screen_main(stdscr):
         elif key in (curses.KEY_ENTER, 10, 13):
             action = menu[sel][2]
             if action is None:
-                return None
+                if _confirm_quit(stdscr):
+                    return None
+                continue
             result = dispatch(stdscr, action)
             if result in {"proc", "connect"}:
                 return result
@@ -6731,7 +7128,9 @@ def screen_main(stdscr):
                         add_log(f"{label} is unavailable until a scan is complete", "warn")
                         break
                     if action is None:
-                        return None
+                        if _confirm_quit(stdscr):
+                            return None
+                        break
                     result = dispatch(stdscr, action)
                     if result in {"proc", "connect"}:
                         return result
@@ -6745,7 +7144,8 @@ def do_help(stdscr) -> None:
         "Pointers     P Pointer Project (persisted 2-reload workflow)",
         "Results      A Apply   C Cheat   R Find permanent   N Refine",
         "Cheats       F/Space Toggle   A Apply   E Edit   D Delete",
-        "Advanced     / Command Palette → import/export/logs/pointer tools",
+        "Advanced     Export/Import/Freeze/Logs have no direct key —",
+        "             press / then type the command name to run them.",
         "Setup        T Settings",
         "",
         "Routine success messages stay in the status line;",
@@ -8493,6 +8893,7 @@ def _add_cheat_at(stdscr, addr: int) -> None:
             **module_metadata,
         }
         state["cheats"].append(entry)
+        state["cheats_dirty"] = True
         add_log(f"Added '{entry['name']}' @ {hex(addr)} = "
                 f"{_format_typed_value(val, type_key, scan_w)} ({type_key})")
 
@@ -8608,6 +9009,35 @@ def _read_cheat_live_value(cheat: dict) -> str:
     return "?"
 
 
+def _delete_cheat_with_undo(index: int) -> str:
+    """Delete state['cheats'][index], stopping any active freeze first, and
+    stash it (with its original position) as a single-slot undo buffer.
+    Returns the deleted cheat's name."""
+    cheat = state["cheats"][index]
+    name = cheat["name"]
+    if _is_cheat_frozen(cheat):
+        _toggle_cheat_freeze(cheat)
+    state["last_deleted_cheat"] = (dict(cheat), index)
+    del state["cheats"][index]
+    state["cheats_dirty"] = True
+    add_log(f"Deleted cheat '{name}' — press Z in Cheat List to restore", "warn")
+    return name
+
+
+def _restore_last_deleted_cheat() -> Optional[str]:
+    """Undo the most recent single delete, if any and not already consumed."""
+    saved = state.get("last_deleted_cheat")
+    state["last_deleted_cheat"] = None
+    if saved is None:
+        return None
+    cheat, index = saved
+    index = min(max(index, 0), len(state["cheats"]))
+    state["cheats"].insert(index, cheat)
+    state["cheats_dirty"] = True
+    add_log(f"Restored deleted cheat '{cheat['name']}'")
+    return cheat["name"]
+
+
 def _inspect_cheat(stdscr, idx: int) -> None:
     """Read-only cheat inspector with explicit edit/apply/delete actions."""
     while 0 <= idx < len(state["cheats"]):
@@ -8679,11 +9109,7 @@ def _inspect_cheat(stdscr, idx: int) -> None:
             do_freeze(stdscr, c)
         elif key in (ord('d'), ord('D')):
             if confirm_box(stdscr, f"Delete '{c['name']}'?", "Delete Cheat"):
-                name = c["name"]
-                if _is_cheat_frozen(c):
-                    _toggle_cheat_freeze(c)
-                del state["cheats"][idx]
-                add_log(f"Deleted cheat '{name}'", "warn")
+                _delete_cheat_with_undo(idx)
                 return
 
 
@@ -8785,13 +9211,17 @@ def do_cheat_list(stdscr) -> None:
                         color(C_WARN))
 
             is_refreshing = refresh_thread is not None and refresh_thread.is_alive()
-            draw_statusbar(stdscr, [
+            status_items = [
                 ("↑↓ navigate", C_NORM), ("Enter inspect", C_OK),
                 ("F/Space toggle", C_ACC),
                 ("A apply once", C_WARN), ("D delete", C_ERR),
-                ("⟳ live" if is_refreshing else "live values", C_ACC),
-                ("Q back", C_NORM),
-            ])
+            ]
+            if state.get("last_deleted_cheat"):
+                status_items.append(("Z restore", C_OK))
+            status_items.append(
+                ("⟳ live" if is_refreshing else "live values", C_ACC))
+            status_items.append(("Q back", C_NORM))
+            draw_statusbar(stdscr, status_items)
             stdscr.refresh()
 
             key = stdscr.getch()
@@ -8826,11 +9256,8 @@ def do_cheat_list(stdscr) -> None:
                 stdscr.nodelay(False)
                 name = cheats[sel]["name"]
                 if confirm_box(stdscr, f"Delete '{name}'?", "Delete Cheat"):
-                    if _is_cheat_frozen(cheats[sel]):
-                        _toggle_cheat_freeze(cheats[sel])
-                    del cheats[sel]
-                    state["cheats"] = cheats
-                    add_log(f"Deleted cheat '{name}'", "warn")
+                    _delete_cheat_with_undo(sel)
+                    cheats = state["cheats"]
                     with cache_lock:
                         live_cache.clear()
                     if not cheats:
@@ -8839,6 +9266,12 @@ def do_cheat_list(stdscr) -> None:
                         sel = min(sel, len(cheats) - 1)
                     offset = min(offset, max(0, len(cheats) - visible))
                 stdscr.nodelay(True)
+            elif key in (ord('z'), ord('Z')) and state.get("last_deleted_cheat"):
+                restored = _restore_last_deleted_cheat()
+                if restored:
+                    cheats = state["cheats"]
+                    with cache_lock:
+                        live_cache.clear()
             elif key in (ord('q'), ord('Q')):
                 break
     finally:
@@ -9008,14 +9441,95 @@ def _parse_int_field(value, field_name):
         raise ValueError(f"Invalid {field_name}: {value!r}")
 
 
+def _do_import_static_patch_mods(stdscr, path: Path, mods: list,
+                                 kind_label: str, file_title_id: str,
+                                 file_process: str = "") -> None:
+    """Shared tail for importing etaHEN/GoldHEN JSON or a decrypted .mc4's
+    mods into RDX's cheat list, resolved against the currently attached
+    process's live main module (never trusted from the file itself — see
+    _mods_to_import_entries)."""
+    attached_process = str(state.get("proc_name", "") or "")
+    if file_process and attached_process and file_process != attached_process:
+        message_box(stdscr,
+            [f"{kind_label} targets process '{file_process}', but RDX is",
+             f"attached to '{attached_process}'.",
+             "Attach to the matching process before importing."],
+            "Import Failed", C_ERR)
+        return
+    if (file_title_id and state.get("game_id") and
+            file_title_id.upper() != str(state["game_id"]).upper()):
+        add_log(
+            f"{kind_label} Title ID '{file_title_id}' does not match the "
+            f"attached game_id '{state['game_id']}' — importing anyway; "
+            "addresses are resolved against the live process, not the file.",
+            "warn")
+    process = str(state.get("proc_name", "") or "eboot.bin")
+    try:
+        maps = _get_maps_cached(state["ip"], state["pid"])
+    except Exception as exc:
+        message_box(stdscr,
+            [f"Could not read the target process's memory map: {exc}",
+             "A live connection is required to resolve static-patch",
+             "offsets — connect and attach to the game first."],
+            "Import Failed", C_ERR)
+        return
+    module_base, _accepted = _etahen_main_module(maps, process)
+    if module_base is None:
+        message_box(stdscr,
+            [f"Could not identify {process}'s main module in the",
+             "current process — cannot resolve static-patch offsets."],
+            "Import Failed", C_ERR)
+        return
+    imported = _mods_to_import_entries(mods, path, module_base)
+    if not imported:
+        message_box(stdscr,
+            [f"No usable static patches found in this {kind_label} file."],
+            "Import Failed", C_ERR)
+        return
+    if state["cheats"] and not confirm_box(
+            stdscr,
+            f"Import {len(imported)} cheats from {kind_label} and keep "
+            f"existing {len(state['cheats'])}?",
+            "Import Cheats"):
+        return
+    state["cheats"].extend(imported)
+    state["cheats_dirty"] = True
+    add_log(f"Imported {len(imported)} cheats from {kind_label} {path}")
+    message_box(stdscr,
+        [f"Imported {len(imported)} cheats as raw-byte static-module",
+         "patches, bound to this session at the current live address.",
+         "Export once attached to make them portable across reloads."],
+        "Import Complete", C_OK)
+
+
+def _do_import_mc4(stdscr, path: Path) -> None:
+    try:
+        xml_text = _mc4_decrypt(path.read_bytes()).decode("utf-8")
+        trainer_attrs, mods = mc4_xml_to_mods(xml_text)
+    except Exception as exc:
+        message_box(stdscr,
+            [f"Could not decode .mc4: {exc}",
+             "It may be corrupt, or not a real .mc4 trainer."],
+            "Import Failed", C_ERR)
+        return
+    if not mods:
+        message_box(stdscr,
+            ["No usable <Cheat>/<Cheatline> entries found in this .mc4."],
+            "Import Failed", C_ERR)
+        return
+    _do_import_static_patch_mods(
+        stdscr, path, mods, "CheatRunner .mc4", trainer_attrs.get("Cusa", ""),
+        trainer_attrs.get("Process", ""))
+
+
 def do_import(stdscr) -> None:
     stdscr.clear()
-    draw_border(stdscr, "IMPORT RDX TRAINER")
+    draw_border(stdscr, "IMPORT TRAINER")
     safe_addstr(stdscr, 2, 3,
-                "Imports RDX cheatList JSON; etaHEN patches are deploy-only.",
+                "Imports an RDX .rdx.json, an etaHEN/GoldHEN JSON, or a .mc4.",
                 color(C_NORM))
     raw_path = input_box(
-        stdscr, "RDX JSON path: ", 4, 3, 70,
+        stdscr, "Trainer path: ", 4, 3, 70,
         state.get("export_dir", str(Path.home())),
         allow_cancel=True, cancel_with_q=False)
     if raw_path is None:
@@ -9025,6 +9539,25 @@ def do_import(stdscr) -> None:
     if not path.exists() or not path.is_file():
         message_box(stdscr, [f"File not found: {path}"], "Import Failed", C_ERR)
         return
+
+    if path.suffix.lower() == ".mc4":
+        _do_import_mc4(stdscr, path)
+        return
+
+    # Sniff for the etaHEN/GoldHEN static-patch JSON schema (a top-level
+    # "mods" array, no "cheatList") before falling into the native RDX
+    # format's own parsing below, which owns .rdx.json's error handling.
+    try:
+        sniffed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        sniffed = None
+    if (isinstance(sniffed, dict) and "cheatList" not in sniffed and
+            isinstance(sniffed.get("mods"), list)):
+        _do_import_static_patch_mods(
+            stdscr, path, sniffed["mods"], "etaHEN/GoldHEN JSON",
+            str(sniffed.get("id", "")), str(sniffed.get("process", "")))
+        return
+
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         trainer_process = str(data.get("process", "") or "")
@@ -9171,6 +9704,57 @@ def do_import(stdscr) -> None:
         message_box(stdscr, [f"Import failed: {exc}"], "Import Failed", C_ERR)
 
 
+def _select_export_cheats(stdscr, cheats: list) -> Optional[list]:
+    """Checkbox picker for which of the eligible cheats to include in this
+    export. Everything starts selected — most exports want everything, so
+    this only costs a keystroke (Enter) in the common case. Returns the
+    chosen subset (possibly empty), or None if the user cancels."""
+    marked = [True] * len(cheats)
+    sel = 0
+    offset = 0
+    while True:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        n_selected = sum(marked)
+        draw_border(stdscr,
+                    f"SELECT CHEATS TO EXPORT  ({n_selected}/{len(cheats)})")
+        visible = max(1, h - 7)
+        if sel < offset:
+            offset = sel
+        if sel >= offset + visible:
+            offset = sel - visible + 1
+        for i, c in enumerate(cheats[offset:offset + visible]):
+            ri = offset + i
+            box = "[x]" if marked[ri] else "[ ]"
+            attr = color(C_SEL) | curses.A_BOLD if ri == sel else color(C_NORM)
+            line = f"{box} {c.get('name', 'Unnamed cheat')}"
+            safe_addstr(stdscr, 3 + i, 3, line[:w - 6], attr)
+        draw_statusbar(stdscr, [
+            ("↑↓ navigate", C_NORM), ("Space toggle", C_ACC),
+            ("A all", C_OK), ("N none", C_WARN),
+            ("Enter continue", C_OK), ("Esc cancel", C_ERR),
+        ])
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key == curses.KEY_RESIZE:
+            curses.update_lines_cols()
+            continue
+        if key == curses.KEY_UP:
+            sel = max(0, sel - 1)
+        elif key == curses.KEY_DOWN:
+            sel = min(len(cheats) - 1, sel + 1)
+        elif key == ord(' '):
+            marked[sel] = not marked[sel]
+        elif key in (ord('a'), ord('A')):
+            marked = [True] * len(cheats)
+        elif key in (ord('n'), ord('N')):
+            marked = [False] * len(cheats)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            return [c for c, m in zip(cheats, marked) if m]
+        elif key in (27, ord('q'), ord('Q')):
+            return None
+
+
 def do_export(stdscr) -> None:
     stdscr.clear()
     draw_border(stdscr, "EXPORT TRAINERS")
@@ -9215,6 +9799,20 @@ def do_export(stdscr) -> None:
         safe_addstr(stdscr, 3, 3,
             f"Excluded stale/other-game cheats: {excluded_count}", color(C_NORM))
     stdscr.refresh()
+
+    deselected_count = 0
+    if len(export_cheats) > 1:
+        picked = _select_export_cheats(stdscr, export_cheats)
+        if picked is None:
+            add_log("Trainer export cancelled")
+            return
+        if not picked:
+            message_box(stdscr,
+                ["No cheats selected — nothing to export."],
+                "Nothing to Export", C_WARN)
+            return
+        deselected_count = len(export_cheats) - len(picked)
+        export_cheats = picked
 
     # Require a non-empty Title ID before proceeding
     while True:
@@ -9293,8 +9891,10 @@ def do_export(stdscr) -> None:
     process_suffix = ("" if process.lower() == "eboot.bin" else
                       "_" + sanitize_filename(process))
     etahen_name = base_name + process_suffix + ".json"
+    mc4_name = base_name + process_suffix + ".mc4"
     rdx_path = output_dir / rdx_name
     etahen_path = output_dir / etahen_name
+    mc4_path = output_dir / mc4_name
 
     # Capture the disable value at creation time whenever possible.  Older
     # in-memory entries predate that field, so make one best-effort live read
@@ -9339,6 +9939,8 @@ def do_export(stdscr) -> None:
         export_cheats, gid, gver, gtit, True, process)
     etahen_text, etahen_mods, skipped = generate_etahen_json(
         export_cheats, gid, gver, gtit, process, maps, author)
+    mc4_bytes = (generate_mc4_bytes(etahen_mods, gid, gver, gtit, process, author)
+                if etahen_mods else None)
     if str(gid).upper().startswith("CUSA"):
         platform_name = "GoldHEN"
         deploy_dir = "/user/data/GoldHEN/cheats/json/"
@@ -9354,15 +9956,20 @@ def do_export(stdscr) -> None:
         f"{platform_name} static patches: {len(etahen_mods)}",
         f"Static export skipped: {len(skipped)}",
         f"Other-game/stale excluded: {excluded_count}",
-        f"Destination: {output_dir}",
     ]
+    if deselected_count:
+        preflight.append(f"Deselected by you: {deselected_count}")
+    preflight.append(f"Destination: {output_dir}")
     if etahen_mods:
         preflight.append(f"Console deploy: {deploy_dir}{etahen_name}")
+        preflight.append(
+            f"CheatRunner .mc4: {len(etahen_mods)} patches "
+            "(/data/cheatrunner/cheats/mc4/)")
     if not confirm_box(stdscr, "\n".join(preflight) + "\n\nWrite these files?",
                        "Export Preflight"):
         add_log("Trainer export cancelled at preflight")
         return
-    existing = [p.name for p in (rdx_path, etahen_path)
+    existing = [p.name for p in (rdx_path, etahen_path, mc4_path)
                 if p.exists() and (p == rdx_path or etahen_mods)]
     if existing and not confirm_box(
             stdscr, "Overwrite existing file(s)?\n" + "\n".join(existing),
@@ -9371,6 +9978,10 @@ def do_export(stdscr) -> None:
 
     try:
         _atomic_write_text(rdx_path, rdx_text)
+        # Only clear the unsaved-work flag if every cheat in the list was
+        # actually written — excluded stale/other-game entries and cheats
+        # the user deselected in the picker were not.
+        state["cheats_dirty"] = excluded_count > 0 or deselected_count > 0
         add_log(f"Exported RDX trainer {rdx_path}")
         lines = [f"RDX trainer: {rdx_path}",
                  f"  {len(export_cheats)} entry/entries; pointer chains supported."]
@@ -9388,11 +9999,22 @@ def do_export(stdscr) -> None:
                 "Upload via FTP to:",
                 f"  {deploy_dir}{etahen_name}",
             ])
+            if mc4_bytes is not None:
+                _atomic_write_bytes(mc4_path, mc4_bytes)
+                add_log(f"Exported CheatRunner .mc4 {mc4_path} "
+                        f"({len(etahen_mods)} patches)")
+                lines.extend([
+                    "",
+                    f"CheatRunner .mc4: {mc4_path}",
+                    f"  {len(etahen_mods)} static module patch(es).",
+                    "Upload via FTP to:",
+                    f"  /data/cheatrunner/cheats/mc4/{mc4_name}",
+                ])
         else:
             lines.extend([
                 "",
-                f"No {platform_name} JSON was written: it cannot execute pointer",
-                "chains or live freezes; use the RDX trainer for those entries.",
+                f"No {platform_name} JSON or .mc4 was written: neither can execute",
+                "pointer chains or live freezes; use the RDX trainer for those entries.",
             ])
         if skipped:
             lines.append(
@@ -10453,6 +11075,7 @@ def do_pointer_chain_verify(stdscr, candidate: dict, original_target: int) -> No
                 "address": 0,    # resolved at apply time
             }
             state["cheats"].append(entry)
+            state["cheats_dirty"] = True
             add_log(f"Added pointer cheat '{entry['name']}' "
                     f"base={hex(base)} offsets={[hex(o) for o in offsets]} val={val}")
             if entry["cross_reload_validated"]:

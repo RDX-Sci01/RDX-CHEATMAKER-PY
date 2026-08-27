@@ -662,6 +662,7 @@ _PTR_DISK_INDEX_THRESHOLD = 0x40000000  # 1 GiB readable memory
 _PTR_DISK_SHARD_BYTES = 0x2000000       # 32 MiB per sorted disk shard
 _PTR_DISK_WORKERS = 6                    # persistent parallel reader/indexers
 _pointer_region_class_cache = {}         # map fingerprint -> classified rows
+_region_class_supported: dict = {}       # map fingerprint -> probe actually ran
 _POINTER_PROVISIONAL_FILE = Path(__file__).with_name(
     ".rdx-pointer-candidates.json")
 _PREFERENCES_FILE = Path(__file__).with_name(".rdx-preferences.json")
@@ -1113,6 +1114,8 @@ def _lz4_decompress_block(data: bytes, expected_length: int) -> bytes:
 
 _memdbg_maps_v2_lock = threading.Lock()
 _memdbg_maps_v2_supported: dict = {}   # ip -> bool, learned once per host
+_console_scan_lock = threading.Lock()
+_console_scan_supported: dict = {}     # ip -> bool, learned once per host
 
 
 def _memdbg_unframe_memory(raw: bytes) -> bytes:
@@ -2393,7 +2396,18 @@ def memdbg_write_multi(ip: str, pid: int, entries: list,
         client = _MemDBGClient(ip, timeout=timeout)
         try:
             client.connect()
-            return client.memory_write_multi(pid, entries)
+            # One BATCH_WRITE exchange is capped at
+            # MEMDBG_BATCH_WRITE_MAX_ITEMS entries.  Split a larger freeze
+            # tick across several exchanges on the same connection: passing
+            # the whole list straight through raised ValueError, which this
+            # loop then treated as a transient network fault, so a user with
+            # 65+ simultaneous freezes got nothing written at all, every
+            # tick, with no fall-through to the per-write path.
+            results = []
+            for start in range(0, len(entries), MEMDBG_BATCH_WRITE_MAX_ITEMS):
+                results.extend(client.memory_write_multi(
+                    pid, entries[start:start + MEMDBG_BATCH_WRITE_MAX_ITEMS]))
+            return results
         except Exception as exc:
             native_exc = exc
             if attempt < _UI_MAX_RETRIES - 1:
@@ -3194,6 +3208,27 @@ class _ScanSocket:
                 else:
                     time.sleep(delay)
 
+    def set_timeout(self, seconds: float) -> None:
+        """Apply a socket timeout to whichever transport is actually live.
+
+        Callers that want a short, responsive read budget (the Results
+        screen's live-value refresh) must not reach for ``self._s``
+        directly: after a successful native MemDBG connect, ``_s`` is None
+        and only ``_native_client`` holds a socket.
+        """
+        if self._native_client is not None:
+            self._native_client.timeout = float(seconds)
+            if self._native_client.sock is not None:
+                try:
+                    self._native_client.sock.settimeout(float(seconds))
+                except OSError:
+                    pass
+        elif self._s is not None:
+            try:
+                self._s.settimeout(float(seconds))
+            except OSError:
+                pass
+
     def close(self):
         if self._native_client is not None:
             self._native_client.close()
@@ -3324,15 +3359,34 @@ def scan_first(ip: str, pid: int, value, width: int = 4,
     PROT_READ  = 0x1
     PROT_WRITE = 0x2
     PROT_EXEC  = 0x4
-    MAX_REGION = 0x40000000   # 1 GB — only skip GPU/VRAM/reserved ranges;
-                               # heap regions up to 512 MB are now scanned
+    # Fallback only: used when the payload cannot classify regions for us.
+    MAX_REGION = 0x40000000
+
+    # A blanket size cap is the wrong instrument for excluding GPU/VRAM, and
+    # on a real title it is actively harmful: retail games commonly place the
+    # whole managed heap in one multi-GiB cached mapping, so the cap silently
+    # skipped the only memory worth scanning. Ask the payload instead, exactly
+    # as the pointer scanner already does — it distinguishes a 2 GiB cached
+    # game heap from a 2 GiB uncached GPU mapping, which a size test cannot.
+    _uncached, _classifier_ok = _classify_regions_cached(ip, pid, maps)
+    _uncached_starts = [row[0] for row in _uncached]
 
     def _scannable(regions, require_write):
-        return [r for r in regions
-                if (r['end'] - r['start']) <= MAX_REGION
-                and (r['prot'] & PROT_READ)
-                and (not require_write or (r['prot'] & PROT_WRITE))
-                and not (r['prot'] == PROT_EXEC)]
+        out = []
+        for r in regions:
+            if not (r['prot'] & PROT_READ):
+                continue
+            if require_write and not (r['prot'] & PROT_WRITE):
+                continue
+            if r['prot'] == PROT_EXEC:
+                continue
+            if _classifier_ok:
+                if _region_is_uncached(r, _uncached, _uncached_starts):
+                    continue
+            elif (r['end'] - r['start']) > MAX_REGION:
+                continue   # no classifier on this payload: keep the old guard
+            out.append(r)
+        return out
 
     rw_regions  = _scannable(maps, require_write=True)
     if writable_only:
@@ -3386,19 +3440,39 @@ def scan_first(ip: str, pid: int, value, width: int = 4,
     elif engine == "turbo" and not payload_exact_ok:
         raise ValueError(f"Turbo-only scanning does not support {type_key}; use Auto or Host")
     if payload_exact_ok and engine in ("auto", "console"):
-        try:
-            result = ps5_scan_exact_server(ip, pid, value, width,
-                                           selected_ranges, aligned,
-                                           cancel_event, progress_cb,
-                                           value_type=type_key)
-            add_log(f"Console first scan completed in {max(time.monotonic()-started,1e-9):.2f}s")
-            return result
-        except InterruptedError:
-            raise
-        except Exception as exc:
-            add_log(f"Console scan unavailable ({exc})", "warn")
+        # ps5debug-NG builds exist that acknowledge CMD_PROC_SCAN with
+        # STATUS_SUCCESS and then never send a single result byte, so the
+        # only way to discover it is to wait out _recv_exact_cancel's 15 s
+        # inactivity budget. Learn that once per host rather than paying it
+        # on every scan, the same way MemDBG's PROCESS_MAPS_V2 probe does.
+        # _clear_scan_state() drops the cache, so loading a different payload
+        # gets a fresh probe.
+        with _console_scan_lock:
+            known_bad = _console_scan_supported.get(ip) is False
+        if known_bad:
             if engine == "console":
+                raise RuntimeError(
+                    "this payload accepts the console scan command but never "
+                    "returns results; use Auto or Host")
+        else:
+            try:
+                result = ps5_scan_exact_server(ip, pid, value, width,
+                                               selected_ranges, aligned,
+                                               cancel_event, progress_cb,
+                                               value_type=type_key)
+                with _console_scan_lock:
+                    _console_scan_supported[ip] = True
+                add_log(f"Console first scan completed in {max(time.monotonic()-started,1e-9):.2f}s")
+                return result
+            except InterruptedError:
                 raise
+            except Exception as exc:
+                with _console_scan_lock:
+                    _console_scan_supported[ip] = False
+                add_log(f"Console scan unavailable ({exc}); "
+                        "not retrying it on this console", "warn")
+                if engine == "console":
+                    raise
     elif engine == "console" and not payload_exact_ok:
         raise ValueError(f"Console-only scanning does not support {type_key}; use Auto or Host")
 
@@ -3457,7 +3531,13 @@ def scan_first(ip: str, pid: int, value, width: int = 4,
                     addr, csz = work[work_idx[0]]
                     work_idx[0] += 1
                 try:
-                    data = sock.read(addr, csz)
+                    # Pass cancel_event: without it a 32 MiB read runs to
+                    # completion (or to _recv_exact_cancel's ~42 s budget)
+                    # before Esc is noticed, with twelve readers typically
+                    # mid-chunk. scan_first_pattern already does this.
+                    data = sock.read(addr, csz, cancel_event)
+                except InterruptedError:
+                    break
                 except Exception as exc:
                     with reader_err_lock:
                         if len(reader_err) < 200:   # cap: pathological maps won't OOM
@@ -3673,9 +3753,14 @@ def scan_first_pattern(ip: str, pid: int, pattern: bytes, mask: bytes,
         cancel_event.truncated = False
 
     maps = _get_maps_cached(ip, pid)
+    # Same classifier-over-size-cap correction as scan_first's _scannable.
+    uncached, classifier_ok = _classify_regions_cached(ip, pid, maps)
+    uncached_starts = [row[0] for row in uncached]
     regions = [r for r in maps
                if int(r.get("end", 0)) > int(r.get("start", 0))
-               and int(r.get("end", 0)) - int(r.get("start", 0)) <= 0x40000000
+               and (not _region_is_uncached(r, uncached, uncached_starts)
+                    if classifier_ok else
+                    int(r.get("end", 0)) - int(r.get("start", 0)) <= 0x40000000)
                and (int(r.get("prot", 0)) & 0x1)
                and (not writable_only or (int(r.get("prot", 0)) & 0x2))]
     if str(region_scope or "") == "recommended":
@@ -3853,7 +3938,7 @@ def scan_next(ip: str, pid: int, value, width: int,
         except Exception as exc:
             add_log(f"Resident Turbo rescan unavailable ({exc}); using host filter", "warn")
             if state.get("scan_engine") == "turbo":
-                raise
+                raise RuntimeError(_TURBO_ONLY_NO_SESSION.format(reason=exc)) from exc
 
     dtype = np.dtype(VALUE_TYPES[type_key]["dtype"])
     target = np.asarray([_unpack_typed_value(
@@ -3939,14 +4024,27 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
     PROT_READ  = 0x1
     PROT_WRITE = 0x2
     PROT_EXEC  = 0x4
-    MAX_REGION = 0x40000000
+    MAX_REGION = 0x40000000   # fallback only; see scan_first's _scannable
+
+    _uncached, _classifier_ok = _classify_regions_cached(ip, pid, maps)
+    _uncached_starts = [row[0] for row in _uncached]
 
     def _scannable(regions, require_write):
-        return [r for r in regions
-                if (r['end'] - r['start']) <= MAX_REGION
-                and (r['prot'] & PROT_READ)
-                and (not require_write or (r['prot'] & PROT_WRITE))
-                and not (r['prot'] == PROT_EXEC)]
+        out = []
+        for r in regions:
+            if not (r['prot'] & PROT_READ):
+                continue
+            if require_write and not (r['prot'] & PROT_WRITE):
+                continue
+            if r['prot'] == PROT_EXEC:
+                continue
+            if _classifier_ok:
+                if _region_is_uncached(r, _uncached, _uncached_starts):
+                    continue
+            elif (r['end'] - r['start']) > MAX_REGION:
+                continue
+            out.append(r)
+        return out
 
     rw_regions  = _scannable(maps, require_write=True)
     if writable_only:
@@ -4040,7 +4138,9 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
                     addr, csz = work[work_idx[0]]
                     work_idx[0] += 1
                 try:
-                    data = sock.read(addr, csz)
+                    data = sock.read(addr, csz, cancel_event)   # see scan_first
+                except InterruptedError:
+                    break
                 except Exception as exc:
                     with reader_err_lock:
                         if len(reader_err) < 200:
@@ -4237,6 +4337,20 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
     return out_addrs, out_values
 
 
+# Turbo-only mode deliberately refuses to degrade to the host filter. That is
+# the right contract, but the underlying "no matching resident TurboScan
+# session" is opaque: the usual cause is the user's own previous action
+# (dropping a result, exploring nearby values, switching engine) discarding
+# the console-resident list, and nothing in the bare message says so or says
+# how to get moving again.
+_TURBO_ONLY_NO_SESSION = (
+    "{reason}. Turbo-only mode narrows the list the console is holding, and "
+    "that list was discarded — dropping a result, exploring nearby values, "
+    "undoing a scan or changing the scan engine all discard it. Run a new "
+    "First Scan, or set Scan Settings -> engine: auto to fall back to the "
+    "host filter."
+)
+
 # Relational scan modes for unknown-value next scans.
 RELATIONAL_MODES = [
     "decreased",        # current < previous (e.g. took damage)
@@ -4246,6 +4360,28 @@ RELATIONAL_MODES = [
     "decreased by",     # current == previous - N  (known delta)
     "increased by",     # current == previous + N  (known delta)
 ]
+
+def _wrapped_delta(prev_values: np.ndarray, delta, width: int,
+                   dtype: np.dtype, sign: int) -> np.ndarray:
+    """Return ``prev_values ± delta`` wrapped at the scanned value's own width.
+
+    Integer game values wrap at their storage width, so the comparison has to
+    as well: a u8 counter really does go from 3 to 249 when it loses 10, and
+    an i8 one really does go from 100 to 44 when it gains 200.  Doing the
+    arithmetic in the array's native dtype does not reproduce that — NumPy
+    promotes to a wider type whenever the Python ``delta`` does not fit the
+    dtype, so the sum never wraps and a legitimate match is silently dropped
+    (and on NumPy 2 / NEP 50 the same expression raises OverflowError
+    instead).  Compute in uint64, mask to ``width``, then reinterpret through
+    the unsigned view of the scan dtype so signed types land back on their
+    correct two's-complement value.
+    """
+    step = np.uint64(int(delta) & 0xFFFF_FFFF_FFFF_FFFF)
+    wide = prev_values.astype(np.uint64)
+    wide = (wide + step) if sign > 0 else (wide - step)
+    masked = wide & np.uint64(WIDTH_MAX[width])
+    return masked.astype(np.dtype(f"<u{width}")).view(dtype)
+
 
 def scan_next_relational(ip: str, pid: int, width: int,
                          prev_addrs: np.ndarray,
@@ -4314,7 +4450,7 @@ def scan_next_relational(ip: str, pid: int, width: int,
             add_log(f"Resident Turbo snapshot rescan unavailable ({exc}); "
                     "using host filter", "warn")
             if state.get("scan_engine") == "turbo":
-                raise
+                raise RuntimeError(_TURBO_ONLY_NO_SESSION.format(reason=exc)) from exc
 
     # prev_addrs must be sorted for searchsorted.
     if len(prev_addrs) > 1 and not np.all(prev_addrs[:-1] <= prev_addrs[1:]):
@@ -4388,10 +4524,8 @@ def scan_next_relational(ip: str, pid: int, width: int,
             else:
                 keep = cur == prv
         elif mode == "decreased by":
-            if kind == "uint":
-                bit_mask = np.uint64(WIDTH_MAX[width])
-                expected = ((prv.astype(np.uint64) - np.uint64(delta)) &
-                            bit_mask).astype(dtype)
+            if kind in ("uint", "sint"):
+                expected = _wrapped_delta(prv, delta, width, dtype, -1)
             else:
                 expected = prv - delta
             keep = (np.isclose(cur, expected, rtol=0.0,
@@ -4399,10 +4533,8 @@ def scan_next_relational(ip: str, pid: int, width: int,
                     if kind == "float" and float(tolerance) > 0
                     else cur == expected)
         elif mode == "increased by":
-            if kind == "uint":
-                bit_mask = np.uint64(WIDTH_MAX[width])
-                expected = ((prv.astype(np.uint64) + np.uint64(delta)) &
-                            bit_mask).astype(dtype)
+            if kind in ("uint", "sint"):
+                expected = _wrapped_delta(prv, delta, width, dtype, +1)
             else:
                 expected = prv + delta
             keep = (np.isclose(cur, expected, rtol=0.0,
@@ -5228,17 +5360,25 @@ class _DiskReversePointerIndex:
         return out
 
 
-def _get_reverse_pointer_index(ip: str, pid: int, cancel_event=None,
-                               progress_cb=None):
-    """Get or build the cached reverse pointer index for the current map layout."""
-    maps = _get_maps_cached(ip, pid)
-    fp = _pointer_map_fingerprint(maps)
-    if fp not in _pointer_region_class_cache:
+def _classify_regions_cached(ip: str, pid: int, maps: list) -> tuple:
+    """Fetch ps5debug-NG's read-throughput classification once per map layout.
+
+    Returns ``(uncached_ranges, supported)``.  ``uncached_ranges`` is the
+    sorted ``(start, end)`` list the payload reported as uncached/GPU-backed.
+    ``supported`` reports whether the probe actually ran, which callers need
+    in order to tell "the payload says nothing here is GPU-backed" apart from
+    "this payload cannot tell us" — only the latter should fall back to a
+    blunt size heuristic.
+    """
+    fingerprint = _pointer_map_fingerprint(maps)
+    if fingerprint not in _pointer_region_class_cache:
         try:
             classified = ps5_classify_regions(ip, pid)
             if len(_pointer_region_class_cache) >= 4:
                 _pointer_region_class_cache.clear()
-            _pointer_region_class_cache[fp] = classified
+                _region_class_supported.clear()
+            _pointer_region_class_cache[fingerprint] = classified
+            _region_class_supported[fingerprint] = True
             uncached_mib = sum(
                 max(0, int(r["end"]) - int(r["start"]))
                 for r in classified if int(r.get("flags", 0)) & 1
@@ -5250,9 +5390,32 @@ def _get_reverse_pointer_index(ip: str, pid: int, cancel_event=None,
                         "unreported maps retain normal safe fallback handling",
                         "warn")
         except Exception as exc:
-            _pointer_region_class_cache[fp] = []
+            _pointer_region_class_cache[fingerprint] = []
+            _region_class_supported[fingerprint] = False
             add_log(f"Region classifier unavailable; using map safeguards: {exc}",
                     "warn")
+    rows = _pointer_region_class_cache.get(fingerprint) or []
+    uncached = sorted(
+        (int(r["start"]), int(r["end"])) for r in rows
+        if int(r.get("flags", 0)) & 1 and int(r["end"]) > int(r["start"]))
+    return uncached, bool(_region_class_supported.get(fingerprint))
+
+
+def _region_is_uncached(region: dict, uncached: list, starts: list) -> bool:
+    """Whether ``region`` overlaps any classifier-reported uncached range."""
+    if not uncached:
+        return False
+    start, end = int(region.get("start", 0)), int(region.get("end", 0))
+    index = bisect.bisect_left(starts, end)
+    return index > 0 and start < uncached[index - 1][1]
+
+
+def _get_reverse_pointer_index(ip: str, pid: int, cancel_event=None,
+                               progress_cb=None):
+    """Get or build the cached reverse pointer index for the current map layout."""
+    maps = _get_maps_cached(ip, pid)
+    fp = _pointer_map_fingerprint(maps)
+    _classify_regions_cached(ip, pid, maps)
     key = (ip, int(pid), int(state.get("session", 0)))
     stale_index = None
     with _pointer_index_lock:
@@ -6036,7 +6199,11 @@ def pointer_chain_scan(ip: str, pid: int,
                     ip, pid, candidate, int(target_addr), cancel_event):
                 verified_static.append(candidate)
         if depth_static:
-            stale_ids = {id(c) for c in depth_static if c not in verified_static}
+            # Compare by identity: `c not in verified_static` is dict
+            # value-equality, which is both O(n²) here and the wrong question
+            # to ask about two candidate records that happen to match.
+            verified_ids = {id(c) for c in verified_static}
+            stale_ids = {id(c) for c in depth_static if id(c) not in verified_ids}
             candidates = [c for c in candidates if id(c) not in stale_ids]
             if stale_ids:
                 if diagnostic_report is not None:
@@ -6202,6 +6369,20 @@ def _pointer_module_base(maps: list, module_name: str) -> Optional[int]:
             return int(peers[ordinal]["start"])
         return None
     same = [r for r in maps if str(r.get("name", "") or "") == wanted]
+    if not same:
+        # ps5debug reports a bare module name ("Il2CppUserAssemblies.prx")
+        # where MemDBG reports the full vnode path
+        # ("/app0/Il2CppUserAssemblies.prx"), so a pointer chain rooted in a
+        # library and validated under one backend could not rebase under the
+        # other -- the chain silently stopped resolving and the trainer was
+        # dead. _is_main_module_name already does basename matching for the
+        # main image; library roots need the same. Exact match still wins,
+        # so this only ever adds a fallback.
+        wanted_base = wanted.replace("\\", "/").rsplit("/", 1)[-1]
+        if wanted_base and not _is_generic_map_name(wanted_base):
+            same = [r for r in maps
+                    if str(r.get("name", "") or "").replace(
+                        "\\", "/").rsplit("/", 1)[-1] == wanted_base]
     if same:
         return min(int(r["start"]) for r in same)
     if wanted == "main":
@@ -6322,11 +6503,18 @@ def _pointer_game_identity(process: str, maps: list) -> str:
     main_rows = [r for r in static
                  if _is_main_module_name(r.get("name", ""), process)]
     chosen = main_rows or sorted(static, key=lambda r: int(r["start"]))[:32]
+    # Only fields BOTH backends report. ps5debug's map rows carry `offset`
+    # and no `flags`; MemDBG's carry `flags` and no `offset`, so including
+    # either made the same game on the same console fingerprint differently
+    # depending on which payload was loaded — and this identity is the gate
+    # for reusing a trainer, a portable cheat or a pointer project. A
+    # ps5debug-built trainer was therefore rejected the moment the user
+    # switched to MemDBG, with "game-image fingerprint does not match".
+    # Name, protection and section size are ASLR-independent and reported
+    # identically by both, which is what this fingerprint actually needs.
     signature = sorted((
         str(r.get("name", "") or ""),
         int(r.get("prot", 0)),
-        (int(r.get("flags", 0)) >> 24) & 0xFF,
-        int(r.get("offset", 0)),
         int(r.get("end", 0)) - int(r.get("start", 0)),
     ) for r in chosen)
     encoded = json.dumps(signature, separators=(",", ":")).encode("utf-8")
@@ -6833,6 +7021,13 @@ def _aes256_cbc_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
 
 
 def _aes256_cbc_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
+    if len(ciphertext) % 16:
+        # Say what is actually wrong.  Without this the short final block
+        # raises IndexError from inside the cipher, which the import path
+        # reports as the vaguer "it may be corrupt".
+        raise ValueError(
+            f"ciphertext is {len(ciphertext)} bytes, not a multiple of the "
+            "16-byte AES block size")
     w, nr = _aes_key_expansion(key)
     out = bytearray()
     prev = iv
@@ -7315,6 +7510,24 @@ def screen_connect(stdscr) -> str:
             add_log(f"Connected to {ip} via experimental MemDBG "
                     f"{native.get('version') or ''}; "
                     f"{'native memory I/O' if native_io else 'compatibility fallback'}")
+            # TurboScan, the console-side scanner, and the region classifier
+            # are all ps5debug-NG commands on port 744 and have no MemDBG
+            # equivalent. With MemDBG alone every scan silently falls back to
+            # transferring the whole region over the network -- on a 2 GiB
+            # game that is ~140 s instead of ~1 s. Say so at connect time
+            # rather than letting the user rediscover it per scan.
+            # Diagnostic only: never let a failed probe fail the connect,
+            # since native MemDBG is explicitly supposed to work with no
+            # legacy listener at all.
+            try:
+                probe = ps5_connect(ip, timeout=2.0)
+                probe.close()
+            except Exception:
+                add_log("ps5debug-NG (port 744) is not listening: TurboScan, "
+                        "the console scanner and the region classifier are "
+                        "unavailable. Scans will use the slower host path; "
+                        "load ps5debug-NG alongside MemDBG to keep them.",
+                        "warn")
         else:
             add_log(f"Connected to {ip} via ps5debug, {len(procs)} processes")
         return screen_proc_select(stdscr, procs)
@@ -7344,6 +7557,12 @@ def _clear_scan_state(stop_freezes: bool = True) -> None:
     state["scan_unknown"]   = False
     with _map_cache_lock:
         _map_cache.clear()
+    # A reconnect may be to a different payload build, so re-probe the
+    # commands whose support we learned by failing at them.
+    with _console_scan_lock:
+        _console_scan_supported.clear()
+    with _memdbg_maps_v2_lock:
+        _memdbg_maps_v2_supported.clear()
     _invalidate_pointer_index()
     _ScanSocket.clear_pool()
     gc.collect()
@@ -7889,7 +8108,13 @@ def do_scan_settings(stdscr) -> None:
     if selected is None:
         add_log("Scan settings unchanged")
         return
-    state["scan_engine"] = keys[options.index(selected)]
+    chosen = keys[options.index(selected)]
+    if chosen != current:
+        # Switching to host/console and back would otherwise re-adopt the
+        # session left resident by the last turbo scan, silently discarding
+        # every narrowing the host path did in between.
+        _close_turbo_session()
+    state["scan_engine"] = chosen
     add_log(f"Scan engine set to {state['scan_engine']}")
 
 
@@ -8224,8 +8449,20 @@ def do_scan_next(stdscr) -> None:
                          else int(delta_s, 0))
                 if not math.isfinite(float(delta)) or delta < 0:
                     raise ValueError("out of range")
-            except ValueError:
-                message_box(stdscr, ["Invalid delta — enter a positive integer."],
+                # A delta is a magnitude, not a value of the scanned type, so
+                # it is bounded by the width rather than by the signed range:
+                # 200 is a legitimate delta for an i8 counter that wraps.
+                # Anything past the width would wrap to a different, very
+                # surprising number.
+                if (VALUE_TYPES[type_key]["kind"] != "float" and
+                        delta > WIDTH_MAX[width]):
+                    raise ValueError("larger than the scanned width holds")
+            except ValueError as exc:
+                hint = ("Enter a positive number."
+                        if VALUE_TYPES[type_key]["kind"] == "float" else
+                        f"Enter a whole number from 0 to "
+                        f"{WIDTH_MAX[width]:,}.")
+                message_box(stdscr, [f"Invalid delta: {exc}", hint],
                             "Error", C_ERR)
                 return
 
@@ -8392,9 +8629,12 @@ def _refresh_visible_locked(ip: str, pid: int, addrs: list, width: int,
     type_key = _normalise_value_type(value_type, width)
     sock = None
     try:
-        # Build a _ScanSocket with an aggressively short timeout
+        # Build a _ScanSocket with an aggressively short timeout.  Go through
+        # set_timeout(): on the native MemDBG backend there is no ``_s`` to
+        # poke, and touching it directly killed this thread on every refresh
+        # tick, leaving every Results row stuck showing "…".
         sock = _ScanSocket(ip, pid)
-        sock._s.settimeout(1.5)   # type: ignore[union-attr]  short: fast exit on Q
+        sock.set_timeout(1.5)   # short: fast exit on Q
         for addr in addrs:
             if cancel_event and cancel_event.is_set():
                 break
@@ -8554,6 +8794,10 @@ def do_browse_nearby(stdscr, anchor: int) -> None:
             f"Found {len(candidate_addr):,} nearby candidates. Open them for safe visual preview?",
             "Nearby Candidates"):
         return
+    # This replaces the candidate list wholesale; a surviving resident
+    # TurboScan session would make the next Next Scan silently discard the
+    # whole nearby set and narrow the old server-side list instead.
+    _close_turbo_session()
     state["scan_results"] = candidate_addr
     state["scan_values"] = candidate_values
     state["scan_pid"] = state["pid"]
@@ -8629,6 +8873,9 @@ def do_discover_nearby(stdscr, anchor: int) -> None:
     message_box(stdscr, lines, "Nearby Candidates", C_OK)
     if confirm_box(stdscr, "Replace Results with these nearby candidates?",
                    "Nearby Discovery"):
+        # Wholesale replacement — discard any resident session first, same
+        # reason as do_browse_nearby.
+        _close_turbo_session()
         state["scan_results"] = changed_addr
         state["scan_values"] = new_values
         state["scan_pid"] = state["pid"]
@@ -8828,7 +9075,6 @@ def do_batch_preview_matching(stdscr) -> None:
         return
 
     originals = []
-    rejected = []
     result_addrs = sorted({int(raw_addr) for raw_addr in results})
     try:
         maps = _get_maps_cached(state["ip"], int(state["pid"]), ttl_override=0.0)
@@ -8924,8 +9170,10 @@ def do_batch_preview_matching(stdscr) -> None:
         return
     add_log(f"Batch preview restored {len(written)} fields "
             f"({match_value} → {replacement} → {match_value})")
-    note = (f"Skipped {len(rejected)} unreadable/non-writable Results."
-            if rejected else "All selected fields were writable and verified.")
+    # Every candidate is snapshot-read and writability-checked before the
+    # transaction starts, so anything that reaches here was verified; the old
+    # "skipped" branch read a list nothing ever appended to.
+    note = "All selected fields were writable and verified."
     message_box(stdscr, [f"Restored all {len(written)} fields to {match_value}.", note],
                 "Batch Preview Complete", C_OK)
     if identified and len(originals) > 1 and confirm_box(
@@ -9262,6 +9510,11 @@ def do_show_results(stdscr) -> None:
                 dropped = results[sel]
                 results = _make_addr_array(a for i, a in enumerate(results) if i != sel)
                 state["scan_results"] = results
+                # A resident TurboScan session is matched by connection/PID/
+                # width/value-type alone, never by candidate count, so it
+                # would happily narrow the server's pre-drop list and hand
+                # this address straight back on the next Next Scan.
+                _close_turbo_session()
                 # Unknown-value scans keep a parallel value snapshot.  Remove
                 # the matching element or the next relational scan sees a
                 # mismatched/corrupted address-value pair.
@@ -9361,13 +9614,21 @@ def _inspect_result(stdscr, addr: int, live_value: str = "…") -> None:
         elif key in (ord('d'), ord('D')):
             old_results = state["scan_results"]
             old_values = state.get("scan_values")
+            # searchsorted would be wrong here: after any host-path Next Scan
+            # scan_results comes back in ps5_read_batch's worker-flush order,
+            # not sorted, so it returned an index belonging to a different
+            # address and np.delete silently desynchronised scan_values from
+            # scan_results for every later relational scan.
             try:
-                drop_idx = int(np.searchsorted(old_results, addr))
+                hits = np.flatnonzero(np.asarray(old_results) == np.uint64(addr))
+                drop_idx = int(hits[0]) if len(hits) else -1
             except Exception:
                 drop_idx = -1
             state["scan_results"] = _make_addr_array(a for a in old_results if int(a) != addr)
             if old_values is not None and 0 <= drop_idx < len(old_values):
                 state["scan_values"] = np.delete(old_values, drop_idx)
+            state["scan_dropped"].add(addr)
+            _close_turbo_session()   # see the Results drop handler
             add_log(f"Dropped result {hex(addr)}", "warn")
             return
 
@@ -10253,6 +10514,9 @@ def do_import(stdscr) -> None:
                 "Import Cheats"):
             return
         state["cheats"].extend(imported)
+        # Imported cheats are unsaved work like any other, so Quit must warn
+        # about them; the .mc4/etaHEN import path already sets this.
+        state["cheats_dirty"] = True
         add_log(f"Imported {len(imported)} cheats from {path}")
         portable = sum(1 for cheat in imported if _is_portable_cheat(cheat))
         locked = sum(1 for cheat in imported if cheat.get("import_locked"))
@@ -10601,7 +10865,11 @@ def do_freeze(stdscr, selected_cheat: Optional[dict] = None) -> None:
     if mode == "Saved cheat toggle":
         cheat = selected_cheat
         if cheat is None:
-            names = [c.get("name", "Unnamed") for c in state["cheats"]]
+            # Number the labels: two cheats can legitimately share a name
+            # (only the import path de-duplicates), and a bare name lookup
+            # silently resolved every duplicate to the first one.
+            names = [f"{i + 1}. {c.get('name', 'Unnamed')}"
+                     for i, c in enumerate(state["cheats"])]
             selected = cycle_input(
                 stdscr, "Cheat             : ", 6, 3, names, names[0],
                 allow_cancel=True)

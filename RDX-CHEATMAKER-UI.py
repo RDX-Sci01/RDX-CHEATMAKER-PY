@@ -252,16 +252,20 @@ MEMDBG_VERSION = 1
 MEMDBG_CMD_HELLO = 0x0001
 MEMDBG_CMD_PROCESS_LIST = 0x0100
 MEMDBG_CMD_PROCESS_MAPS = 0x0101
+MEMDBG_CMD_PROCESS_MAPS_V2 = 0x0110
 MEMDBG_CMD_MEMORY_READ = 0x0200
 MEMDBG_CMD_MEMORY_WRITE = 0x0201
+MEMDBG_CMD_BATCH_WRITE = 0x0203
 MEMDBG_CMD_SCAN_POINTER = 0x0303
 MEMDBG_CAP_PROCESS_LIST = 1 << 0
 MEMDBG_CAP_PROCESS_MAPS = 1 << 1
 MEMDBG_CAP_MEMORY_READ = 1 << 2
 MEMDBG_CAP_MEMORY_WRITE = 1 << 3
+MEMDBG_CAP_BATCH_WRITE = 1 << 16
 MEMDBG_CAP_SCAN_POINTER = 1 << 10
 MEMDBG_MAX_MEMORY_READ = 1024 * 1024
 MEMDBG_MAX_WRITE_DATA = 1024 * 1024 - 16  # request body includes 16-byte header
+MEMDBG_BATCH_WRITE_MAX_ITEMS = 64
 
 # A TurboScan list session lives on its TCP connection.  Retaining that
 # connection lets subsequent exact scans use the payload's resident COUNT
@@ -837,14 +841,27 @@ def _freeze_manager_worker() -> None:
                     with _freeze_lock:
                         _freeze_status[runtime_id] = f"error: {exc}"
 
-            # Phase 2: collapse every resolved write into one round trip via
-            # 0xBDAACC04 (bulk write) instead of one CMD_PROC_WRITE per
-            # cheat. Falls back to the plain per-write path for a single
-            # entry (no batching benefit) or when MemDBG's native write path
-            # is active (bulk write is a ps5debug-wire-protocol command;
-            # native MemDBG writes already go through their own
-            # capability-gated path inside ps5_write).
-            if len(resolved) >= 2 and not _memdbg_has(MEMDBG_CAP_MEMORY_WRITE):
+            # Phase 2: collapse every resolved write into one round trip
+            # instead of one write per cheat. Three paths, most-specific
+            # first: MemDBG's own native batch write when available, else
+            # ps5debug-NG's 0xBDAACC04 bulk write when not on MemDBG's
+            # native write path, else the plain per-write loop (single
+            # entry has no batching benefit either way).
+            if len(resolved) >= 2 and _memdbg_has(MEMDBG_CAP_BATCH_WRITE):
+                try:
+                    results = memdbg_write_multi(
+                        state["ip"], state["pid"],
+                        [(addr, data) for _rid, addr, data in resolved],
+                        cancel_event=_freeze_stop, timeout=2.0)
+                except Exception as exc:
+                    results = [False] * len(resolved)
+                    add_log(f"MemDBG bulk freeze write failed: {exc}", "warn")
+                with _freeze_lock:
+                    for (runtime_id, address, _data), ok in zip(resolved, results):
+                        _freeze_status[runtime_id] = (
+                            f"active @ {hex(address)}" if ok
+                            else "error: payload rejected the write")
+            elif len(resolved) >= 2 and not _memdbg_has(MEMDBG_CAP_MEMORY_WRITE):
                 try:
                     results = ps5_write_multi(
                         state["ip"], state["pid"],
@@ -1094,8 +1111,14 @@ def _lz4_decompress_block(data: bytes, expected_length: int) -> bytes:
     return bytes(out)
 
 
+_memdbg_maps_v2_lock = threading.Lock()
+_memdbg_maps_v2_supported: dict = {}   # ip -> bool, learned once per host
+
+
 def _memdbg_unframe_memory(raw: bytes) -> bytes:
-    """Decode MemDBG's command-local raw/LZ4 memory-response frame."""
+    """Decode MemDBG's command-local raw/LZ4 response frame (used for both
+    native memory reads and, since it's the same generic framing, the
+    PROCESS_MAPS_V2 map list)."""
     if not raw:
         raise RuntimeError("empty MemDBG memory frame")
     if raw[0] == 0:
@@ -1206,8 +1229,10 @@ class _MemDBGClient:
             out.append({"pid": pid, "name": name})
         return out
 
-    def process_maps(self, pid: int) -> list:
-        raw = self.request(MEMDBG_CMD_PROCESS_MAPS, struct.pack("<i", int(pid)))
+    @staticmethod
+    def _parse_map_list_body(raw: bytes) -> list:
+        """Parse the `uint32 count + memdbg_map_entry_t[]` body shared by
+        PROCESS_MAPS and the unframed PROCESS_MAPS_V2 payload."""
         if len(raw) < 4:
             raise RuntimeError("short MemDBG map list")
         count = struct.unpack_from("<I", raw, 0)[0]
@@ -1223,6 +1248,64 @@ class _MemDBGClient:
             out.append({"start": start, "end": end, "prot": prot,
                         "flags": flags, "name": name})
         return out
+
+    def process_maps(self, pid: int) -> list:
+        """Map list, preferring the raw/LZ4-framed PROCESS_MAPS_V2 (smaller
+        transfer on large map tables). Probed once per host: on the first
+        failure for a given IP, V2 is remembered as unsupported so later
+        calls (map fetches happen constantly — every scan, every pointer
+        resolution, every export) don't keep retrying a doomed command.
+        """
+        with _memdbg_maps_v2_lock:
+            try_v2 = _memdbg_maps_v2_supported.get(self.ip) is not False
+        if try_v2:
+            try:
+                raw = _memdbg_unframe_memory(self.request(
+                    MEMDBG_CMD_PROCESS_MAPS_V2, struct.pack("<i", int(pid))))
+                maps = self._parse_map_list_body(raw)
+            except Exception:
+                with _memdbg_maps_v2_lock:
+                    _memdbg_maps_v2_supported[self.ip] = False
+            else:
+                with _memdbg_maps_v2_lock:
+                    _memdbg_maps_v2_supported[self.ip] = True
+                return maps
+        raw = self.request(MEMDBG_CMD_PROCESS_MAPS, struct.pack("<i", int(pid)))
+        return self._parse_map_list_body(raw)
+
+    def memory_write_multi(self, pid: int, entries: list) -> list:
+        """Bulk write via MEMDBG_CMD_BATCH_WRITE.
+
+        `entries` is [(address, data), ...], at most
+        MEMDBG_BATCH_WRITE_MAX_ITEMS long. Returns a list of bool the same
+        length as `entries` (True = that entry's write succeeded — both the
+        server status and the reported byte count must confirm it).
+        """
+        caps = int((self.hello or {}).get("capabilities", 0))
+        if not (caps & MEMDBG_CAP_BATCH_WRITE):
+            raise RuntimeError("MemDBG does not advertise native batch writes")
+        if not entries:
+            return []
+        if len(entries) > MEMDBG_BATCH_WRITE_MAX_ITEMS:
+            raise ValueError(
+                f"too many entries for one MemDBG batch write "
+                f"({len(entries)} > {MEMDBG_BATCH_WRITE_MAX_ITEMS})")
+        body = bytearray(struct.pack("<iII", int(pid), len(entries), 0))
+        for addr, data in entries:
+            if len(data) > MEMDBG_MAX_WRITE_DATA:
+                raise ValueError(
+                    f"entry at {hex(addr)} is {len(data)} bytes, over the "
+                    f"{MEMDBG_MAX_WRITE_DATA}-byte per-entry cap")
+            body += struct.pack("<QII", int(addr), len(data), 0)
+            body += data
+        raw = self.request(MEMDBG_CMD_BATCH_WRITE, bytes(body))
+        if len(raw) != len(entries) * 16:
+            raise RuntimeError("short MemDBG batch write response")
+        results = []
+        for i, (_addr, data) in enumerate(entries):
+            _r_addr, written, status = struct.unpack_from("<QII", raw, i * 16)
+            results.append(status == 0 and written == len(data))
+        return results
 
     def memory_read(self, pid: int, address: int, length: int) -> bytes:
         """Read through native MemDBG, splitting at its public 1 MiB limit."""
@@ -1560,6 +1643,44 @@ def _turbo_fetch_addresses(s: socket.socket, width: int, count: int,
     return out[:pos]
 
 
+def _turbo_fetch_addresses_and_values(s: socket.socket, width: int, count: int,
+                                      value_type: str,
+                                      cancel_event=None) -> tuple:
+    """Like _turbo_fetch_addresses, but also decodes each record's `current`
+    value field — used by the snapshot (unknown-value) path, which needs
+    values for display and as the next narrow's client-side baseline,
+    unlike the exact-match path where the value is already known."""
+    wanted = min(int(count), MAX_SCAN_RESULTS)
+    value_dtype = np.dtype(VALUE_TYPES[value_type]["dtype"])
+    out_addr = np.empty(wanted, dtype=_NP_ADDR_DTYPE)
+    out_val = np.empty(wanted, dtype=value_dtype)
+    pos = 0
+    page = 10_000
+    while pos < wanted:
+        take = min(page, wanted - pos)
+        get_body = struct.pack("<III", pos, take, 0)
+        s.sendall(cmd_header(CMD_TURBO_GET, len(get_body)) + get_body)
+        if struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0] != STATUS_SUCCESS:
+            raise RuntimeError("TurboScan result fetch rejected")
+        header = struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0]
+        actual = header & 0x7FFFFFFF
+        has_first = bool(header & 0x80000000)
+        rec_size = 8 + width * (3 if has_first else 2)
+        raw = _recv_exact_cancel(s, actual * rec_size, cancel_event)
+        if struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0] != STATUS_SUCCESS:
+            raise RuntimeError("TurboScan result fetch incomplete")
+        if actual == 0:
+            break
+        records = np.ndarray(shape=(actual,), dtype={
+            "names": ["addr", "current", "rest"],
+            "formats": ["<u8", value_dtype, f"V{rec_size - 8 - width}"],
+            "offsets": [0, 8, 8 + width], "itemsize": rec_size}, buffer=raw)
+        out_addr[pos:pos + actual] = records["addr"]
+        out_val[pos:pos + actual] = records["current"]
+        pos += actual
+    return out_addr[:pos], out_val[:pos]
+
+
 def _close_turbo_session() -> None:
     """Best-effort release of the console-resident result list and socket."""
     global _turbo_session
@@ -1706,7 +1827,8 @@ def ps5_scan_exact_turbo(ip: str, pid: int, value, width: int,
         with _turbo_session_lock:
             _turbo_session = {"socket": s, "ip": ip, "pid": pid,
                               "width": width, "count": int(count),
-                              "engines": engines, "value_type": type_key}
+                              "engines": engines, "value_type": type_key,
+                              "mode": "exact"}
         retain_session = True
         return out
     finally:
@@ -1730,7 +1852,8 @@ def ps5_scan_next_turbo(ip: str, pid: int, value, width: int,
         type_key = _normalise_value_type(value_type, width)
         if not session or any((session["ip"] != ip, session["pid"] != pid,
                                session["width"] != width,
-                               session.get("value_type", type_key) != type_key)):
+                               session.get("value_type", type_key) != type_key,
+                               session.get("mode", "exact") != "exact")):
             raise RuntimeError("no matching resident TurboScan session")
         s = session["socket"]
         old_count = int(session["count"])
@@ -1771,6 +1894,257 @@ def ps5_scan_next_turbo(ip: str, pid: int, value, width: int,
         except Exception:
             # A cancelled or failed command leaves stream framing uncertain.
             # Drop the session so subsequent scans safely use host fallback.
+            _turbo_session = None
+            s.close()
+            raise
+
+
+# Wire compareType codes for CC12's relational narrow of a resident snapshot
+# session (protocol.md 7.2, cmpType 0-12). Modes without "by" compare against
+# the session's own tracked prior value server-side and need no operand.
+_SNAPSHOT_COMPARE_TYPE = {
+    "increased":    5,   # IncreasedValue    — no operand
+    "increased by": 6,   # IncreasedValueBy  — operand = delta
+    "decreased":    7,   # DecreasedValue    — no operand
+    "decreased by": 8,   # DecreasedValueBy  — operand = delta
+    "changed":      9,   # ChangedValue      — no operand
+    "unchanged":    10,  # UnchangedValue    — no operand
+}
+
+
+def ps5_scan_unknown_turbo(ip: str, pid: int, width: int,
+                           regions: list, aligned: bool = True,
+                           cancel_event=None, progress_cb=None,
+                           value_type: Optional[str] = None) -> tuple:
+    """Unknown-initial-value First Scan via CC11 + TS_SNAPSHOT: the console
+    holds the baseline itself (RAM/disk-hybrid, per-connection) instead of
+    RDX transferring and holding every candidate's raw bytes locally.
+    Retains its server-resident snapshot session for narrowing via
+    ps5_scan_relational_turbo, exactly as ps5_scan_exact_turbo retains its
+    own session for ps5_scan_next_turbo. Returns (addrs, values) matching
+    scan_first_unknown()'s contract exactly, so callers can try this first
+    and fall back to that unchanged.
+
+    TS_SNAPSHOT_INCLUDE_ZEROS is always set: scan_first_unknown's client-side
+    path records every aligned address regardless of value, but the server's
+    snapshot default *drops* all-zero slots — this flag is required for
+    behavioral parity with the existing path, not an optional tuning knob.
+    """
+    global _turbo_session
+    _close_turbo_session()
+    ps5_auth_scanner(ip)
+    version, engines, _ = ps5_turboscan_caps(ip)
+    required = 0x08 | 0x10  # TSE_SNAPSHOT, TSE_SNAPSHOT_SEGMENTS
+    if version < 1 or (engines & required) != required:
+        raise RuntimeError("required TurboScan snapshot engines are unavailable")
+
+    type_key = _normalise_value_type(value_type, width)
+    value_dtype = np.dtype(VALUE_TYPES[type_key]["dtype"])
+    empty = (np.empty(0, dtype=_NP_ADDR_DTYPE), np.empty(0, dtype=value_dtype))
+
+    # Segment merge + alignment: identical to ps5_scan_exact_turbo's, so a
+    # snapshot scan covers exactly the same slots an exact-value turbo scan
+    # over the same regions/alignment would.
+    combined = []
+    for start, end in sorted(regions):
+        if combined and start <= combined[-1][1]:
+            combined[-1] = (combined[-1][0], max(combined[-1][1], end))
+        else:
+            combined.append((start, end))
+    merged = []
+    for start, end in combined:
+        if aligned:
+            start += (-start) % width
+            if start + width > end:
+                continue
+        while start < end:
+            max_piece = 0xFFFFFFFF
+            if aligned and width > 1:
+                max_piece -= max_piece % width
+            piece_end = min(end, start + max_piece)
+            merged.append((start, piece_end))
+            start = piece_end
+    if not merged:
+        return empty
+    if len(merged) > 1_048_576:
+        raise RuntimeError("too many TurboScan segments")
+
+    wire_type = SCAN_VALUE_TYPE_ID[type_key]
+    flags = 0x04 | 0x08 | 0x10  # TS_SNAPSHOT | TS_SNAPSHOT_INCLUDE_ZEROS | TS_SNAPSHOT_SEGMENTS
+    alignment = width if aligned else 1
+    # compareType 11 = UnknownInitialValue; lenData 0 — TS_SNAPSHOT needs no seed.
+    body = struct.pack("<IQIBBBII", pid, 0, 0, wire_type, 11,
+                       alignment, 0, flags)
+    total_bytes = sum(end - start for start, end in merged)
+    if progress_cb:
+        progress_cb(0, max(total_bytes, 1))
+
+    s = ps5_connect(ip)
+    session_created = False
+    retain_session = False
+    try:
+        s.sendall(cmd_header(CMD_TURBO_START, len(body)) + body)
+        if struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0] != STATUS_SUCCESS:
+            raise RuntimeError("TurboScan snapshot start rejected")
+        # TS_SNAPSHOT needs no seed value, but the wire still has two leading
+        # acks (protocol.md: "after the two leading CMD_SUCCESS acks... reads
+        # the trailing segment list") — sending zero bytes here mirrors
+        # ps5_scan_exact_turbo's ack1-then-value-then-ack2 shape with an
+        # empty value phase, matching the exact-segmented case's documented
+        # "after the two acks, reads the segment list" ordering exactly.
+        s.sendall(b"")
+        if struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0] != STATUS_SUCCESS:
+            raise RuntimeError("TurboScan snapshot value phase rejected")
+
+        segment_data = bytearray(struct.pack("<I", len(merged)))
+        for start, end in merged:
+            segment_data.extend(struct.pack("<QI", start, end - start))
+        s.sendall(segment_data)
+        # No ack after the segment list — straight into the plan/progress/
+        # summary stream, exactly like the exact-segmented case goes
+        # straight into its 12-byte summary with no ack in between.
+
+        # Heartbeat: advance progress 0→90% while blocking on the server scan,
+        # same time-based estimate ps5_scan_exact_turbo uses for the same
+        # reason (segmented scans give no fine-grained per-byte feedback
+        # here either — the real progress records arrive after this phase).
+        _hb_stop = threading.Event()
+        if progress_cb and total_bytes > 0:
+            def _heartbeat():
+                _estimated_secs = max(total_bytes / (500 * 1024 * 1024), 0.5)
+                _step = max(int(total_bytes * 0.01), 1)
+                _interval = _estimated_secs / 99
+                _done = 0
+                _cap = int(total_bytes * 0.99)
+                while not _hb_stop.wait(max(_interval, 0.05)):
+                    _done = min(_done + _step, _cap)
+                    try:
+                        progress_cb(_done, total_bytes)
+                    except Exception:
+                        pass
+            _hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+            _hb_thread.start()
+        else:
+            _hb_thread = None
+
+        try:
+            _slot_count, _plan_total_bytes = struct.unpack(
+                "<QQ", _recv_exact_cancel(s, 16, cancel_event))
+            while True:
+                bytes_done = struct.unpack(
+                    "<Q", _recv_exact_cancel(s, 8, cancel_event))[0]
+                if bytes_done == 0xFFFFFFFFFFFFFFFF:
+                    break
+                if progress_cb:
+                    progress_cb(min(bytes_done, total_bytes), max(total_bytes, 1))
+            snapshot_ok, survivor_count = struct.unpack(
+                "<IQ", _recv_exact_cancel(s, 12, cancel_event))
+        finally:
+            _hb_stop.set()
+            if _hb_thread is not None:
+                _hb_thread.join(timeout=0.5)
+
+        if not snapshot_ok:
+            raise RuntimeError("TurboScan snapshot storage exceeded capacity")
+        session_created = True
+        if struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0] != STATUS_SUCCESS:
+            raise RuntimeError("TurboScan snapshot did not complete")
+
+        addrs, vals = _turbo_fetch_addresses_and_values(
+            s, width, survivor_count, type_key, cancel_event)
+
+        if survivor_count > MAX_SCAN_RESULTS and cancel_event:
+            cancel_event.truncated = True
+        if progress_cb:
+            progress_cb(max(total_bytes, 1), max(total_bytes, 1))
+        add_log(f"TurboScan snapshot: {len(addrs):,}/{survivor_count:,} "
+                f"candidates, {total_bytes / 1_073_741_824:.2f} GiB scanned")
+        with _turbo_session_lock:
+            _turbo_session = {"socket": s, "ip": ip, "pid": pid,
+                              "width": width, "count": int(survivor_count),
+                              "engines": engines, "value_type": type_key,
+                              "mode": "snapshot"}
+        retain_session = True
+        return addrs, vals
+    finally:
+        if not retain_session:
+            if session_created:
+                try:
+                    s.sendall(cmd_header(CMD_TURBO_END))
+                    recv_exact(s, 4)
+                except Exception:
+                    pass
+            s.close()
+
+
+def ps5_scan_relational_turbo(ip: str, pid: int, width: int,
+                              mode_lbl: str, delta,
+                              cancel_event=None, progress_cb=None,
+                              value_type: Optional[str] = None) -> tuple:
+    """Narrow a resident snapshot session (see ps5_scan_unknown_turbo) via
+    CC12 + TS_SERVER_RESIDENT with a relational compareType, instead of
+    scan_next_relational's client-driven re-read-and-compare over every
+    candidate. Requires a matching snapshot-mode session; raises otherwise
+    so the caller can fall back to that unchanged. Returns (addrs, values)
+    matching scan_next_relational()'s contract.
+    """
+    global _turbo_session
+    compare_type = _SNAPSHOT_COMPARE_TYPE.get(str(mode_lbl))
+    if compare_type is None:
+        raise ValueError(f"unsupported relational mode for TurboScan: {mode_lbl!r}")
+    needs_operand = mode_lbl in ("increased by", "decreased by")
+
+    with _turbo_session_lock:
+        session = _turbo_session
+        type_key = _normalise_value_type(value_type, width)
+        if not session or any((session["ip"] != ip, session["pid"] != pid,
+                               session["width"] != width,
+                               session.get("value_type", type_key) != type_key,
+                               session.get("mode") != "snapshot")):
+            raise RuntimeError("no matching resident TurboScan snapshot session")
+        s = session["socket"]
+        old_count = int(session["count"])
+        wire_type = SCAN_VALUE_TYPE_ID[type_key]
+        operand = _pack_typed_value(delta, type_key, width) if needs_operand else b""
+        flags = 0x02  # TS_SERVER_RESIDENT
+        if session["engines"] & 0x200:
+            flags |= 0x100  # TS_RESCAN_ALIASING
+        body = struct.pack("<IQBBII", pid, 0, wire_type, compare_type,
+                           len(operand), flags)
+        try:
+            if progress_cb:
+                progress_cb(0, max(old_count, 1))
+            s.sendall(cmd_header(CMD_TURBO_COUNT, len(body)) + body)
+            if struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0] != STATUS_SUCCESS:
+                raise RuntimeError("TurboScan snapshot rescan rejected")
+            s.sendall(operand)
+
+            # COUNT has a single ack (above), unlike START's two — matches
+            # ps5_scan_next_turbo's proven wire sequence exactly: send
+            # header+body, one ack, send the operand (here: none for
+            # operand-free relational modes), then straight into the
+            # progress stream.
+            while True:
+                scanned = struct.unpack(
+                    "<Q", _recv_exact_cancel(s, 8, cancel_event))[0]
+                if scanned == 0xFFFFFFFFFFFFFFFF:
+                    break
+                if progress_cb:
+                    progress_cb(min(int(scanned), old_count), max(old_count, 1))
+            new_count = struct.unpack("<Q", _recv_exact_cancel(s, 8, cancel_event))[0]
+            if struct.unpack("<I", _recv_exact_cancel(s, 4, cancel_event))[0] != STATUS_SUCCESS:
+                raise RuntimeError("TurboScan snapshot rescan failed")
+            session["count"] = int(new_count)
+            addrs, vals = _turbo_fetch_addresses_and_values(
+                s, width, new_count, type_key, cancel_event)
+            if cancel_event is not None:
+                cancel_event.truncated = new_count > MAX_SCAN_RESULTS
+            if progress_cb:
+                progress_cb(max(old_count, 1), max(old_count, 1))
+            add_log(f"Turbo snapshot next scan ({mode_lbl}): "
+                    f"{len(addrs):,}/{new_count:,} remain")
+            return addrs, vals
+        except Exception:
             _turbo_session = None
             s.close()
             raise
@@ -2002,6 +2376,36 @@ def ps5_write_multi(ip: str, pid: int, entries: list,
                 try: s.close()
                 except Exception: pass
     return [False] * len(entries)
+
+
+def memdbg_write_multi(ip: str, pid: int, entries: list,
+                       cancel_event: Optional[threading.Event] = None,
+                       timeout: float = 5.0) -> list:
+    """Retry-wrapping free function around _MemDBGClient.memory_write_multi,
+    mirroring ps5_write's MemDBG-native retry loop. Raises on total failure
+    (every attempt exhausted) so the caller can fall back to per-write."""
+    if not entries:
+        return []
+    native_exc: Exception = RuntimeError("no attempts")
+    for attempt in range(_UI_MAX_RETRIES):
+        if cancel_event and cancel_event.is_set():
+            return [False] * len(entries)
+        client = _MemDBGClient(ip, timeout=timeout)
+        try:
+            client.connect()
+            return client.memory_write_multi(pid, entries)
+        except Exception as exc:
+            native_exc = exc
+            if attempt < _UI_MAX_RETRIES - 1:
+                delay = 0.1 * (attempt + 1)
+                if cancel_event:
+                    if cancel_event.wait(delay):
+                        return [False] * len(entries)
+                else:
+                    time.sleep(delay)
+        finally:
+            client.close()
+    raise native_exc
 
 
 def ps5_write_verified(ip: str, pid: int, addr: int, data: bytes) -> tuple:
@@ -3568,6 +3972,30 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
         return (np.empty(0, dtype=_NP_ADDR_DTYPE),
                 np.empty(0, dtype=value_dtype))
 
+    # Prefer TurboScan's server-side snapshot — the console holds the
+    # baseline itself instead of RDX transferring the whole region and
+    # holding it in its own process — matching scan_first's exact-value
+    # engine-selection pattern exactly. Falls back to the client-side
+    # pipeline below on any failure (older payload, TS_SNAPSHOT engine
+    # unavailable, etc.), same as scan_first's own turbo fallback.
+    engine = state.get("scan_engine", "auto")
+    if (engine in ("auto", "turbo") and
+            os.environ.get("RDX_TURBO_SCAN", "1") != "0"):
+        try:
+            selected_ranges = sorted((r['start'], r['end']) for r in scannable)
+            addrs, vals = ps5_scan_unknown_turbo(
+                ip, pid, width, selected_ranges, aligned,
+                cancel_event, progress_cb, value_type=type_key)
+            add_log("Turbo unknown-value scan completed in "
+                    f"{max(time.monotonic() - started, 1e-9):.2f}s")
+            return addrs, vals
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            add_log(f"TurboScan snapshot unavailable ({exc})", "warn")
+            if engine == "turbo":
+                raise
+
     work: list = []
     for r in scannable:
         size = r['end'] - r['start']
@@ -3864,6 +4292,29 @@ def scan_next_relational(ip: str, pid: int, width: int,
     spec = VALUE_TYPES[type_key]
     kind = spec["kind"]
     dtype = np.dtype(spec["dtype"])
+
+    # Prefer narrowing a resident TurboScan snapshot session server-side —
+    # matches scan_next's own exact-value engine-selection pattern,
+    # including its same float-tolerance gate: the server's relational
+    # compareTypes do an exact comparison with no tolerance concept, so a
+    # nonzero float tolerance must keep using the host path, which honours
+    # it. Falls back to the client-driven read-and-compare below whenever
+    # there's no matching resident session (e.g. the First Scan that built
+    # `prev_addrs`/`prev_values` ran on the host path) or any other failure.
+    if (mode in _SNAPSHOT_COMPARE_TYPE and
+            not (kind == "float" and float(tolerance) > 0) and
+            state.get("scan_engine", "auto") in ("auto", "turbo")):
+        try:
+            return ps5_scan_relational_turbo(
+                ip, pid, width, mode, delta, cancel_event, progress_cb,
+                value_type=type_key)
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            add_log(f"Resident Turbo snapshot rescan unavailable ({exc}); "
+                    "using host filter", "warn")
+            if state.get("scan_engine") == "turbo":
+                raise
 
     # prev_addrs must be sorted for searchsorted.
     if len(prev_addrs) > 1 and not np.all(prev_addrs[:-1] <= prev_addrs[1:]):

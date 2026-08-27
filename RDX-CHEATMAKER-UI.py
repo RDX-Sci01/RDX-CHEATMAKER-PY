@@ -6845,7 +6845,7 @@ def screen_proc_select(stdscr, procs: list) -> str:
         draw_statusbar(stdscr, [
             ("arrows navigate", C_NORM), ("Enter attach", C_OK),
             ("type to filter", C_WARN),  ("Tab sort", C_NORM),
-            ("Bksp clear", C_NORM),      ("Q back", C_NORM),
+            ("Bksp clear", C_NORM),      ("Esc back", C_NORM),
         ])
         stdscr.refresh()
 
@@ -6872,7 +6872,11 @@ def screen_proc_select(stdscr, procs: list) -> str:
                                "last_process": p["name"]})
             add_log(f"Attached to PID {state['pid']} ({state['proc_name']})")
             return "main"
-        elif key in (ord('q'), ord('Q')):
+        elif key == 27:
+            # 'q'/'Q' are deliberately NOT bound to quit here: this screen
+            # has a live typeahead filter, and 'q' is a normal, common
+            # character in process names — treating it as a quit shortcut
+            # would make it impossible to ever type. Esc is unambiguous.
             return "connect"
         elif key in (curses.KEY_BACKSPACE, 127, 8):   # 8 = BS on some terminals
             filter_str = filter_str[:-1]
@@ -6989,7 +6993,13 @@ def do_command_palette(stdscr) -> None:
         key = stdscr.getch()
         if key == curses.KEY_RESIZE:
             curses.update_lines_cols(); continue
-        if key in (27, ord('q'), ord('Q')) and not query:
+        if key == 27:
+            # 'q'/'Q' are deliberately NOT bound to quit here: this is a
+            # live fuzzy-search query field, and 'q' is a normal character
+            # in command names — treating it as a quit shortcut would make
+            # it impossible to ever start a query with "q". Esc is
+            # unambiguous. (Same class of bug as screen_proc_select's
+            # process filter, fixed the same way.)
             return
         if key in (curses.KEY_UP,):
             sel = max(0, sel - 1)
@@ -8551,7 +8561,7 @@ def do_show_results(stdscr) -> None:
                 age_label = f"⚠ stale (~{data_age}s)"
             draw_statusbar(stdscr, [
                 (f"{len(results):,} results", C_WARN),
-                ("↑↓ Enter inspect", C_NORM), ("Q back", C_NORM),
+                ("↑↓ Enter inspect", C_NORM), ("Esc/Q back", C_NORM),
                 ("N next", C_ACC), ("R permanent", C_ACC),
                 ("C cheat", C_OK), ("M more", C_WARN),
                 (age_label, C_ERR if stale else C_ACC if is_refreshing else C_NORM),
@@ -8753,7 +8763,7 @@ def _inspect_result(stdscr, addr: int, live_value: str = "…") -> None:
         safe_addstr(stdscr, 11, 5, "D  Drop result", color(C_ERR))
         draw_statusbar(stdscr, [("A apply", C_OK), ("C cheat", C_OK),
                                 ("P permanent", C_ACC), ("D drop", C_ERR),
-                                ("Esc back", C_NORM)])
+                                ("Esc/Q back", C_NORM)])
         stdscr.refresh()
         key = stdscr.getch()
         if key == curses.KEY_RESIZE:
@@ -9094,7 +9104,7 @@ def _inspect_cheat(stdscr, idx: int) -> None:
                      color(C_OK) if frozen else color(C_NORM)))
         draw_statusbar(stdscr, [("A apply", C_OK), ("E edit", C_WARN),
                                 ("F/Space toggle", C_ACC),
-                                ("D delete", C_ERR), ("Esc back", C_NORM)])
+                                ("D delete", C_ERR), ("Esc/Q back", C_NORM)])
         stdscr.refresh()
         key = stdscr.getch()
         if key == curses.KEY_RESIZE:
@@ -9214,13 +9224,13 @@ def do_cheat_list(stdscr) -> None:
             status_items = [
                 ("↑↓ navigate", C_NORM), ("Enter inspect", C_OK),
                 ("F/Space toggle", C_ACC),
-                ("A apply once", C_WARN), ("D delete", C_ERR),
+                ("A apply once", C_OK), ("D delete", C_ERR),
             ]
             if state.get("last_deleted_cheat"):
                 status_items.append(("Z restore", C_OK))
             status_items.append(
                 ("⟳ live" if is_refreshing else "live values", C_ACC))
-            status_items.append(("Q back", C_NORM))
+            status_items.append(("Esc/Q back", C_NORM))
             draw_statusbar(stdscr, status_items)
             stdscr.refresh()
 
@@ -9272,7 +9282,7 @@ def do_cheat_list(stdscr) -> None:
                     cheats = state["cheats"]
                     with cache_lock:
                         live_cache.clear()
-            elif key in (ord('q'), ord('Q')):
+            elif key in (ord('q'), ord('Q'), 27):
                 break
     finally:
         stdscr.nodelay(False)
@@ -9732,7 +9742,7 @@ def _select_export_cheats(stdscr, cheats: list) -> Optional[list]:
         draw_statusbar(stdscr, [
             ("↑↓ navigate", C_NORM), ("Space toggle", C_ACC),
             ("A all", C_OK), ("N none", C_WARN),
-            ("Enter continue", C_OK), ("Esc cancel", C_ERR),
+            ("Enter continue", C_OK), ("Esc/Q cancel", C_NORM),
         ])
         stdscr.refresh()
         key = stdscr.getch()
@@ -10505,7 +10515,7 @@ def do_resolve_permanent(stdscr, target_addr: int) -> None:
 
         draw_statusbar(stdscr, [
             ("↑↓ choose", C_NORM), ("Enter save", C_OK),
-            ("Q back", C_NORM)])
+            ("Esc/Q back", C_NORM)])
         stdscr.refresh()
         key = stdscr.getch()
         if key == curses.KEY_RESIZE:
@@ -10590,7 +10600,7 @@ def do_pointer_scan(stdscr, target_addr: Optional[int] = None,
                     ("↑↓ navigate", C_NORM),
                     ("Enter select", C_OK),
                     ("M manual", C_NORM),
-                    ("Q cancel", C_NORM),
+                    ("Esc/Q cancel", C_NORM),
                 ])
                 stdscr.refresh()
 
@@ -10792,7 +10802,7 @@ def do_pointer_scan(stdscr, target_addr: Optional[int] = None,
                 (f"{len(verified_matches)} verified", C_OK),
                 ("Enter save", C_OK),
                 ("A all  V verified", C_NORM),
-                ("Q back", C_NORM),
+                ("Esc/Q back", C_NORM),
             ])
             stdscr.refresh()
 
@@ -10918,13 +10928,13 @@ def do_pointer_chain_verify(stdscr, candidate: dict, original_target: int) -> No
 
         menu_row = min(status_row + 3, h - 5)
         safe_addstr(stdscr, menu_row, 3,
-            "[E] Edit offsets   [T] Test again   [S] Save as cheat   [Q] Back",
+            "[E] Edit offsets   [T] Test again   [S] Save as cheat   [Esc/Q] Back",
             color(C_NORM))
         draw_statusbar(stdscr, [
             ("E edit offsets", C_WARN),
             ("T re-test",      C_OK),
             ("S save cheat",   C_OK),
-            ("Q back",         C_NORM),
+            ("Esc/Q back",         C_NORM),
         ])
         stdscr.refresh()
 
@@ -11147,7 +11157,7 @@ def do_log(stdscr) -> None:
             safe_addstr(stdscr, 3 + i, 3, line[:w - 6], color(cp))
         draw_statusbar(stdscr, [
             (f"{offset+1}-{min(offset+visible,len(snap))}/{len(snap)}", C_WARN),
-            ("↑↓/PgUp/PgDn", C_NORM), ("S save", C_OK), ("Q back", C_NORM),
+            ("↑↓/PgUp/PgDn", C_NORM), ("S save", C_OK), ("Esc/Q back", C_NORM),
         ])
         stdscr.refresh()
         key = stdscr.getch()

@@ -53,52 +53,6 @@ see **[`info/RDX-CHEATMAKER-PY_README.md`](info/RDX-CHEATMAKER-PY_README.md)**.
 
 ---
 
-## Status
-
-Version 1.0.0. Current implementation: `RDX-CHEATMAKER-UI-patch76.py`.
-**210 automated tests**, all passing.
-
-This section is deliberately specific about what has and has not touched real
-hardware, because "it has tests" and "it works on a console" are different
-claims.
-
-### Validated on a real PS5
-
-Tested against **Enter the Gungeon (CUSA01659)**, a Unity/IL2CPP title, over
-ps5debug-NG:
-
-- Process listing, memory maps, TurboScan capability probe, region classifier
-- Exact-value scanning on all ten types, aligned and unaligned, all scan scopes
-- Unknown-value snapshot scanning — 100.0% slot coverage, zero-value parity
-  confirmed
-- Relational narrowing, including the delta-operand modes
-- AOB scanning with wildcards, verified by positive *and* negative controls
-- Scan cancellation, result drop/undo, large batch-read correctness
-- Verified memory writes, confirmed changing the game on screen
-- Simultaneous freezes via the bulk-write path — held across 386 exchanges
-- Pointer search: 164 chains found and verified, rooted in real modules
-- Trainer import across `.mc4`, GoldHEN/etaHEN JSON and native `.rdx.json`,
-  including every rejection path
-
-### Not yet validated on hardware
-
-- **The MemDBG backend, in its entirety.** It is implemented and unit-tested,
-  but no session has run against a real MemDBG daemon. Treat it as
-  experimental.
-- **The second half of pointer promotion.** Chains have been found and
-  validated across one relocation; the two-reload promotion to a permanent,
-  reboot-surviving trainer has not been completed end to end.
-- **`.mc4` against a live CheatRunner.** The container format is verified
-  against a real third-party file and a FIPS-197 AES known-answer test, but no
-  CheatRunner instance has consumed a file this tool produced.
-- **The optional Numba acceleration**, which requires `numba` to be installed.
-
-[`HARDWARE_TEST_CHECKLIST.md`](HARDWARE_TEST_CHECKLIST.md) tracks all of this
-item by item, including notes on two ways hardware results are easy to
-misread.
-
----
-
 ## Requirements
 
 **Console** — a jailbroken PS5 or PS4 running

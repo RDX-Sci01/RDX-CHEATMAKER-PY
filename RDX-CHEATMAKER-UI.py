@@ -483,6 +483,31 @@ PROC_ENTRY_SIZE = 36
 #   uint64 offset; uint16 prot;  → 58 bytes (no padding between fields)
 MAP_ENTRY_SIZE = 58
 
+# Sanity bounds on the uint32 entry counts that CMD_PROC_LIST and CMD_PROC_MAPS
+# put on the wire.  The payload declares no server-side cap for either (see
+# protocol reference 254-299), and the protocol itself notes that a stream can
+# become "untrustworthy" after a cap violation elsewhere.  An unbounded count
+# is therefore attacker-free but not garbage-free: on a desynced stream those
+# four bytes are whatever happened to be in the buffer, and feeding
+# range(0xFFFFFFFF) a 58-byte-per-entry loop turns ~400 MB of stream into
+# >3 GB of Python dicts in about seven seconds.  That matters beyond a wasted
+# allocation -- an OOM kill is SIGKILL, which _install_signal_teardown()
+# explicitly cannot catch, so it would leave a SIGSTOPped game on the console.
+# Real hardware measured 307 map rows and 87 processes; these caps sit far
+# above anything real while still bounding the failure.
+MAX_PROC_ENTRIES = 4096
+MAX_MAP_ENTRIES = 65536
+
+
+def _checked_entry_count(raw: bytes, limit: int, what: str) -> int:
+    """Decode a uint32 wire count, refusing implausible values."""
+    count = struct.unpack("<I", raw)[0]
+    if count > limit:
+        raise RuntimeError(
+            f"{what} count of {count:,} exceeds the sane maximum of {limit:,}; "
+            f"the connection stream is out of sync — reconnect to the console")
+    return count
+
 TITLE_ID_RE = re.compile(r'^[A-Z]{4}\d{5}$')
 
 # ── scan limits ───────────────────────────────────────────────────────────────
@@ -2208,7 +2233,8 @@ def ps5_proc_list(ip: str) -> list:
         s.sendall(cmd_header(CMD_PROC_LIST))
         if not check_ok(s):
             raise RuntimeError("proc list command rejected")
-        count = struct.unpack("<I", recv_exact(s, 4))[0]
+        count = _checked_entry_count(recv_exact(s, 4), MAX_PROC_ENTRIES,
+                                     "process list")
         procs = []
         for _ in range(count):
             raw  = recv_exact(s, PROC_ENTRY_SIZE)
@@ -2237,7 +2263,8 @@ def ps5_maps(ip: str, pid: int) -> list:
         s.sendall(cmd_header(CMD_PROC_MAPS, len(body)) + body)
         if not check_ok(s):
             raise RuntimeError("proc maps command rejected")
-        count = struct.unpack("<I", recv_exact(s, 4))[0]
+        count = _checked_entry_count(recv_exact(s, 4), MAX_MAP_ENTRIES,
+                                     "memory map")
         maps = []
         for _ in range(count):
             raw   = recv_exact(s, MAP_ENTRY_SIZE)
@@ -2720,7 +2747,13 @@ def _debug_parse_event(packet: bytes) -> dict:
 
 def _debug_disasm(s: socket.socket, pid: int, address: int,
                   length: int = 32, max_entries: int = 16) -> list:
-    body = struct.pack("<IQII", int(pid), int(address), int(length), int(max_entries))
+    # The payload validates max_entries as 1..1000000 and answers CMD_ERROR
+    # outside that, so a bad argument must not reach the wire at all.
+    max_entries = int(max_entries)
+    if not 1 <= max_entries <= 1_000_000:
+        raise ValueError(
+            f"max_entries must be between 1 and 1,000,000, got {max_entries}")
+    body = struct.pack("<IQII", int(pid), int(address), int(length), max_entries)
     s.sendall(cmd_header(CMD_PROC_DISASM_REGION, len(body)) + body)
     if not _debug_status_ok(s):
         raise RuntimeError("disassembly request rejected")
@@ -2729,6 +2762,20 @@ def _debug_disasm(s: socket.socket, pid: int, address: int,
         raw = recv_exact(s, 32)
         if raw == b"\xFF" * 32:
             break
+        # The server sends at most max_entries records and then the sentinel
+        # (protocol reference 380-385), so a further record means the stream
+        # has desynced -- typically unread bytes left on this socket by an
+        # earlier command. Without this bound the loop is infinite and
+        # accumulating: a desynced stream produced 6.5 million entries and
+        # 2.7 GB of RSS in 5.4 s for a request that asked for 16. That is far
+        # worse here than elsewhere, because this runs with the target process
+        # stopped inside _trace_temporary_access -- an OOM kill is SIGKILL,
+        # the teardown cannot run, and the game is left SIGSTOPped.
+        if len(out) >= max_entries:
+            raise RuntimeError(
+                f"disassembly stream did not terminate after {max_entries} "
+                f"entries; the connection stream is out of sync — reconnect "
+                f"to the console")
         addr, rip_rel, mem_disp = struct.unpack_from("<QQq", raw, 0)
         insn_len, kind, mem_base, mem_index, mem_scale = struct.unpack_from("<BBBBB", raw, 24)
         mnemonic = struct.unpack_from("<B", raw, 29)[0]
@@ -2767,8 +2814,34 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(("0.0.0.0", 755))
-    listener.listen(1)
+    # Port 755 is not ours to choose: the console connects *out* to the client
+    # and ps5debug-NG hard-codes htons(755) in debug.c (protocol ref 1.9), so
+    # the client must already be listening there before CMD_DEBUG_ATTACH. It is
+    # below 1024, which is privileged on Linux and macOS -- so an ordinary user
+    # run fails here with a bare "[Errno 13] Permission denied" that names
+    # neither the port nor the remedy. Bind before attaching, and translate the
+    # two failures that actually happen into something actionable.
+    try:
+        listener.bind(("0.0.0.0", 755))
+        listener.listen(1)
+    except PermissionError as exc:
+        listener.close()
+        raise RuntimeError(
+            f"cannot listen on TCP port 755 for the debug interrupt channel: "
+            f"{exc}. The console dials this fixed port itself, so it cannot be "
+            f"changed. Either run RDX as root, or grant the interpreter the "
+            f"bind capability once:\n"
+            f"    sudo setcap 'cap_net_bind_service=+ep' "
+            f"$(readlink -f $(command -v python3))\n"
+            f"(the capability applies to that interpreter for every program it "
+            f"runs, so prefer sudo if that is not wanted)") from exc
+    except OSError as exc:
+        listener.close()
+        raise RuntimeError(
+            f"cannot listen on TCP port 755 for the debug interrupt channel: "
+            f"{exc}. Another process is holding it -- typically an earlier RDX "
+            f"run whose listener has not been released yet, or a second "
+            f"debugger. Close it and retry.") from exc
     listener.settimeout(max(timeout + 1.0, 2.0))
 
     cmd = None
@@ -5478,6 +5551,54 @@ class _ReversePointerIndex:
         return out
 
 
+# Live disk indexes, so a crash or Ctrl-C cannot strand their shard files.
+# One index for a multi-GiB process can hold hundreds of MiB of .npy shards,
+# and close() was previously the only thing that removed them.
+_disk_index_registry = set()
+_disk_index_lock = threading.Lock()
+_DISK_INDEX_PREFIX = "rdx_ptr_"
+# Orphans from a previous run that died before its atexit hook could fire.
+# ps5debug-NG does the same for its own snapshot spill files ("/data is swept
+# at startup"); an hour is well past any plausible in-progress build.
+_DISK_INDEX_ORPHAN_AGE = 3600.0
+
+
+def _close_all_disk_indexes() -> None:
+    with _disk_index_lock:
+        live = list(_disk_index_registry)
+    for index in live:
+        try:
+            index.close()
+        except Exception:
+            pass
+
+
+def _sweep_orphaned_disk_indexes() -> int:
+    """Remove shard directories left behind by a previous run. Never raises."""
+    removed = 0
+    try:
+        root = Path(tempfile.gettempdir())
+        now = time.time()
+        for entry in root.glob(_DISK_INDEX_PREFIX + "*"):
+            try:
+                if not entry.is_dir():
+                    continue
+                if now - entry.stat().st_mtime < _DISK_INDEX_ORPHAN_AGE:
+                    continue          # may belong to a running instance
+                for child in entry.iterdir():
+                    child.unlink(missing_ok=True)
+                entry.rmdir()
+                removed += 1
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return removed
+
+
+_atexit.register(_close_all_disk_indexes)
+
+
 class _DiskReversePointerIndex:
     """Shard-backed reverse index for processes too large to retain in RAM.
 
@@ -5495,15 +5616,39 @@ class _DiskReversePointerIndex:
         self.total_bytes = 0
         self.done_bytes = 0
         self.shards = []
-        self._tmpdir = Path(tempfile.mkdtemp(prefix="rdx_ptr_"))
+        # Shard arrays are written once by _build() and never change, but
+        # query() used to np.load() every one of them again on every call.
+        # The graph search runs up to _PTR_RESOLVE_MAX_NODES nodes x
+        # len(_PTR_RESOLVE_OFFSET_TIERS) tiers, so on a 4.24 GiB process
+        # (135 shards) that is ~1.7 M reopen+remap operations -- about 1.3
+        # minutes of pure overhead on top of an already slow resolve. Map
+        # each file once and keep it; memmaps are virtual, so holding a few
+        # hundred costs address space rather than RSS.
+        self._mapped = {}
+        self._tmpdir = Path(tempfile.mkdtemp(prefix=_DISK_INDEX_PREFIX))
+        with _disk_index_lock:
+            _disk_index_registry.add(self)
         try:
             self._build(cancel_event, progress_cb)
         except BaseException:
             self.close()
             raise
 
+    def _mapped_array(self, path):
+        """Memory-map a shard array once and reuse it for later queries."""
+        arr = self._mapped.get(path)
+        if arr is None:
+            arr = np.load(path, mmap_mode="r", allow_pickle=False)
+            self._mapped[path] = arr
+        return arr
+
     def close(self):
         """Close mapped shards and remove this index's private temporary files."""
+        # Drop the mappings before unlinking so the files are not still mapped
+        # when the directory goes.
+        with _disk_index_lock:
+            _disk_index_registry.discard(self)
+        self._mapped.clear()
         self.shards.clear()
         try:
             for path in self._tmpdir.iterdir():
@@ -5606,8 +5751,16 @@ class _DiskReversePointerIndex:
                                         allow_pickle=False)
                                 np.save(priority_path, group_priority[order],
                                         allow_pickle=False)
+                                # Each shard is sorted, so its first and
+                                # last value bound everything it holds. Keep
+                                # them: query() can then skip a shard whole
+                                # instead of binary-searching it, which is
+                                # what makes a 135-shard index tractable.
+                                sorted_values = group_values[order]
                                 paths.append((int(prefix), value_path,
-                                              holder_path, priority_path))
+                                              holder_path, priority_path,
+                                              int(sorted_values[0]),
+                                              int(sorted_values[-1])))
                         with result_lock:
                             if paths:
                                 self.shards.extend(paths)
@@ -5655,16 +5808,22 @@ class _DiskReversePointerIndex:
         high = min(_ADDR_MAX, target + max(0, int(max_offset)))
         candidates = []
         wanted_prefixes = set(range(low >> 32, (high >> 32) + 1))
-        for prefix, value_path, holder_path, priority_path in self.shards:
+        for (prefix, value_path, holder_path, priority_path,
+             shard_lo, shard_hi) in self.shards:
             if prefix not in wanted_prefixes:
                 continue
-            values = np.load(value_path, mmap_mode="r", allow_pickle=False)
+            # Cheap interval reject before touching the file at all: the
+            # shard is sorted, so if its range does not intersect the query
+            # window it cannot contribute a single hit.
+            if shard_hi < low or shard_lo > high:
+                continue
+            values = self._mapped_array(value_path)
             lo = int(np.searchsorted(values, np.uint64(low), side="left"))
             hi = int(np.searchsorted(values, np.uint64(high), side="right"))
             if hi <= lo:
                 continue
-            holders = np.load(holder_path, mmap_mode="r", allow_pickle=False)
-            priorities = np.load(priority_path, mmap_mode="r", allow_pickle=False)
+            holders = self._mapped_array(holder_path)
+            priorities = self._mapped_array(priority_path)
             seg_values = values[lo:hi].astype(np.int64, copy=False)
             seg_holders = holders[lo:hi]
             seg_priorities = priorities[lo:hi]
@@ -6792,14 +6951,40 @@ def _save_pointer_provisionals(records: list,
 
 
 def _load_pointer_provisionals(path: Optional[Path] = None) -> list:
+    """Load the two-reload pointer project; a damaged file fails closed.
+
+    This runs from screen_main on every entry to the main menu, so anything
+    that escapes here takes down the UI immediately after connecting, with no
+    way back in short of knowing which hidden file to delete. `data` must be
+    shape-checked before use: valid JSON of the wrong type (`[]`, `null`, a
+    bare number or string) makes `data.get` raise AttributeError, which is not
+    a subclass of any exception listed below. _load_preferences already guards
+    this way; this loader did not.
+    """
     src = Path(path or _POINTER_PROVISIONAL_FILE)
     try:
         data = json.loads(src.read_text(encoding="utf-8"))
-        if int(data.get("version", 0)) != 1:
+        if not isinstance(data, dict) or int(data.get("version", 0)) != 1:
             return []
-        return [x for x in data.get("candidates", []) if isinstance(x, dict)]
-    except (OSError, ValueError, TypeError):
+        candidates = data.get("candidates", [])
+        if not isinstance(candidates, list):
+            return []
+        return [x for x in candidates if isinstance(x, dict)]
+    except (OSError, ValueError, TypeError, AttributeError):
         return []
+
+
+def _coerce_int_field(record: dict, key: str, default: int = 0) -> int:
+    """Read an int from an untrusted persisted record without raising.
+
+    Records survive across releases and hand edits, so a field can hold a
+    string, None, or a float. int() raises ValueError/TypeError on those, and
+    the summary below runs inside screen_main where that is fatal.
+    """
+    try:
+        return int(record.get(key, default))
+    except (TypeError, ValueError):
+        return default
 
 
 def _pointer_project_summary(process: str = "", maps: Optional[list] = None,
@@ -6817,13 +7002,13 @@ def _pointer_project_summary(process: str = "", maps: Optional[list] = None,
         records = [r for r in records
                    if str(r.get("observed_game", "") or "") in
                    ("", game_identity)]
-    survivals = max((int(r.get("reload_survivals", 0)) for r in records),
+    survivals = max((_coerce_int_field(r, "reload_survivals") for r in records),
                     default=0)
     return {
         "count": len(records),
         "survivals": min(max(survivals, 0), 2),
         "complete": survivals >= 2,
-        "target": (int(records[0].get("observed_target", 0))
+        "target": (_coerce_int_field(records[0], "observed_target")
                    if records else None),
         "process": wanted_process,
         "game_identity": game_identity,
@@ -7272,7 +7457,15 @@ def generate_etahen_json(cheats: list, game_id: str, game_ver: str,
             description += " etaHEN applies it once per toggle; it is not a live freeze."
         mods.append({
             "name": name,
-            "description": description,
+            # "hint", not "description": a real etaHEN file
+            # (PS5_Cheats json/CUSA00004_01.07.json) uses
+            # {name, hint, type, memory} and GoldHEN's equivalent uses
+            # {name, type, memory} with no such field at all. RDX emitted
+            # "description", which neither manager reads -- so the note
+            # explaining that a toggle is a one-shot write, not a live
+            # freeze, was never shown to anyone. GoldHEN ignores the extra
+            # key exactly as it ignored the old one.
+            "hint": description,
             "type": "checkbox",
             "memory": [{
                 "offset": f"{relative:X}",
@@ -7880,6 +8073,26 @@ def draw_header_banner(stdscr) -> None:
     safe_addstr(stdscr, 1, max(0, (w - len(brand)) // 2),
                 brand, color(C_TITLE) | curses.A_BOLD)
 
+def _console_preflight(ip: str, timeout: float = 3.0) -> bool:
+    """Is anything listening on either payload port? Fails fast when not.
+
+    A console on the LAN answers in milliseconds. When it is powered off,
+    asleep, or the address is a typo, the normal path costs `memdbg_probe`
+    (1.5 s) plus `ps5_connect`'s 15 s default -- about 16.5 s during which
+    the UI shows only "Connecting..." and offers no way to cancel. Both
+    ports are tried because a MemDBG-only console has 744 closed and a
+    ps5debug-only console has 9020 closed. Uses ps5_connect/memdbg_probe so
+    the same getaddrinfo handling applies as in the real connection.
+    """
+    try:
+        probe = ps5_connect(ip, timeout=timeout)
+        probe.close()
+        return True
+    except Exception:
+        pass
+    return memdbg_probe(ip, timeout=max(1.0, timeout / 2)) is not None
+
+
 def screen_connect(stdscr) -> str:
     stdscr.clear()
     draw_border(stdscr, "CONNECT")
@@ -7904,6 +8117,20 @@ def screen_connect(stdscr) -> str:
     _stop_freeze_worker()
     safe_addstr(stdscr, 8, 3, "Connecting…", color(C_WARN))
     stdscr.refresh()
+    if not _console_preflight(ip):
+        safe_addstr(stdscr, 8, 3,
+                    f"X Nothing is listening on {ip} (ports 744 / 9020)".ljust(60),
+                    color(C_ERR))
+        safe_addstr(stdscr, 10, 3,
+                    "The console may be powered off, asleep, or on another",
+                    color(C_WARN))
+        safe_addstr(stdscr, 11, 3,
+                    "address; the payload may also not be loaded yet.",
+                    color(C_WARN))
+        safe_addstr(stdscr, 13, 3, "Press any key to retry.", color(C_NORM))
+        stdscr.refresh()
+        stdscr.getch()
+        return "connect"
     try:
         native = memdbg_probe(ip)
         if native is not None:
@@ -10944,6 +11171,13 @@ def do_import(stdscr) -> None:
 
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
+        # Shape check before any .get(): a file holding valid JSON that is not
+        # an object otherwise surfaces as "'list' object has no attribute
+        # 'get'", which tells the user nothing about their file.
+        if not isinstance(data, dict):
+            raise ValueError(
+                "trainer file must contain a JSON object, but this one holds "
+                f"a {type(data).__name__}")
         trainer_process = str(data.get("process", "") or "")
         if trainer_process and trainer_process != str(state.get("proc_name", "") or ""):
             raise ValueError(
@@ -11328,12 +11562,20 @@ def do_export(stdscr) -> None:
         export_cheats, gid, gver, gtit, process, maps, author)
     mc4_bytes = (generate_mc4_bytes(etahen_mods, gid, gver, gtit, process, author)
                 if etahen_mods else None)
+    # .mc4 has more than one consumer. CheatRunner reads it from its own
+    # directory, but GoldHEN and etaHEN each keep a cheats/mc4/ folder
+    # alongside their cheats/json/ one, so naming only CheatRunner's path
+    # sent the file somewhere the manager RDX had just selected would never
+    # look for it.
+    mc4_dirs = ["/data/cheatrunner/cheats/mc4/"]
     if str(gid).upper().startswith("CUSA"):
         platform_name = "GoldHEN"
         deploy_dir = "/user/data/GoldHEN/cheats/json/"
+        mc4_dirs.insert(0, "/user/data/GoldHEN/cheats/mc4/")
     elif str(gid).upper().startswith("PPSA"):
         platform_name = "etaHEN"
         deploy_dir = "/data/etaHEN/cheats/json/"
+        mc4_dirs.insert(0, "/data/etaHEN/cheats/mc4/")
     else:
         platform_name = "GoldHEN/etaHEN-compatible"
         deploy_dir = "the console manager's cheats/json directory"
@@ -11350,8 +11592,7 @@ def do_export(stdscr) -> None:
     if etahen_mods:
         preflight.append(f"Console deploy: {deploy_dir}{etahen_name}")
         preflight.append(
-            f"CheatRunner .mc4: {len(etahen_mods)} patches "
-            "(/data/cheatrunner/cheats/mc4/)")
+            f".mc4: {len(etahen_mods)} patches -> {mc4_dirs[0]}")
     if not confirm_box(stdscr, "\n".join(preflight) + "\n\nWrite these files?",
                        "Export Preflight"):
         add_log("Trainer export cancelled at preflight")
@@ -11392,11 +11633,10 @@ def do_export(stdscr) -> None:
                         f"({len(etahen_mods)} patches)")
                 lines.extend([
                     "",
-                    f"CheatRunner .mc4: {mc4_path}",
+                    f".mc4 trainer: {mc4_path}",
                     f"  {len(etahen_mods)} static module patch(es).",
-                    "Upload via FTP to:",
-                    f"  /data/cheatrunner/cheats/mc4/{mc4_name}",
-                ])
+                    "Upload via FTP to whichever manager you use:",
+                ] + [f"  {d}{mc4_name}" for d in mc4_dirs])
         else:
             lines.extend([
                 "",
@@ -12572,25 +12812,34 @@ def main(stdscr) -> None:
                              # nodelay screens override this per-call.
 
     screen = "connect"
+    too_small_drawn = None      # last size the warning was drawn at
     while True:
         # Issues #1/#3: handle resize at the top level so every screen
         # automatically gets a full redraw after the user resizes the terminal.
         h, w = stdscr.getmaxyx()
         if h < _MIN_ROWS or w < _MIN_COLS:
-            stdscr.clear()
-            try:
-                stdscr.addstr(0, 0,
-                    f"Terminal too small ({w}×{h}). "
-                    f"Need {_MIN_COLS}×{_MIN_ROWS}. Resize to continue.")
-            except curses.error:
-                pass
-            stdscr.refresh()
+            # getch() returns -1 every 100 ms (stdscr.timeout), so redrawing
+            # unconditionally clears and repaints a static message ten times
+            # a second: visible flicker and constant CPU for as long as the
+            # terminal stays small. Only repaint when the size actually
+            # changes.
+            if too_small_drawn != (h, w):
+                too_small_drawn = (h, w)
+                stdscr.clear()
+                try:
+                    stdscr.addstr(0, 0,
+                        f"Terminal too small ({w}×{h}). "
+                        f"Need {_MIN_COLS}×{_MIN_ROWS}. Resize to continue.")
+                except curses.error:
+                    pass
+                stdscr.refresh()
             k = stdscr.getch()
             if k == curses.KEY_RESIZE:
                 curses.update_lines_cols()
             elif k in (ord('q'), ord('Q')):
                 break
             continue
+        too_small_drawn = None
 
         if screen == "connect":
             screen = screen_connect(stdscr)
@@ -12641,6 +12890,10 @@ def _install_signal_teardown() -> None:
 
 if __name__ == '__main__':
     _install_signal_teardown()
+    _swept = _sweep_orphaned_disk_indexes()
+    if _swept:
+        add_log(f"Removed {_swept} orphaned pointer-index director"
+                f"{'y' if _swept == 1 else 'ies'} from a previous run")
     try:
         curses.wrapper(main)
     except KeyboardInterrupt:

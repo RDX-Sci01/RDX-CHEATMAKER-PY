@@ -26,6 +26,7 @@ import json
 import threading
 import tempfile
 import time
+import unicodedata
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -663,6 +664,7 @@ _PTR_DISK_SHARD_BYTES = 0x2000000       # 32 MiB per sorted disk shard
 _PTR_DISK_WORKERS = 6                    # persistent parallel reader/indexers
 _pointer_region_class_cache = {}         # map fingerprint -> classified rows
 _region_class_supported: dict = {}       # map fingerprint -> probe actually ran
+_region_class_lock = threading.Lock()
 _POINTER_PROVISIONAL_FILE = Path(__file__).with_name(
     ".rdx-pointer-candidates.json")
 _PREFERENCES_FILE = Path(__file__).with_name(".rdx-preferences.json")
@@ -5371,14 +5373,20 @@ def _classify_regions_cached(ip: str, pid: int, maps: list) -> tuple:
     blunt size heuristic.
     """
     fingerprint = _pointer_map_fingerprint(maps)
-    if fingerprint not in _pointer_region_class_cache:
+    # _pointer_region_class_cache is also read from index-builder threads via
+    # _pointer_readable_regions, so guard the mutation rather than relying on
+    # the UI happening to serialise scans.
+    with _region_class_lock:
+        needs_probe = fingerprint not in _pointer_region_class_cache
+    if needs_probe:
         try:
             classified = ps5_classify_regions(ip, pid)
-            if len(_pointer_region_class_cache) >= 4:
-                _pointer_region_class_cache.clear()
-                _region_class_supported.clear()
-            _pointer_region_class_cache[fingerprint] = classified
-            _region_class_supported[fingerprint] = True
+            with _region_class_lock:
+                if len(_pointer_region_class_cache) >= 4:
+                    _pointer_region_class_cache.clear()
+                    _region_class_supported.clear()
+                _pointer_region_class_cache[fingerprint] = classified
+                _region_class_supported[fingerprint] = True
             uncached_mib = sum(
                 max(0, int(r["end"]) - int(r["start"]))
                 for r in classified if int(r.get("flags", 0)) & 1
@@ -5390,15 +5398,50 @@ def _classify_regions_cached(ip: str, pid: int, maps: list) -> tuple:
                         "unreported maps retain normal safe fallback handling",
                         "warn")
         except Exception as exc:
-            _pointer_region_class_cache[fingerprint] = []
-            _region_class_supported[fingerprint] = False
+            with _region_class_lock:
+                _pointer_region_class_cache[fingerprint] = []
+                _region_class_supported[fingerprint] = False
             add_log(f"Region classifier unavailable; using map safeguards: {exc}",
                     "warn")
-    rows = _pointer_region_class_cache.get(fingerprint) or []
-    uncached = sorted(
+    with _region_class_lock:
+        rows = _pointer_region_class_cache.get(fingerprint) or []
+        supported = bool(_region_class_supported.get(fingerprint))
+    raw = sorted(
         (int(r["start"]), int(r["end"])) for r in rows
         if int(r.get("flags", 0)) & 1 and int(r["end"]) > int(r["start"]))
-    return uncached, bool(_region_class_supported.get(fingerprint))
+    # Coalesce before returning. Callers test membership with a single
+    # bisect against the range starts, which is only correct on disjoint
+    # ranges: with overlaps, a short later-starting range shadows a longer
+    # earlier one and an address inside the long range is reported as
+    # cached. The classifier derives its rows from the VM map, which this
+    # codebase documents as containing overlapping records, so that is a
+    # real shape rather than a theoretical one.
+    return _coalesce_ranges(raw), supported
+
+
+def _coalesce_ranges(raw: list) -> list:
+    """Merge a sorted (start, end) list into disjoint ranges."""
+    out = []
+    for start, end in sorted(raw):
+        if out and start <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], end))
+        else:
+            out.append((start, end))
+    return out
+
+
+def _coalesced_uncached_ranges(maps: list) -> list:
+    """Already-classified uncached ranges for `maps`, merged and disjoint.
+
+    Reads the cache only — never probes — so callers that merely want to
+    honour a previous classification (the pointer scanner) do not trigger an
+    authenticated round trip of their own.
+    """
+    with _region_class_lock:
+        rows = _pointer_region_class_cache.get(_pointer_map_fingerprint(maps), [])
+    return _coalesce_ranges(
+        [(int(r["start"]), int(r["end"])) for r in rows
+         if int(r.get("flags", 0)) & 1 and int(r["end"]) > int(r["start"])])
 
 
 def _region_is_uncached(region: dict, uncached: list, starts: list) -> bool:
@@ -5796,11 +5839,10 @@ def _pointer_readable_regions(maps: list) -> list:
     PROT_READ = 0x1
     PROT_EXEC = 0x4
     out = []
-    classified = _pointer_region_class_cache.get(_pointer_map_fingerprint(maps), [])
-    uncached = sorted(
-        (int(row["start"]), int(row["end"])) for row in classified
-        if int(row.get("flags", 0)) & 1 and int(row["end"]) > int(row["start"])
-    )
+    # Share one coalescing implementation with the value scanners. This used
+    # to build its own uncached list inline, which is how the un-merged
+    # overlap bug got copied into the scanners in the first place.
+    uncached = _coalesced_uncached_ranges(maps)
     uncached_starts = [row[0] for row in uncached]
     for r in maps:
         start, end = int(r.get("start", 0)), int(r.get("end", 0))
@@ -6383,6 +6425,16 @@ def _pointer_module_base(maps: list, module_name: str) -> Optional[int]:
             same = [r for r in maps
                     if str(r.get("name", "") or "").replace(
                         "\\", "/").rsplit("/", 1)[-1] == wanted_base]
+            # Two modules can share a basename in different directories. The
+            # min(start) below would then silently pick one and rebase the
+            # chain into the wrong image -- which resolves to a plausible
+            # address and fails silently. Say so rather than guessing quietly.
+            distinct = {str(r.get("name", "") or "") for r in same}
+            if len(distinct) > 1:
+                add_log(f"Pointer root '{wanted}' matches {len(distinct)} "
+                        f"differently-pathed modules with the same name "
+                        f"({', '.join(sorted(distinct)[:3])}); rebasing to the "
+                        f"lowest-addressed one, which may be wrong", "warn")
     if same:
         return min(int(r["start"]) for r in same)
     if wanted == "main":
@@ -6757,13 +6809,41 @@ def _mods_to_import_entries(mods: list, source_path, module_base: int) -> list:
             off_hex = str(mem.get("off", "")).strip().replace("-", "")
             if not (offset_hex and on_hex):
                 continue
+            # A non-zero <Section> means the offset belongs to some other
+            # module. RDX only resolves the main image here, so placing it
+            # against module_base would be a confident write to the wrong
+            # address — skip loudly instead. (.mc4 only; the etaHEN/GoldHEN
+            # JSON schema has no section concept and omits the key.)
+            section = mem.get("section", 0)
+            if section != 0:
+                add_log(f"Import: skipped '{name}' — it patches section "
+                        f"{section}, not the main image, and RDX cannot "
+                        "resolve a non-main section offset.", "warn")
+                continue
             try:
                 offset = int(offset_hex, 16)
                 on_bytes = bytes.fromhex(on_hex)
             except ValueError:
                 continue
             width = len(on_bytes)
-            if width == 0 or not (_ADDR_MIN <= module_base + offset <= _ADDR_MAX):
+            if width == 0:
+                continue
+            # A negative offset resolves below the module base, i.e. outside
+            # the image entirely. Export already refuses these; import must
+            # too, or a malformed file writes into whatever precedes it.
+            if offset < 0:
+                add_log(f"Import: skipped '{name}' — negative offset "
+                        f"{offset_hex} resolves below the module base.", "warn")
+                continue
+            # _value_width() caps raw-byte values at 256, so a longer patch
+            # produces a cheat that raises on every apply/export. The native
+            # .rdx.json path already rejects these; this one silently kept
+            # them.
+            if width > 256:
+                add_log(f"Import: skipped '{name}' — {width}-byte patch "
+                        "exceeds the 256-byte raw-value limit.", "warn")
+                continue
+            if not (_ADDR_MIN <= module_base + offset <= _ADDR_MAX):
                 continue
             entry = {
                 "name": name, "type": "write",
@@ -7127,8 +7207,20 @@ def mc4_xml_to_mods(xml_text: str) -> tuple:
             offset = (line_el.findtext("Offset") or "").strip()
             on = (line_el.findtext("ValueOn") or "").strip().replace("-", "")
             off = (line_el.findtext("ValueOff") or "").strip().replace("-", "")
+            # <Section> selects WHICH module the offset is relative to.
+            # Dropping it silently made a section-1 library patch resolve
+            # against the main module — the same address a section-0 patch
+            # would get, so a community trainer wrote into the wrong image
+            # with no warning. Carry it so the importer can refuse what it
+            # cannot place. Absent/blank means section 0 (main image).
+            section_text = (line_el.findtext("Section") or "").strip()
+            try:
+                section = int(section_text) if section_text else 0
+            except ValueError:
+                section = -1          # unparseable: treat as un-placeable
             if offset and on:
-                memory.append({"offset": offset, "on": on, "off": off})
+                memory.append({"offset": offset, "on": on, "off": off,
+                               "section": section})
         if memory:
             mods.append({"name": name, "memory": memory})
     return trainer_attrs, mods
@@ -7209,13 +7301,20 @@ def safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
             win.addstr(y, x, text[:avail], attr)
             return
         # Slow path for non-ASCII: clip character-by-character to stay within
-        # available columns.  curses.unget_wch / waddwstr are not universally
-        # available, so we use the simple char-count approximation: each
-        # non-ASCII char might be wide (2 cols); we stop as soon as we'd
-        # exceed avail cols.  This is conservative but safe.
+        # available columns.  Width comes from unicodedata rather than a
+        # codepoint threshold: the old "> 0x1100 means wide" rule called
+        # every decorative glyph this UI draws double-width -- the progress
+        # bar's block characters, the check/warn/cross marks, the arrows,
+        # the spinner -- so a 60-column bar rendered in 39 columns on an
+        # 80-column terminal, and any status line containing them was
+        # clipped early.  East Asian Width W/F is the real double-width set
+        # (CJK); Ambiguous and Neutral render as one column in terminals.
         clipped, cols = [], 0
         for ch in text:
-            w_ch = 2 if ord(ch) > 0x1100 else 1   # crude CJK/wide check
+            if unicodedata.combining(ch):
+                w_ch = 0          # accents attach to the previous cell
+            else:
+                w_ch = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
             if cols + w_ch > avail:
                 break
             clipped.append(ch)
@@ -7499,6 +7598,7 @@ def screen_connect(stdscr) -> str:
         # Increment session BEFORE clearing state so cheats stamped during
         # the clear cannot pass the subsequent session-match check.
         state["session"] += 1
+        _reset_learned_payload_support()   # may be a different payload build
         _clear_scan_state()
         state["pid"] = None
         state["proc_name"] = ""
@@ -7543,6 +7643,19 @@ def screen_connect(stdscr) -> str:
         stdscr.getch()
         return "connect"
 
+def _reset_learned_payload_support() -> None:
+    """Forget which optional commands this console's payload supports.
+
+    Only a reconnect can land on a different payload build, so this is
+    deliberately separate from _clear_scan_state(): clearing results or
+    switching process must not make RDX re-pay the discovery cost.
+    """
+    with _console_scan_lock:
+        _console_scan_supported.clear()
+    with _memdbg_maps_v2_lock:
+        _memdbg_maps_v2_supported.clear()
+
+
 def _clear_scan_state(stop_freezes: bool = True) -> None:
     """Wipe scan state; process/session changes also stop active toggles."""
     if stop_freezes:
@@ -7557,12 +7670,12 @@ def _clear_scan_state(stop_freezes: bool = True) -> None:
     state["scan_unknown"]   = False
     with _map_cache_lock:
         _map_cache.clear()
-    # A reconnect may be to a different payload build, so re-probe the
-    # commands whose support we learned by failing at them.
-    with _console_scan_lock:
-        _console_scan_supported.clear()
-    with _memdbg_maps_v2_lock:
-        _memdbg_maps_v2_supported.clear()
+    # NOTE: learned command-support caches are deliberately NOT cleared here.
+    # _clear_scan_state also runs on a plain "Clear Results" and on a process
+    # change, and forgetting there means the next scan pays the 15 s stall to
+    # rediscover a command this payload still does not implement. Only a
+    # reconnect can reach a different payload build, so screen_connect owns
+    # that reset (see _reset_learned_payload_support).
     _invalidate_pointer_index()
     _ScanSocket.clear_pool()
     gc.collect()
@@ -10370,7 +10483,11 @@ def do_import(stdscr) -> None:
     # "mods" array, no "cheatList") before falling into the native RDX
     # format's own parsing below, which owns .rdx.json's error handling.
     try:
-        sniffed = json.loads(path.read_text(encoding="utf-8"))
+        # utf-8-sig, not utf-8: trainer files are user-supplied and a
+        # Windows editor leaves a BOM, which made json.loads fail with a
+        # raw "Unexpected UTF-8 BOM" and the whole import die. The codec
+        # is identical to utf-8 when no BOM is present.
+        sniffed = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         sniffed = None
     if (isinstance(sniffed, dict) and "cheatList" not in sniffed and
@@ -10381,7 +10498,7 @@ def do_import(stdscr) -> None:
         return
 
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
         trainer_process = str(data.get("process", "") or "")
         if trainer_process and trainer_process != str(state.get("proc_name", "") or ""):
             raise ValueError(

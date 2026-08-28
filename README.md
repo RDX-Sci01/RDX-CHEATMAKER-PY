@@ -78,26 +78,6 @@ so no crypto or compression package is needed.
 
 ---
 
-## Development
-
-The unit suite runs against mocked sockets and simulated memory — no console
-required. It covers protocol framing, map-overlap handling, pointer rebasing,
-typed value codecs, trainer round trips, and the UI screens.
-
-`ui_smoke.py` covers what the unit suite structurally cannot. Every test in it
-stubs curses, so none of them exercise drawing, key handling, or the terminal.
-The smoke driver forks a pty, launches the real program against a fake console,
-and types a scripted key sequence exactly as a user would — real curses, real
-terminal, real input. It failed on two defects the 194-test suite passed
-clean over, and it checks the progress bar's rendered width, which is only
-observable in a terminal.
-
-If you fix a bug, the regression test for it should **fail against the previous
-patch file** and pass against yours. A test that passes on both is a guard, not
-a regression test — both kinds are useful, but only the first proves the fix.
-
----
-
 ## Safety mechanisms
 
 RDX writes to the memory of a running game. It validates addresses against the

@@ -22,6 +22,7 @@ import queue as _queue
 import re
 import socket
 import struct
+import ipaddress
 import json
 import threading
 import tempfile
@@ -671,8 +672,60 @@ _PTR_RESOLVE_OFFSET_STEP = 4      # common 32-bit structure-field alignment
 _PTR_RESOLVE_MAX_HITS = 192       # deterministic candidate window per target
 _PTR_RESOLVE_MAX_NODES = 2500
 _PTR_RESOLVE_MAX_FOUND = 96
-_PTR_FAST_DIRECT_RANGE = 0x100
+# Displacement window the cheap first pass will accept between a holder's
+# pointer value and the target.
+#
+# History, because this constant has been wrong twice in opposite directions.
+# It began at 0x100 (256 B), which assumed the target is a field in a small
+# struct and found nothing on a real title. patch77 then widened it to 0x10000
+# (64 KiB) after an IL2CPP field appeared to sit 0x90F8 from its holder, and
+# that looked like a success: five module-rooted chains in 7.3 s where the
+# previous search had taken over 30 minutes.
+#
+# It was not a success. All five failed the two-reload test -- they were this
+# session's heap coincidences. A later session produced 24 more of the same
+# shape, offsets -0x18C8 to -0x2408 in an exact 48-byte arithmetic series,
+# which is an IL2CPP static-field pointer table rather than parents of the
+# target. Speed had been measured and mistaken for correctness.
+#
+# Cheat Engine, the canonical implementation, defaults its maximum offset to
+# **2048** and documents that it "should be changed only if you suspect that
+# any of the offsets will be larger than 2048 bytes ... which is not so common
+# for most of the values that cheaters are looking for". Every coincidence
+# above lies beyond that bound, so the canonical setting would have rejected
+# them and let the search fall through to the deeper tiers -- which is where
+# Cheat Engine, PS4CheaterNeo and PINCE all actually find pointers.
+#
+# Depth, not proximity, is what finds a real chain. Widening this window only
+# buys coincidences that cannot be told apart from real chains until the heap
+# moves.
+_PTR_FAST_DIRECT_RANGE = 0x800
 _PTR_FAST_DIRECT_HITS = 24
+# Collect several times the returned cap before ranking. The scan stops as soon
+# as it has max_hits, and a wide window makes coincidental holders far more
+# likely, so stopping at the first 24 could lock in junk from whichever region
+# was scanned first and never reach the real holder. Gather more, rank by
+# region priority and smallest displacement, then truncate.
+_PTR_FAST_DIRECT_POOL = 8
+# A real parent pointer points at an object's base, with the field of interest
+# a short way inside it. A holder whose pointer lands *above* the target, or
+# thousands of bytes below it, is a coincidence: some unrelated object that
+# happens to sit nearby in this session's heap.
+#
+# This distinction is what patch77's wider window lost. With the old 256-byte
+# window tier 1 usually found nothing and the search fell through to the deeper
+# tiers; at 64 KiB it matches coincidences and returns early, so the deeper
+# search that could find the real chain never runs. Measured on Enter the
+# Gungeon: 24 "verified" depth-1 candidates, offsets -9224 to -6344 in an exact
+# 48-byte arithmetic series -- an IL2CPP static-field pointer table, not
+# parents. Five of the same shape from an earlier session survived 0/5 reloads.
+_PTR_PLAUSIBLE_FIELD_MAX = 0x200
+# Seconds the locality (tier 2) pass may run before the search gives up on it
+# and falls through to the reverse index, whose cost is bandwidth-bound and
+# therefore predictable. Two minutes is far longer than tier 2 needs when it is
+# going to succeed at all, and far shorter than the 30+ minutes it can spend
+# failing.
+_PTR_LOCALITY_TIME_BUDGET = 120.0
 
 # Bounded streaming pointer scanner.  These limits are separate from the
 # reverse-index resolver above and must remain defined for pointer_chain_scan.
@@ -2603,6 +2656,126 @@ def _clear_debug_session() -> None:
         _debug_session = None
 
 
+_debug_session_stuck = False      # payload still holds a session we cannot clear
+_DETACH_TIMEOUT = 5.0
+
+
+def _debug_session_is_stuck() -> bool:
+    """True when a previous teardown failed to release the payload's session."""
+    return _debug_session_stuck
+
+
+def _debug_detach_or_report(cmd: socket.socket, ip: str, pid: int) -> bool:
+    """Detach, and make failure loud instead of invisible.
+
+    The previous code sent `CMD_DEBUG_DETACH` on `cmd` and swallowed every
+    exception. That is precisely backwards: a trace fails most often by the
+    command socket going bad, so the one moment detach matters is the one
+    moment this socket cannot deliver it. Observed on hardware -- a trace timed
+    out, the swallowed detach never landed, and `g_debug_attached` stayed 1.
+    Every later attach was refused with "already debugging" and nothing
+    connected that to the earlier run.
+
+    Recovery is limited by the protocol: the server binds the session to the
+    connection slot recorded at attach (reference 1.5), so a detach from a new
+    connection acks success without clearing anything -- verified on hardware.
+    The realistic options are therefore to try harder on the owning socket, and
+    to tell the user the truth when that fails.
+    """
+    global _debug_session_stuck
+    try:
+        cmd.settimeout(_DETACH_TIMEOUT)
+    except Exception:
+        pass
+    last = None
+    for attempt in range(3):
+        try:
+            cmd.sendall(cmd_header(CMD_DEBUG_DETACH))
+            if _debug_status_ok(cmd):
+                _debug_session_stuck = False
+                return True
+            last = "payload refused the detach"
+        except Exception as exc:
+            last = f"{type(exc).__name__}: {exc}"
+        time.sleep(0.2 * (attempt + 1))
+
+    # Last resort: at least make sure the game is not left stopped. This does
+    # not clear the session -- CMD_DEBUG_PROCESS_STOP is a bare kill(pid,
+    # SIGCONT) -- so its success must not be mistaken for a detach.
+    resumed = _debug_force_resume(ip, pid)
+    _debug_session_stuck = True
+    add_log(
+        f"Debug detach failed ({last}). The target is most likely still traced "
+        f"by this session, so the next attach will fail. "
+        + ("The game was resumed, so play is unaffected."
+           if resumed else
+           "The game may still be stopped; use Force Resume."),
+        "error")
+    add_log("Relaunch the game before tracing again — a fresh process clears a "
+            "leaked trace. Reload ps5debug-NG only if that does not help.",
+            "error")
+    return False
+
+
+def _local_address_towards(ip: str, port: int = 744) -> Optional[str]:
+    """The source address this host would use to reach `ip`.
+
+    Uses a connectionless UDP socket, so nothing is sent and no server has to
+    be listening; the kernel just resolves the route.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect((ip, int(port)))
+        return probe.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        probe.close()
+
+
+def _trace_network_refusal(ip: str) -> Optional[str]:
+    """Why the console could not deliver debug events here, or None if it can.
+
+    The debug interrupt channel is the console dialling *out* to the client on
+    port 755 (protocol 1.9), using the address it sees on the command
+    connection. Every other RDX operation is client-to-console, so a route that
+    is fine for scanning can still be useless for tracing -- and the failure is
+    ugly: the attach stops the game, then blocks waiting for a callback that
+    can never arrive, and the target is left traced.
+
+    Seen in testing over a Tailscale subnet route: the console saw the client
+    as 100.122.106.94 and had no route back to it. Scans, reads and writes all
+    worked perfectly, which makes this genuinely confusing without a check.
+    """
+    local = _local_address_towards(ip)
+    if local is None:
+        return f"no route to {ip}"
+    try:
+        local_addr = ipaddress.ip_address(local)
+        console_addr = ipaddress.ip_address(str(ip))
+    except ValueError:
+        return None
+
+    # 100.64.0.0/10 is carrier-grade NAT, which is also what Tailscale and
+    # similar overlays hand out. A console on a normal LAN cannot route to it.
+    if local_addr in ipaddress.ip_network("100.64.0.0/10"):
+        return (f"this host reaches the console from {local}, a carrier-grade "
+                f"NAT/VPN address (Tailscale and similar overlays use "
+                f"100.64.0.0/10). The console must open a connection back to "
+                f"the client on port 755 and cannot route to that address")
+
+    # Otherwise require the client to look local to the console. A /24 is the
+    # common case; this is a heuristic, so it only fires when both addresses
+    # are private and clearly on different networks.
+    if local_addr.is_private and console_addr.is_private:
+        if local_addr.packed[:3] != console_addr.packed[:3]:
+            return (f"this host reaches the console from {local}, which is not "
+                    f"on the console's network ({ip}). The console opens the "
+                    f"debug channel back to the client on port 755 and is "
+                    f"unlikely to have a route to that address")
+    return None
+
+
 def _debug_force_resume(ip: str, pid: int) -> bool:
     """Resume a target over a fresh connection, with no debug session needed.
 
@@ -2648,8 +2821,15 @@ def _emergency_debug_teardown() -> None:
                     _debug_continue(sock, 0)
                 elif step == "detach":
                     sock.sendall(cmd_header(CMD_DEBUG_DETACH))
-                    _debug_status_ok(sock)
+                    # Record a failed release here too. This path runs from
+                    # atexit and the signal handlers, so it is the last chance
+                    # to notice; leaving it silent is what made a stuck
+                    # session look like an unexplained refusal later.
+                    if not _debug_status_ok(sock):
+                        globals()["_debug_session_stuck"] = True
             except Exception:
+                globals()["_debug_session_stuck"] = (
+                    step == "detach" or _debug_session_stuck)
                 pass          # keep going; a later step may still land
         try: sock.close()
         except Exception: pass
@@ -2679,8 +2859,28 @@ _ZYDIS_GPR64 = {
 }
 _ZYDIS_RIP = 197
 
+# On-the-wire status words (protocol reference 1.6 — the server bit-swaps, and
+# clients compare the raw wire word, so these are the post-swap values).
+_DEBUG_STATUS_NAMES = {
+    0x80000000: "CMD_SUCCESS",
+    0xF0000001: "CMD_ERROR",
+    0xF0000003: "CMD_DATA_NULL",
+    0xF0000004: "CMD_ALREADY_DEBUG",
+    0xF0000005: "CMD_INVALID_INDEX",
+}
+
+
+def _debug_status_word(s: socket.socket) -> int:
+    """Read one raw status word."""
+    return struct.unpack("<I", recv_exact(s, 4))[0]
+
+
+def _debug_status_name(word: int) -> str:
+    return _DEBUG_STATUS_NAMES.get(int(word), f"unknown status {int(word):#010x}")
+
+
 def _debug_status_ok(s: socket.socket) -> bool:
-    return struct.unpack("<I", recv_exact(s, 4))[0] == STATUS_SUCCESS
+    return _debug_status_word(s) == STATUS_SUCCESS
 
 def _debug_send(s: socket.socket, cmd: int, body: bytes = b"") -> None:
     s.sendall(cmd_header(cmd, len(body)) + body)
@@ -2789,7 +2989,8 @@ def _debug_disasm(s: socket.socket, pid: int, address: int,
 
 def _trace_temporary_access(ip: str, pid: int, target_addr: int,
                             width: int, timeout: float = _DEBUG_TRACE_TIMEOUT,
-                            experimental: bool = False) -> dict:
+                            experimental: bool = False,
+                            _attach_retried: bool = False) -> dict:
     """
     Change-triggered resolver:
       1) attach debugger;
@@ -2806,6 +3007,16 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
     refusal = _debug_attach_refusal(state.get("proc_name", ""))
     if refusal:
         raise RuntimeError(refusal)
+    # Check the return path BEFORE attaching. Attaching stops the game and then
+    # waits for a callback; if that callback can never arrive the game is left
+    # traced and the next attach fails. Cheap to check, expensive to discover.
+    network = _trace_network_refusal(ip)
+    if network:
+        raise RuntimeError(
+            f"hardware watchpoint tracing is not possible over this network "
+            f"path: {network}. Scanning, reading, writing and freezing are "
+            f"unaffected -- only tracing needs the console to reach this host. "
+            f"Run RDX on a machine on the same network as the console to trace.")
     target_addr = int(target_addr)
     width = int(width)
     original = ps5_read(ip, pid, target_addr, width)
@@ -2853,18 +3064,55 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
         cmd = ps5_connect(ip, timeout=10.0)
         body = struct.pack("<I", int(pid))
         cmd.sendall(cmd_header(CMD_DEBUG_ATTACH, len(body)) + body)
-        if not _debug_status_ok(cmd):
+        attach_status = _debug_status_word(cmd)
+        if attach_status != STATUS_SUCCESS:
             # ps5debug-NG permits one session at a time, so this is usually a
             # session leaked by an earlier run rather than a real failure.
             # Try to un-stick the game before giving up: a target left
             # SIGSTOPped is indistinguishable from a hung console to the user.
-            if _debug_force_resume(ip, pid):
-                add_log("A previous debug session was still attached; the "
-                        "target was resumed. Restart the payload to trace "
-                        "again.", "warn")
+            # Report what the payload actually said. Treating every non-success
+            # word as "already debugging" sends the user to reload the payload
+            # when the real cause is usually per-process and cleared by
+            # relaunching the game -- a much cheaper remedy.
+            status_name = _debug_status_name(attach_status)
+            if attach_status == 0xF0000004 and not _attach_retried:
+                # A session left behind by an earlier attempt is clearable:
+                # CMD_DEBUG_DETACH runs debug_full_teardown even from a new
+                # connection. Verified on hardware -- a held session answered
+                # CMD_SUCCESS and the flag was released. Recover once
+                # automatically rather than making the user do it by hand.
+                add_log("A debug session was still held; releasing it and "
+                        "retrying the attach.", "warn")
+                try:
+                    cmd.sendall(cmd_header(CMD_DEBUG_DETACH))
+                    _debug_status_word(cmd)
+                except Exception:
+                    pass
+                try:
+                    cmd.close()
+                except Exception:
+                    pass
+                return _trace_temporary_access(
+                    ip, pid, target_addr, width, timeout=timeout,
+                    experimental=experimental, _attach_retried=True)
+            if attach_status == 0xF0000004:      # CMD_ALREADY_DEBUG
+                # Only this word actually means a session is held. Resuming is
+                # still worth attempting so a stopped game is not left frozen.
+                if _debug_force_resume(ip, pid):
+                    add_log("A previous debug session was still attached; the "
+                            "target was resumed.", "warn")
+                raise RuntimeError(
+                    f"debug attach refused with {status_name}: another debug "
+                    f"session is already attached. Close the other debugger, "
+                    f"or reload ps5debug-NG if nothing else is using it.")
             raise RuntimeError(
-                "debug attach rejected (a debug session may already be "
-                "attached; restart ps5debug-NG if tracing keeps failing)")
+                f"debug attach failed with {status_name}. The payload elevates, "
+                f"calls ptrace(PT_ATTACH) and then dials back to port 755; this "
+                f"status means it did not get that far. The usual cause is that "
+                f"'{state.get('proc_name', 'the target')}' is still traced by an "
+                f"earlier session, which a fresh launch of the game clears. "
+                f"Relaunch the title and try again; reload ps5debug-NG only if "
+                f"that does not help.")
         attached = True
         _register_debug_session(ip, pid, cmd)
 
@@ -3014,13 +3262,8 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
                 _update_debug_session(stopped=False)
             except Exception:
                 pass
-        if cmd is not None:
-            if attached:
-                try:
-                    cmd.sendall(cmd_header(CMD_DEBUG_DETACH))
-                    _debug_status_ok(cmd)
-                except Exception:
-                    pass
+        if cmd is not None and attached:
+            _debug_detach_or_report(cmd, ip, pid)
         # Whatever happened above, the session is finished from here on; drop
         # the registration so the atexit net does not act on a dead socket.
         _clear_debug_session()
@@ -3054,6 +3297,90 @@ def _trace_base_is_resolvable(trace: dict) -> Optional[str]:
     return None
 
 
+def _exact_pointer_holders(ip: str, pid: int, value: int,
+                           cancel_event=None,
+                           max_hits: int = 4096) -> list:
+    """Addresses whose 64-bit contents are exactly ``value``.
+
+    Step 4 of the documented watcher workflow: once the traced instruction has
+    named the object's base pointer, you scan for that pointer *as a value* --
+    hex, exact, pointer width -- and the static results are the answer. One
+    bounded scan, not a graph search.
+    """
+    value = int(value)
+    # A degenerate value matches an enormous share of memory and would return
+    # a meaningless flood. The trace guards base_value, but this helper is
+    # reachable on its own.
+    if not (_ADDR_MIN <= value <= _ADDR_MAX):
+        return []
+    hits = scan_first(ip, pid, value, 8, aligned=True,
+                      value_type="u64", writable_only=False,
+                      cancel_event=cancel_event)
+    return [int(a) for a in hits[:max_hits]]
+
+
+def _walk_from_traced_base(ip: str, pid: int, base_value: int, maps: list,
+                           max_depth: int = 5, cancel_event=None,
+                           progress_cb=None, fanout: int = 4) -> list:
+    """Walk outward from a traced object pointer to module-rooted holders.
+
+    Level 1 is an exact-value scan, because the traced instruction named the
+    object base precisely -- that is the whole benefit of having traced.
+
+    Deeper levels cannot be exact. A parent object points at the *base* of the
+    object that holds the pointer, with the pointer sitting at some field
+    offset inside it; searching for the holder's own address would only find
+    parents that happen to point exactly at that word, which is rare. The
+    manual method solves this by re-running "what accesses" at every level.
+    Without a fresh trace the honest substitute is a bounded window, and the
+    real displacement is recorded rather than assumed to be zero.
+
+    Returns [{"base", "offsets", "depth", "static"}] with offsets ordered
+    outermost-first, matching every other chain in RDX.
+    """
+    region_starts, region_rows = _build_region_lookup(maps)
+    results = []
+    frontier = [(int(base_value), [])]   # (address to find a holder for, trail)
+    seen = {int(base_value)}
+    depth_cap = max(1, min(int(max_depth), MAX_CHAIN_DEPTH))
+    for depth in range(1, depth_cap + 1):
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        next_frontier = []
+        for wanted, trail in frontier[:fanout]:
+            if depth == 1:
+                found = [(h, 0) for h in
+                         _exact_pointer_holders(ip, pid, wanted, cancel_event)]
+            else:
+                found = [(h, int(off)) for h, off, _rg in
+                         _fast_direct_pointer_hits(ip, pid, wanted, maps,
+                                                   cancel_event,
+                                                   static_only=False)]
+            for holder, off in found:
+                region = _region_for_addr(holder, region_starts, region_rows)
+                if region is None:
+                    continue
+                if _is_static_region(region):
+                    # The displacement belongs to the chain on every branch:
+                    # resolving is deref(base) + offsets[0] -> deref -> ... so
+                    # the offset applied after dereferencing THIS holder must
+                    # be carried, not just the trail behind it. Level 1 is an
+                    # exact match, so its entry is 0.
+                    results.append({"base": holder,
+                                    "offsets": [off] + list(trail),
+                                    "depth": depth, "static": True,
+                                    "region": region.get("name", "") or "static"})
+                elif holder not in seen:
+                    seen.add(holder)
+                    next_frontier.append((holder, [off] + list(trail)))
+        if progress_cb:
+            progress_cb(depth, depth_cap)
+        if results or not next_frontier:
+            break
+        frontier = next_frontier
+    return results
+
+
 def _pointer_candidates_from_trace(ip: str, pid: int, trace: dict,
                                    target_addr: int, cancel_event=None,
                                    progress_cb=None,
@@ -3073,8 +3400,15 @@ def _pointer_candidates_from_trace(ip: str, pid: int, trace: dict,
     coincidental chains come from.
     """
     base_target = int(trace["base_value"])
-    candidates = pointer_chain_scan(
-        ip, pid, base_target,
+    maps_for_walk = _get_maps_cached(ip, pid)
+    # The documented method: scan for the traced base pointer *as a value* and
+    # take the static holders. Previously this handed base_target to
+    # pointer_chain_scan -- the graph search whose cost tracks heap complexity,
+    # measured at over 30 minutes at depth 4 on a 4.26 GiB title. That threw
+    # away the whole point of tracing: once the instruction has named the exact
+    # object pointer, finding its holders is one bounded scan per level.
+    candidates = _walk_from_traced_base(
+        ip, pid, base_target, maps_for_walk,
         max_depth=min(max_depth, MAX_CHAIN_DEPTH),
         cancel_event=cancel_event,
         progress_cb=progress_cb,
@@ -5330,9 +5664,12 @@ def _scan_pointer_hits(raw: bytes, pos: int, holder_limit: int,
 
 
 def _fast_direct_pointer_hits(ip: str, pid: int, target: int, maps: list,
-                              cancel_event=None, max_hits: int = _PTR_FAST_DIRECT_HITS) -> list:
+                              cancel_event=None, max_hits: int = _PTR_FAST_DIRECT_HITS,
+                              static_only: bool = True) -> list:
     """Cheap first pass: find direct target-near pointers without building the full index."""
-    readable = [r for r in _pointer_readable_regions(maps) if _is_static_region(r)]
+    readable = _pointer_readable_regions(maps)
+    if static_only:
+        readable = [r for r in readable if _is_static_region(r)]
     readable.sort(key=lambda r: (-_region_priority(r), int(r["start"])))
     low = max(_ADDR_MIN, int(target) - _PTR_FAST_DIRECT_RANGE)
     high = min(_ADDR_MAX, int(target) + _PTR_FAST_DIRECT_RANGE)
@@ -5358,6 +5695,9 @@ def _fast_direct_pointer_hits(ip: str, pid: int, target: int, maps: list,
             add_log(f"MemDBG pointer seed unavailable; using RDX scan: {exc}", "warn")
         finally:
             client.close()
+    # Gather beyond the returned cap so ranking, not scan order, decides which
+    # holders survive; see _PTR_FAST_DIRECT_POOL.
+    pool_limit = max(int(max_hits), 1) * _PTR_FAST_DIRECT_POOL
     sock = _ScanSocket(ip, pid)
     try:
         for region in readable:
@@ -5365,7 +5705,7 @@ def _fast_direct_pointer_hits(ip: str, pid: int, target: int, maps: list,
                 break
             rs, re_ = int(region["start"]), int(region["end"])
             pos = rs + ((-rs) % 8)
-            while pos < re_ and len(hits) < max_hits:
+            while pos < re_ and len(hits) < pool_limit:
                 size = min(_PTR_INDEX_CHUNK, re_ - pos)
                 size -= size % 8
                 if size < 8:
@@ -5390,7 +5730,7 @@ def _fast_direct_pointer_hits(ip: str, pid: int, target: int, maps: list,
                                 continue
                             holder = holder_base + j * 8
                             hits.append((holder, delta, region))
-                            if len(hits) >= max_hits:
+                            if len(hits) >= pool_limit:
                                 break
                 pos += size
     finally:
@@ -6087,18 +6427,67 @@ def _resolve_permanent_candidates(ip: str, pid: int, target_addr: int,
             c["score"] = 220 + (35 if int(region.get("prot", 0)) & 0x4 else 0)
             c["confidence"] = _candidate_confidence(c)
             fast_candidates.append(c)
-    if fast_candidates:
-        fast_candidates.sort(key=lambda c: -c["score"])
-        return {"candidates": fast_candidates, "index_built": False,
+    # Only a structurally plausible hit is worth short-circuiting on.
+    plausible = [c for c in fast_candidates
+                 if 0 <= int(c["offsets"][0]) <= _PTR_PLAUSIBLE_FIELD_MAX]
+    if plausible:
+        plausible.sort(key=lambda c: (-c["score"], int(c["offsets"][0])))
+        return {"candidates": plausible, "index_built": False,
                 "maps": maps, "method": "fast-direct"}
+    if fast_candidates:
+        # Keep them, but do not stop here: they are near-misses, and the deeper
+        # search may still find a real chain. Returned only as a fallback.
+        add_log(
+            f"Fast pointer pass found {len(fast_candidates)} holder(s), but "
+            f"none point at a plausible object base (nearest displacement "
+            f"{min(abs(int(c['offsets'][0])) for c in fast_candidates):#x}). "
+            f"Continuing with the deeper search.", "warn")
+        for c in fast_candidates:
+            c["score"] = float(c["score"]) - 120.0
+            c["coincidence_risk"] = "displacement is not a plausible field offset"
+            c["confidence"] = _candidate_confidence(c)
 
     # Before constructing a multi-gigabyte exhaustive index, walk the natural
     # object locality: modules first, then the address family containing each
     # discovered parent.  This is the common-case algorithm used by practical
     # pointer scanners and reuses the exhaustive index only when locality fails.
-    local_hits = pointer_chain_scan(
-        ip, pid, int(target_addr), max_depth=max_depth,
-        cancel_event=cancel_event, progress_cb=progress_cb)
+    # Tier 2 is a graph exploration: it accepts any pointer landing within
+    # _PTR_STRUCT_MAX of the target and expands heap holders level by level, so
+    # its cost tracks heap complexity rather than memory bandwidth. Measured on
+    # a 4.24 GiB title it reached only 30% of a depth-4 search in 10 minutes.
+    # Left unbounded it can therefore run for tens of minutes and *then* still
+    # fall through to the indexed tier, which is the one whose cost is
+    # predictable. Bound it so the fallthrough happens while the user is still
+    # willing to wait.
+    budget_event = threading.Event()
+
+    def _budget_watch():
+        deadline = time.monotonic() + _PTR_LOCALITY_TIME_BUDGET
+        while not budget_event.wait(0.25):
+            if cancel_event is not None and cancel_event.is_set():
+                budget_event.set()
+                return
+            if time.monotonic() >= deadline:
+                add_log(
+                    f"Locality pointer pass exceeded "
+                    f"{_PTR_LOCALITY_TIME_BUDGET:.0f}s; falling through to the "
+                    f"reverse index", "warn")
+                budget_event.set()
+                return
+
+    watcher = threading.Thread(target=_budget_watch, daemon=True)
+    watcher.start()
+    try:
+        local_hits = pointer_chain_scan(
+            ip, pid, int(target_addr), max_depth=max_depth,
+            cancel_event=budget_event, progress_cb=progress_cb)
+    finally:
+        budget_event.set()
+        watcher.join(timeout=1.0)
+    # A caller-requested cancel must stay a cancel, not look like a timeout.
+    if cancel_event is not None and cancel_event.is_set():
+        return {"candidates": [], "index_built": False, "maps": maps,
+                "method": "cancelled"}
     local_candidates = []
     for hit in local_hits:
         if not hit.get("static"):
@@ -6121,7 +6510,6 @@ def _resolve_permanent_candidates(ip: str, pid: int, target_addr: int,
         local_candidates.sort(key=lambda c: (-c["score"], c["base"]))
         return {"candidates": local_candidates, "index_built": False,
                 "maps": maps, "method": "locality-first"}
-
     index, maps, built = _get_reverse_pointer_index(
         ip, pid, cancel_event, progress_cb)
     if cancel_event and cancel_event.is_set():
@@ -6310,6 +6698,15 @@ def _resolve_permanent_candidates(ip: str, pid: int, target_addr: int,
         tuple(int(x) for x in c.get("offsets", [])),
         int(c.get("base", 0)),
     ))
+    if not candidates and fast_candidates:
+        # Every tier has now run and found nothing better. Hand back the
+        # near-misses from the fast pass rather than nothing at all, clearly
+        # marked: they are holders that point near the target but not at a
+        # plausible object base, so they are likely this session's heap
+        # coincidences and will not survive a reload.
+        fast_candidates.sort(key=lambda c: (abs(int(c["offsets"][0])), c["base"]))
+        return {"candidates": fast_candidates, "index_built": built,
+                "maps": maps, "method": "fast-direct-unverified"}
     return {"candidates": candidates, "index_built": built,
             "maps": maps, "method": "reverse-index"}
 

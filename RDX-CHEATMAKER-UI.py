@@ -662,6 +662,7 @@ _PTR_DEPTH_DEFAULT = 5
 _PTR_DISK_INDEX_THRESHOLD = 0x40000000  # 1 GiB readable memory
 _PTR_DISK_SHARD_BYTES = 0x2000000       # 32 MiB per sorted disk shard
 _PTR_DISK_WORKERS = 6                    # persistent parallel reader/indexers
+                                         # (kept under _MAX_CONSOLE_SOCKETS)
 _pointer_region_class_cache = {}         # map fingerprint -> classified rows
 _region_class_supported: dict = {}       # map fingerprint -> probe actually ran
 _region_class_lock = threading.Lock()
@@ -1904,6 +1905,14 @@ def ps5_scan_next_turbo(ip: str, pid: int, value, width: int,
             raise
 
 
+# Protocol 2.2: the snapshot value store is RAM-backed under this threshold
+# (server default, tunable by the client via CC15 which RDX does not use); the
+# overflow spills to a file under the console's /data.
+_TS_SNAPSHOT_RAM_THRESHOLD = 512 * 1024 * 1024
+# Above this much spill, say so as a warning rather than an informational line.
+_TS_SNAPSHOT_SPILL_WARN = 1024 * 1024 * 1024
+
+
 # Wire compareType codes for CC12's relational narrow of a resident snapshot
 # session (protocol.md 7.2, cmpType 0-12). Modes without "by" compare against
 # the session's own tracked prior value server-side and need no operand.
@@ -1976,7 +1985,27 @@ def ps5_scan_unknown_turbo(ip: str, pid: int, width: int,
 
     wire_type = SCAN_VALUE_TYPE_ID[type_key]
     flags = 0x04 | 0x08 | 0x10  # TS_SNAPSHOT | TS_SNAPSHOT_INCLUDE_ZEROS | TS_SNAPSHOT_SEGMENTS
+
+    # The snapshot's value store lives on the CONSOLE. Protocol 2.2: it is
+    # RAM-backed under a 512 MiB threshold and the overflow spills to
+    # ps5dbg_snap_NN.bin under /data. With INCLUDE_ZEROS every aligned slot is
+    # seeded, so a whole-heap unknown scan is far larger than the bytes read:
+    # 2.15 GiB at width 4 is ~577 M slots and roughly 4.3 GiB of store, i.e.
+    # ~3.8 GiB written to the console's /data. That is self-limiting (unlinked
+    # on END/disconnect, /data swept at startup) and the server declines
+    # cleanly with snapshot_ok = 0 if it cannot allocate — but it should never
+    # be invisible. Say the number before committing to it.
     alignment = width if aligned else 1
+    _slots = sum((end - start) // max(alignment, 1) for start, end in merged)
+    _store_bytes = _slots * width * 2          # current + previous stores
+    _spill_bytes = max(0, _store_bytes - _TS_SNAPSHOT_RAM_THRESHOLD)
+    if _spill_bytes:
+        add_log(
+            f"Snapshot scan will build a ~{_store_bytes / 1073741824:.2f} GiB "
+            f"value store on the console ({_slots:,} slots); about "
+            f"{_spill_bytes / 1073741824:.2f} GiB spills to its /data "
+            f"partition until the session ends.",
+            "warn" if _spill_bytes >= _TS_SNAPSHOT_SPILL_WARN else "info")
     # compareType 11 = UnknownInitialValue; lenData 0 — TS_SNAPSHOT needs no seed.
     body = struct.pack("<IQIBBBII", pid, 0, 0, wire_type, 11,
                        alignment, 0, flags)
@@ -2035,6 +2064,13 @@ def ps5_scan_unknown_turbo(ip: str, pid: int, width: int,
         try:
             _slot_count, _plan_total_bytes = struct.unpack(
                 "<QQ", _recv_exact_cancel(s, 16, cancel_event))
+            # The server's own plan, which RDX previously read and discarded.
+            # Log it: it is the authoritative slot count and the only way to
+            # see that the estimate above matched what the console actually
+            # committed to.
+            add_log(f"Snapshot plan: {_slot_count:,} slots over "
+                    f"{_plan_total_bytes / 1073741824:.2f} GiB "
+                    f"(estimated {_slots:,} slots)")
             while True:
                 bytes_done = struct.unpack(
                     "<Q", _recv_exact_cancel(s, 8, cancel_event))[0]
@@ -2462,6 +2498,144 @@ _DEBUG_TRACE_WP_INDEX = None
 # explicitly confirmed, one-shot experimental UI action.
 _DEBUG_TRACE_ENABLED = False
 
+# ── debug-session safety net ──────────────────────────────────────────────────
+#
+# An attached debug session that is never torn down is the one thing in this
+# tool that can take the console down with it. ps5debug-NG allows exactly one
+# session (main.c handle_client only records the debugger slot when
+# g_debug_attached == 0), the target can be left SIGSTOPped, and hardware
+# watchpoints stay armed in DR0-DR3. PS4CheaterNeo's own documentation warns
+# that closing the game while its debugger is attached crashes the console.
+#
+# So: the moment we attach, the session is recorded here, and every exit path
+# — normal return, exception, Ctrl-C, SIGTERM, interpreter shutdown — runs the
+# teardown. This is the same pattern the freeze worker uses for its writes.
+# Arming a watchpoint means SIGSTOPping the target. Doing that to a system
+# process stops the console itself: ps5dbg gates its own debug-attach test
+# behind --risky because "attaching to SceShellCore can freeze the system UI".
+# None of these are cheat targets, and RDX previously attached to whatever
+# process happened to be selected.
+_DEBUG_ATTACH_BLOCKLIST = frozenset({
+    "kernel", "mini-syscore.elf", "SceSysCore.elf", "SceShellCore",
+    "SceShellUI", "SceSysAvControl.elf", "SceRemotePlay",
+    "SceGameLiveStreaming", "SceVideoCore2K", "SceAvCapture",
+    "orbis_audiod.elf", "AgcCompositor.elf",
+})
+
+
+def _debug_attach_refusal(process: str) -> Optional[str]:
+    """Why the debugger must not attach to `process`, or None if it may.
+
+    Hard-refuses the processes that run the console UI and audio/video
+    pipeline. Anything else that is plainly a system service still attaches,
+    but the caller is expected to confirm it explicitly — see
+    _debug_attach_is_unusual().
+    """
+    name = str(process or "").strip()
+    if not name:
+        return "no process is attached"
+    if name in _DEBUG_ATTACH_BLOCKLIST:
+        return (f"'{name}' runs the console itself. Stopping it to arm a "
+                "hardware watchpoint can freeze the system UI, and it is "
+                "never a cheat target.")
+    return None
+
+
+def _debug_attach_is_unusual(process: str) -> bool:
+    """True for a process that is probably a system service, not a game.
+
+    Games run as `eboot.bin`; homebrew as a named `.elf`. A `Sce*` daemon is
+    almost certainly not what the user meant to trace, so it earns a second,
+    explicit confirmation rather than a silent attach.
+    """
+    name = str(process or "").strip()
+    return bool(name) and name.startswith("Sce")
+
+
+CMD_DEBUG_PROCESS_STOP = 0xBDBB0500
+_debug_session_lock = threading.Lock()
+_debug_session: Optional[dict] = None   # {"ip","pid","sock","wp_index","stopped"}
+
+
+def _register_debug_session(ip: str, pid: int, sock) -> None:
+    global _debug_session
+    with _debug_session_lock:
+        _debug_session = {"ip": ip, "pid": int(pid), "sock": sock,
+                          "wp_index": None, "stopped": False}
+
+
+def _update_debug_session(**fields) -> None:
+    with _debug_session_lock:
+        if _debug_session is not None:
+            _debug_session.update(fields)
+
+
+def _clear_debug_session() -> None:
+    global _debug_session
+    with _debug_session_lock:
+        _debug_session = None
+
+
+def _debug_force_resume(ip: str, pid: int) -> bool:
+    """Resume a target over a fresh connection, with no debug session needed.
+
+    `CMD_DEBUG_PROCESS_STOP` is handled even when no session is active: the
+    server falls through to a direct `kill(pid, sig)` with `0 -> SIGCONT`
+    (protocol 2.3). That makes it the one way to un-stick a game left stopped
+    by a session that died without detaching — including one leaked by a
+    previous run of this program.
+    """
+    try:
+        s = ps5_connect(ip, timeout=5.0)
+    except OSError:
+        return False
+    try:
+        body = struct.pack("<IB", int(pid), 0)   # 5 raw bytes: pid, state=0
+        s.sendall(cmd_header(CMD_DEBUG_PROCESS_STOP, len(body)) + body)
+        return _debug_status_ok(s)
+    except Exception:
+        return False
+    finally:
+        try: s.close()
+        except Exception: pass
+
+
+def _emergency_debug_teardown() -> None:
+    """Clear the watchpoint, resume the target and detach. Never raises.
+
+    Registered with atexit and called from every trace exit path, so a crash,
+    Ctrl-C or a closed terminal cannot leave the console attached with a live
+    hardware watchpoint.
+    """
+    with _debug_session_lock:
+        session, globals()["_debug_session"] = _debug_session, None
+    if not session:
+        return
+    sock = session.get("sock")
+    if sock is not None:
+        for step in ("watchpoint", "resume", "detach"):
+            try:
+                if step == "watchpoint" and session.get("wp_index") is not None:
+                    _debug_clear_watchpoint(sock, int(session["wp_index"]))
+                elif step == "resume" and session.get("stopped"):
+                    _debug_continue(sock, 0)
+                elif step == "detach":
+                    sock.sendall(cmd_header(CMD_DEBUG_DETACH))
+                    _debug_status_ok(sock)
+            except Exception:
+                pass          # keep going; a later step may still land
+        try: sock.close()
+        except Exception: pass
+    # Belt and braces: DETACH already runs debug_full_teardown (which resumes),
+    # but if the command socket was the thing that broke, the target may still
+    # be stopped and only a fresh connection can reach it.
+    if session.get("stopped"):
+        _debug_force_resume(str(session.get("ip", "")), int(session.get("pid", 0)))
+
+
+import atexit as _atexit
+_atexit.register(_emergency_debug_teardown)
+
 # FreeBSD/amd64 struct reg: 15 GP registers followed by trap/segment fields.
 _REG_OFFSETS = {
     "r15": 0, "r14": 8, "r13": 16, "r12": 24, "r11": 32, "r10": 40,
@@ -2582,6 +2756,9 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
     if not (_DEBUG_TRACE_ENABLED or experimental):
         raise RuntimeError(
             "hardware-watchpoint tracing is disabled: unsafe debugger lifecycle")
+    refusal = _debug_attach_refusal(state.get("proc_name", ""))
+    if refusal:
+        raise RuntimeError(refusal)
     target_addr = int(target_addr)
     width = int(width)
     original = ps5_read(ip, pid, target_addr, width)
@@ -2604,8 +2781,19 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
         body = struct.pack("<I", int(pid))
         cmd.sendall(cmd_header(CMD_DEBUG_ATTACH, len(body)) + body)
         if not _debug_status_ok(cmd):
-            raise RuntimeError("debug attach rejected")
+            # ps5debug-NG permits one session at a time, so this is usually a
+            # session leaked by an earlier run rather than a real failure.
+            # Try to un-stick the game before giving up: a target left
+            # SIGSTOPped is indistinguishable from a hung console to the user.
+            if _debug_force_resume(ip, pid):
+                add_log("A previous debug session was still attached; the "
+                        "target was resumed. Restart the payload to trace "
+                        "again.", "warn")
+            raise RuntimeError(
+                "debug attach rejected (a debug session may already be "
+                "attached; restart ps5debug-NG if tracing keeps failing)")
         attached = True
+        _register_debug_session(ip, pid, cmd)
 
         event_sock, _ = listener.accept()
         event_sock.settimeout(timeout)
@@ -2617,12 +2805,14 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
         wp_index = _debug_free_watchpoint(cmd, lwpid)
         if wp_index is None:
             raise RuntimeError("no free hardware watchpoint slot")
+        _update_debug_session(wp_index=wp_index)
 
         # Stop briefly while installing DR7.  Do not write a probe value here:
         # restoring one later can overwrite a legitimate in-game inventory
         # change made while the trace is active.
         _debug_continue(cmd, 1)
         target_stopped = True
+        _update_debug_session(stopped=True)
         # DR7 length encoding: 0=1 byte, 1=2 bytes, 2=8 bytes, 3=4 bytes.
         wp_length = {1: 0, 2: 1, 4: 3, 8: 2}.get(width)
         if wp_length is None:
@@ -2631,6 +2821,7 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
         _debug_set_watchpoint(cmd, wp_index, target_addr, wp_length, 1)
         _debug_continue(cmd, 0)
         target_stopped = False
+        _update_debug_session(stopped=False)
 
         # Collect a few genuine target accesses.  The first hit is not always
         # the useful accessor (for example a housekeeping read), so keep trying
@@ -2649,12 +2840,14 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
                 break
             candidate = _debug_parse_event(packet)
             target_stopped = True
+            _update_debug_session(stopped=True)
             dr6 = int(candidate["dbregs"][6])
             if not (dr6 & (1 << int(wp_index))):
                 # Every debug event stops the target.  Ignoring an unrelated
                 # event without resuming leaves the game visibly frozen.
                 _debug_continue(cmd, 0)
                 target_stopped = False
+                _update_debug_session(stopped=False)
                 continue
             hits += 1
             regs = candidate["regs"]
@@ -2677,6 +2870,7 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
                 last_reason = "watchpoint hit but accessor instruction was not decoded"
                 _debug_continue(cmd, 0)
                 target_stopped = False
+                _update_debug_session(stopped=False)
                 continue
             event = candidate
             insn = decoded
@@ -2744,6 +2938,7 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
             try:
                 _debug_continue(cmd, 0)
                 target_stopped = False
+                _update_debug_session(stopped=False)
             except Exception:
                 pass
         if cmd is not None:
@@ -2753,6 +2948,9 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
                     _debug_status_ok(cmd)
                 except Exception:
                     pass
+        # Whatever happened above, the session is finished from here on; drop
+        # the registration so the atexit net does not act on a dead socket.
+        _clear_debug_session()
         if event_sock is not None:
             try: event_sock.close()
             except Exception: pass
@@ -2762,32 +2960,49 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
         try: listener.close()
         except Exception: pass
 
-def _resolve_trace_first(ip: str, pid: int, target_addr: int,
-                         width: int, cancel_event=None,
-                         progress_cb=None) -> dict:
+def _trace_base_is_resolvable(trace: dict) -> Optional[str]:
+    """Why this trace cannot seed a permanent chain, or None if it can.
+
+    A chain root has to be reachable from a module every run.  `rip` is a code
+    reference rather than an object pointer; `rsp`/`rbp` are stack frames that
+    exist only for the duration of the call; and an indexed access
+    (`[base + index*scale]`) has a runtime-varying element that no fixed offset
+    chain can reproduce.  Returning the reason rather than a bool lets the UI
+    tell the user which of these it hit, since the remedy differs.
     """
-    Trace first, then resolve the observed object pointer with the existing
-    bounded pointer scanner.  Falls back to the cached reverse index if the
-    trace backend is unavailable or the accessor is not pointer-like.
+    if not trace.get("base_value"):
+        return "the accessor had no base register (absolute or computed address)"
+    if trace.get("base_reg") in ("rip", "rsp", "rbp"):
+        return (f"the base register is {trace.get('base_reg')}, which is a code "
+                "or stack reference rather than a heap object pointer")
+    if trace.get("index_reg"):
+        return (f"the access is indexed via {trace.get('index_reg')}, whose value "
+                "varies at runtime and cannot be baked into a fixed chain")
+    return None
+
+
+def _pointer_candidates_from_trace(ip: str, pid: int, trace: dict,
+                                   target_addr: int, cancel_event=None,
+                                   progress_cb=None,
+                                   max_depth: int = 5) -> dict:
+    """Turn one captured write-trace into verified module-rooted chains.
+
+    This is the half of the change-triggered workflow that runs *after* the
+    watchpoint fires, split out so the UI can capture a trace (which needs the
+    user to interact with the game) and then run the search under a progress
+    bar without tracing a second time.
+
+    The win over searching backwards from the value itself: the traced
+    instruction hands us the object's base pointer and the field displacement
+    exactly, read off the opcode.  Searching for one known object pointer is
+    far more constrained than accepting any pointer that happens to land within
+    ``_PTR_STRUCT_MAX`` of the target, which is where a backwards scan's
+    coincidental chains come from.
     """
-    trace = _trace_temporary_access(ip, pid, target_addr, width)
-    if cancel_event and cancel_event.is_set():
-        return {"candidates": [], "trace": trace, "method": "trace-cancelled"}
-
-    # A stable pointer root needs a general-purpose base register.  Indexed
-    # addressing is reported but deliberately not promoted to a permanent chain
-    # because its index can change at runtime.
-    if (not trace.get("base_value") or trace.get("base_reg") in ("rip", "rsp", "rbp")
-            or trace.get("index_reg")):
-        return {"candidates": [], "trace": trace, "method": "trace-no-stable-base"}
-
-    if progress_cb:
-        progress_cb(0, max(_PTR_RESOLVE_MAX_NODES, 1))
-
     base_target = int(trace["base_value"])
     candidates = pointer_chain_scan(
         ip, pid, base_target,
-        max_depth=min(5, MAX_CHAIN_DEPTH),
+        max_depth=min(max_depth, MAX_CHAIN_DEPTH),
         cancel_event=cancel_event,
         progress_cb=progress_cb,
     )
@@ -2824,6 +3039,7 @@ def _resolve_trace_first(ip: str, pid: int, target_addr: int,
         c2["steps"] = steps
         if c2["verified"]:
             c2["score"] = float(c2.get("score", 0.0)) + 150.0
+            c2["confidence"] = _candidate_confidence(c2)
             verified.append(c2)
 
     verified.sort(key=lambda c: (-c["score"], c["depth"]))
@@ -2834,6 +3050,30 @@ def _resolve_trace_first(ip: str, pid: int, target_addr: int,
         "index_built": False,
         "maps": maps,
     }
+
+
+def _resolve_trace_first(ip: str, pid: int, target_addr: int,
+                         width: int, cancel_event=None,
+                         progress_cb=None, experimental: bool = False) -> dict:
+    """
+    Trace first, then resolve the observed object pointer with the existing
+    bounded pointer scanner.  Falls back to the cached reverse index if the
+    trace backend is unavailable or the accessor is not pointer-like.
+    """
+    trace = _trace_temporary_access(ip, pid, target_addr, width,
+                                    experimental=experimental)
+    if cancel_event and cancel_event.is_set():
+        return {"candidates": [], "trace": trace, "method": "trace-cancelled"}
+
+    reason = _trace_base_is_resolvable(trace)
+    if reason:
+        return {"candidates": [], "trace": trace,
+                "method": "trace-no-stable-base", "reason": reason}
+
+    if progress_cb:
+        progress_cb(0, max(_PTR_RESOLVE_MAX_NODES, 1))
+    return _pointer_candidates_from_trace(
+        ip, pid, trace, target_addr, cancel_event, progress_cb)
 
 
 # ── batch reader for scan_next ────────────────────────────────────────────────
@@ -2872,7 +3112,9 @@ def ps5_read_batch(ip: str, pid: int, addrs: np.ndarray, width: int,
     Return type: (live_addrs: ndarray[uint64], live_vals: ndarray[uint_w])
         Same as before — callers unchanged.
     """
-    NEXT_WORKERS  = 12          # Phase 1: raised from 6 → 12
+    # Bounded by the console connection budget, not just by CPU: see
+    # _MAX_CONSOLE_SOCKETS.
+    NEXT_WORKERS  = min(12, _MAX_CONSOLE_SOCKETS)
     COALESCE_MAX  = 8 * 1024 * 1024
     MAX_BYTES_PER_CANDIDATE = 4096
     LOCAL_BUF     = 256         # thread-local accumulation size before flush
@@ -3056,6 +3298,23 @@ def ps5_read_batch(ip: str, pid: int, addrs: np.ndarray, width: int,
 
 # ── persistent-socket reader for scan_first ───────────────────────────────────
 
+# Concurrent console connections are a finite, shared resource and nothing
+# bounded them. MemDBG documents a hard cap of 16 ("16 accepted, 4 rejected out
+# of 20") and closes idle connections after 30 s. ps5debug-NG documents no cap,
+# but this project observed it drop *every* connection with
+# `ConnectionError: PS5 disconnected` when a 12-socket batch read and a 6-socket
+# AOB scan overlapped.
+#
+# The budget counts sockets that are OPEN, not sockets that are busy: a pooled
+# _ScanSocket is idle but still occupies a connection on the console, so it
+# keeps holding its slot until it is genuinely closed. Headroom is left for the
+# connections that never go through _ScanSocket at all — the resident TurboScan
+# session, map fetches, the region classifier, writes, and the Results
+# live-value refresh.
+_MAX_CONSOLE_SOCKETS = 10
+_console_socket_slots = threading.BoundedSemaphore(_MAX_CONSOLE_SOCKETS)
+
+
 class _ScanSocket:
     """
     Holds one persistent native-MemDBG or ps5debug connection for a scan.
@@ -3087,6 +3346,7 @@ class _ScanSocket:
         self._native = _memdbg_has(MEMDBG_CAP_MEMORY_READ)
         self._native_client: Optional[_MemDBGClient] = None
         self._from_pool = False
+        self._holds_slot = False
         # Pre-built mutable request buffer; addr field patched in read()
         self._req = bytearray(self._HDR_SIZE)
         struct.pack_into("<III", self._req,  0,
@@ -3104,16 +3364,66 @@ class _ScanSocket:
                 for sock in cls._pool.pop(key, []):
                     try: sock.close()
                     except Exception: pass
+                    try: _console_socket_slots.release()
+                    except ValueError: pass
+
+    @classmethod
+    def _acquire_slot(cls):
+        """Take a connection slot, evicting idle pooled sockets if needed.
+
+        Pooled sockets are idle for us but still open on the console, so they
+        hold slots. Without this, a pool left full by a previous operation
+        would starve the workers of the next one: they would block until the
+        pool happened to be cleared. Active work always wins over a cached
+        connection.
+        """
+        if _console_socket_slots.acquire(blocking=False):
+            return
+        cls.clear_pool()          # frees every slot the pool was holding
+        _console_socket_slots.acquire()
+
+    def __del__(self):
+        """Last-resort budget recovery for a socket nobody closed.
+
+        Every current caller closes in a `finally`, but a slot that is never
+        returned is worse than the problem the budget solves: the ceiling
+        drops permanently, and once it reaches zero every scan blocks for
+        ever. One missed `close()` in future code would be enough. Closing
+        here also pools or shuts the socket properly rather than just
+        reclaiming the number.
+        """
+        try:
+            if self._holds_slot:
+                self.close()
+        except Exception:
+            pass
+        finally:
+            try:
+                self._release_slot()
+            except Exception:
+                pass          # interpreter shutdown can gut the globals
+
+    def _release_slot(self):
+        """Give the connection budget back exactly once per open socket."""
+        if self._holds_slot:
+            self._holds_slot = False
+            try:
+                _console_socket_slots.release()
+            except ValueError:
+                pass
 
     def _connect(self):
         if self._native_client is not None:
             self._native_client.close()
             self._native_client = None
+            self._release_slot()
         if self._s:
             try: self._s.close()
             except Exception: pass
             self._s = None
+            self._release_slot()
         if self._native:
+            self._acquire_slot()
             client = _MemDBGClient(self.ip, timeout=15.0)
             try:
                 client.connect()
@@ -3121,10 +3431,12 @@ class _ScanSocket:
                         MEMDBG_CAP_MEMORY_READ):
                     raise RuntimeError("native reads are not advertised")
                 self._native_client = client
+                self._holds_slot = True
                 self._from_pool = False
                 return
             except Exception as exc:
                 client.close()
+                _console_socket_slots.release()
                 # A development/older payload may still expose the compatibility
                 # service.  Try it without making every scan worker repeat the
                 # native failure on each reconnect.
@@ -3136,9 +3448,16 @@ class _ScanSocket:
             if bucket:
                 self._s = bucket.pop()
                 self._from_pool = True
+                self._holds_slot = True     # inherited from the pooled socket
                 if not bucket: self._pool.pop(key, None)
                 return
-        self._s = ps5_connect(self.ip)
+        self._acquire_slot()
+        try:
+            self._s = ps5_connect(self.ip)
+        except BaseException:
+            _console_socket_slots.release()
+            raise
+        self._holds_slot = True
         self._from_pool = False
 
     def read(self, addr: int, length: int,
@@ -3191,9 +3510,11 @@ class _ScanSocket:
                 if self._native_client is not None:
                     self._native_client.close()
                     self._native_client = None
+                    self._release_slot()
                 if self._s is not None:
                     try: self._s.close()
                     except Exception: pass
+                    self._release_slot()
                 self._s = None
                 self._from_pool = False
                 # The caller can immediately retry this range with a smaller
@@ -3235,19 +3556,25 @@ class _ScanSocket:
         if self._native_client is not None:
             self._native_client.close()
             self._native_client = None
+            self._release_slot()
             return
         if not self._s:
+            self._release_slot()
             return
         sock, self._s = self._s, None
         key = (self.ip, self.pid)
         with self._pool_lock:
             bucket = self._pool.setdefault(key, [])
             if len(bucket) < self._POOL_MAX:
+                # Still open, so it still costs a console connection: hand the
+                # slot to the pool rather than releasing it here.
                 bucket.append(sock)
+                self._holds_slot = False
                 self._from_pool = True
                 return
         try: sock.close()
         except Exception: pass
+        self._release_slot()
         self._from_pool = False
 
 def _get_maps_cached(ip: str, pid: int,
@@ -3351,7 +3678,7 @@ def scan_first(ip: str, pid: int, value, width: int = 4,
                                # single RTT covers far more heap than before.
                                # RAM budget: 12 workers × 4 slots × 32 MB = 1.5 GB
                                # max in-flight; bounded by QUEUE_DEPTH.
-    SCAN_WORKERS = 12          # 12 parallel readers to saturate the GbE link
+    SCAN_WORKERS = min(12, _MAX_CONSOLE_SOCKETS)   # bounded by the budget
                                # (ps5debug is server-side; 12 concurrent TCP streams
                                # keeps the scanner from stalling on any one RTT).
     QUEUE_DEPTH  = SCAN_WORKERS * 4   # 48 slots × 32 MB = 1.5 GB max in-flight
@@ -4019,7 +4346,7 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
     maps = _get_maps_cached(ip, pid)
 
     CHUNK        = 0x2000000   # 32 MB — matches scan_first for consistent RTT amortisation
-    SCAN_WORKERS = 12          # 12 parallel readers
+    SCAN_WORKERS = min(12, _MAX_CONSOLE_SOCKETS)   # bounded by the budget
     QUEUE_DEPTH  = SCAN_WORKERS * 4
     _SENTINEL    = None
 
@@ -8778,7 +9105,7 @@ def _results_more_menu(stdscr):
         ("Explore Values Near This Item", "nearby_browse"),
         ("Find a Nearby Item by Changing It", "nearby"),
         ("Preview Selected Value", "preview"),
-        ("Experimental: Trace Item Write", "trace_write"),
+        ("Trace Write → Find Pointer (experimental)", "trace_write"),
         ("Find Matching Nearby Item (Group Test)", "batch_preview"),
         ("Write Address", "write"),
         ("Verify Pointer", "ptr_verify"),
@@ -9102,6 +9429,28 @@ def do_trace_item_write(stdscr, address: int) -> None:
     if validation:
         message_box(stdscr, [validation], "Trace Blocked", C_ERR)
         return
+    # Refuse outright before anything is attached: arming a watchpoint stops
+    # the target, and stopping the console's own UI process freezes the
+    # console.
+    refusal = _debug_attach_refusal(state.get("proc_name", ""))
+    if refusal:
+        message_box(stdscr, [
+            "Tracing is not available for this process.",
+            "",
+            refusal,
+            "",
+            "Attach to the game process and try again.",
+        ], "Trace Refused", C_ERR)
+        return
+    if _debug_attach_is_unusual(state.get("proc_name", "")):
+        if not confirm_box(
+                stdscr,
+                f"'{state.get('proc_name')}' looks like a system service, not "
+                "a game.\nAttaching a debugger to it stops it while the "
+                "watchpoint is armed,\nwhich may disturb the console.\n\n"
+                "Trace it anyway?",
+                "Unusual Trace Target"):
+            return
     if not confirm_box(stdscr,
             "Experimental one-shot trace: the game may pause briefly. Continue?",
             "Trace Item Write"):
@@ -9149,6 +9498,102 @@ def do_trace_item_write(stdscr, address: int) -> None:
         "Watchpoint cleared; target resume and detach were requested.",
     ]
     message_box(stdscr, lines, "Item Write Captured", C_OK)
+
+    # The trace is only half the value. Searching backwards from the value
+    # itself accepts any pointer landing within _PTR_STRUCT_MAX of it, which
+    # is where a backwards scan's coincidental chains come from. The traced
+    # instruction hands us the object's base pointer and the field
+    # displacement exactly, so the search becomes "find this one known
+    # object pointer" with the terminal offset already known.
+    reason = _trace_base_is_resolvable(trace)
+    if reason:
+        message_box(stdscr, [
+            "This accessor cannot seed a permanent pointer chain:",
+            f"  {reason}.",
+            "",
+            "The capture is still recorded in the log. Try tracing a",
+            "different write to the same value, or use Find Permanent",
+            "Pointer, which searches backwards instead.",
+        ], "No Stable Base", C_WARN)
+        return
+
+    if not confirm_box(
+            stdscr,
+            f"Search for pointer chains to the traced object at "
+            f"{hex(base_value)}?\n"
+            "This is the same bounded scan Find Permanent Pointer uses, but\n"
+            "aimed at the exact object the game itself dereferenced.",
+            "Resolve Traced Object"):
+        return
+
+    cancel_event = threading.Event()
+    progress = {"done": 0, "total": _PTR_RESOLVE_MAX_NODES,
+                "results": None, "error": None}
+
+    def run():
+        try:
+            progress["results"] = _pointer_candidates_from_trace(
+                state["ip"], int(state["pid"]), trace, int(address),
+                cancel_event=cancel_event,
+                progress_cb=lambda d, t: progress.update(
+                    done=d, total=max(int(t), 1)))
+        except Exception as exc:
+            progress["error"] = str(exc)
+
+    if not _run_scan_with_progress(
+            stdscr, run, "Resolving the traced object…", cancel_event, progress):
+        add_log("Traced-object resolution cancelled", "warn")
+        return
+    if progress["error"]:
+        message_box(stdscr, [f"Error: {progress['error']}"],
+                    "Resolve Failed", C_ERR)
+        return
+
+    data = progress["results"] or {}
+    candidates = [c for c in data.get("candidates", []) if c.get("verified")]
+    if not candidates:
+        message_box(stdscr, [
+            "No module-rooted chain reached the traced object.",
+            "",
+            "The object is reachable from the accessor but not from any",
+            "static root within the search depth. A deeper Find Permanent",
+            "Pointer run may still find one.",
+        ], "No Chain Found", C_WARN)
+        return
+
+    # Same persistence path as do_resolve_permanent, so these chains enter
+    # the identical two-reload validation workflow rather than a parallel one.
+    try:
+        maps = data.get("maps") or _get_maps_cached(state["ip"], state["pid"])
+        game_identity = _pointer_game_identity(state.get("proc_name", ""), maps)
+        provisional = _make_pointer_provisionals(
+            candidates, maps, state["pid"], state["proc_name"], int(address))
+        _merge_pointer_provisionals(
+            provisional, state.get("proc_name", ""),
+            game_identity=game_identity)
+        state["pointer_project_summary"] = _pointer_project_summary(
+            state.get("proc_name", ""), maps)
+    except Exception as exc:
+        add_log(f"Could not persist traced pointer chains: {exc}", "error")
+        message_box(stdscr, [f"Chains found but not saved: {exc}"],
+                    "Save Failed", C_ERR)
+        return
+
+    best = candidates[0]
+    add_log(f"Change-triggered resolve: {len(candidates)} verified chain(s) "
+            f"from base {base_name}:{hex(base_value)}")
+    message_box(stdscr, [
+        f"{len(candidates)} verified chain(s) reach the traced object.",
+        f"Best: {best.get('module_name')} + "
+        f"{int(best.get('module_relative_offset', 0)):#x}",
+        f"  offsets {[hex(int(x)) for x in best.get('offsets', [])]}"
+        f" then field {final_offset:+#x}",
+        f"  confidence {int(best.get('confidence', 0))}%",
+        "",
+        f"Saved {len(provisional)} provisional chain(s). They are NOT",
+        "permanent yet — reload the game, isolate the value again, and run",
+        "Resolve permanent twice to promote them.",
+    ], "Traced Chains Saved", C_OK)
 
 
 def do_batch_preview_matching(stdscr) -> None:
@@ -12170,12 +12615,41 @@ def main(stdscr) -> None:
             break
 
 
+def _install_signal_teardown() -> None:
+    """Tear the debugger down on SIGTERM/SIGHUP as well as on normal exit.
+
+    atexit does not run for a signal-terminated process, and a closed terminal
+    (SIGHUP) is a realistic way to lose this program mid-trace. SIGKILL cannot
+    be caught, which is why _debug_force_resume() exists as a manual escape.
+    """
+    import signal
+
+    def _handler(signum, _frame):
+        _emergency_debug_teardown()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            pass          # not the main thread, or unsupported on this OS
+
+
 if __name__ == '__main__':
+    _install_signal_teardown()
     try:
         curses.wrapper(main)
     except KeyboardInterrupt:
         pass
     finally:
+        # Order matters: drop the debugger first. A leaked session can leave
+        # the game SIGSTOPped with a live hardware watchpoint, which is the
+        # one failure in this tool that takes the console down with it.
+        _emergency_debug_teardown()
         _stop_freeze_worker()
         _close_turbo_session()
     print("\nRDX CheatMaker exited.")

@@ -527,6 +527,18 @@ MAX_SCAN_RESULTS: int = 2_000_000   # configurable; ~16 MB at this setting
 # worst-case undo RAM even if all 5 levels each hold 2 M addresses.
 HISTORY_RAM_CAP_MB: float = 128.0   # configurable
 
+# TURBO_MIN_SURVIVORS: below this many candidates, "auto" filters on the host
+# rather than negotiating a resident TurboScan session.
+#
+# Auto previously chose purely by availability -- turbo, then console, then
+# host -- which is the right first filter but not the only one. Squalr's rules
+# engine additionally weighs "region size, SIMD compatibility, and data type
+# properties" when picking a strategy. The console round trips that set up and
+# tear down a resident session cost more than reading a few hundred addresses
+# outright, so on a nearly-converged candidate list turbo is the slower path.
+# Only "auto" consults this; an explicit "turbo" is still honoured exactly.
+TURBO_MIN_SURVIVORS: int = 512
+
 # NumPy dtype for each scan width — used by vectorised scan/filter code.
 # uint64 for addresses; width-specific for value arrays.
 _NP_ADDR_DTYPE  = np.uint64
@@ -585,10 +597,124 @@ def _addr_list(a) -> list:
 #                prev_dropped: set,
 #                prev_truncated: bool)
 
+# ── undo delta compression ────────────────────────────────────────────────────
+# Undo levels were the project's real RAM problem: HISTORY_RAM_CAP_MB exists to
+# bound them, and "Clear Scan History" is a whole user-facing screen whose only
+# job is freeing them. A delta is the set of addresses a Next Scan removed, and
+# on an aligned scan those are overwhelmingly long constant-stride runs -- the
+# scan walks memory at a fixed step, so the addresses it discards are mostly
+# consecutive.
+#
+# Squalr makes the same observation about scan results and answers it with
+# run-length encoding: "if scanning for value 0x00 and the region was entirely
+# zeros at size 0x2000 at address 0x10000, it would yield a single result."
+# Applied to a delta, one 4-byte-strided run of a million addresses collapses
+# from 8 MB to three numbers.
+#
+# RLE is not unconditionally better -- a shattered delta with no runs costs 3x
+# raw -- so both encodings are produced and the smaller one is kept. Decoding
+# is exact either way; this is a storage format, not an approximation.
+_RLE_MIN_RUN = 4          # shorter runs cost more to describe than to store
+
+
+def _rle_encode_addrs(addrs: np.ndarray) -> Optional[tuple]:
+    """Encode a sorted address array as (starts, steps, counts).
+
+    Returns None when the encoding would not be smaller than the raw array.
+    """
+    arr = np.asarray(addrs, dtype=np.uint64)
+    if len(arr) < _RLE_MIN_RUN:
+        return None
+    # Signed diffs: addresses are sorted so steps are positive, but uint64
+    # subtraction would wrap on any out-of-order input rather than showing it.
+    diffs = np.diff(arr.astype(np.int64))
+    if len(diffs) == 0:
+        return None
+    # A run boundary is where the stride changes.
+    boundaries = np.flatnonzero(diffs[1:] != diffs[:-1]) + 1
+    starts_idx = np.concatenate(([0], boundaries + 1))
+    run_lengths = np.diff(np.concatenate((starts_idx, [len(arr)])))
+
+    starts, steps, counts = [], [], []
+    cursor = 0
+    while cursor < len(arr):
+        if cursor == len(arr) - 1:
+            starts.append(arr[cursor]); steps.append(0); counts.append(1)
+            cursor += 1
+            continue
+        step = int(arr[cursor + 1]) - int(arr[cursor])
+        length = 2
+        while (cursor + length < len(arr)
+               and int(arr[cursor + length]) - int(arr[cursor + length - 1]) == step):
+            length += 1
+        starts.append(arr[cursor]); steps.append(step); counts.append(length)
+        cursor += length
+
+    encoded = (np.asarray(starts, dtype=np.uint64),
+               np.asarray(steps, dtype=np.int64),
+               np.asarray(counts, dtype=np.int64))
+    if sum(part.nbytes for part in encoded) >= arr.nbytes:
+        return None
+    return encoded
+
+
+def _rle_decode_addrs(encoded: tuple) -> np.ndarray:
+    """Rebuild the exact array a _rle_encode_addrs() result describes."""
+    starts, steps, counts = encoded
+    total = int(counts.sum())
+    out = np.empty(total, dtype=np.uint64)
+    cursor = 0
+    for start, step, count in zip(starts.tolist(), steps.tolist(),
+                                  counts.tolist()):
+        out[cursor:cursor + count] = (
+            np.uint64(start)
+            + (np.arange(count, dtype=np.int64) * step).astype(np.uint64))
+        cursor += count
+    return out
+
+
+class _UndoAddrs:
+    """One undo level's removed-address set, stored in whichever form is
+    smaller. Callers only ever see the decoded array."""
+
+    __slots__ = ("_raw", "_encoded", "_nbytes", "_length")
+
+    def __init__(self, addrs: np.ndarray):
+        arr = np.asarray(addrs, dtype=np.uint64)
+        self._length = len(arr)
+        encoded = _rle_encode_addrs(arr)
+        if encoded is None:
+            self._raw, self._encoded = arr, None
+            self._nbytes = arr.nbytes
+        else:
+            self._raw, self._encoded = None, encoded
+            self._nbytes = sum(part.nbytes for part in encoded)
+
+    def __len__(self) -> int:
+        return self._length
+
+    @property
+    def nbytes(self) -> int:
+        return self._nbytes
+
+    @property
+    def compressed(self) -> bool:
+        return self._encoded is not None
+
+    def array(self) -> np.ndarray:
+        return self._raw if self._encoded is None else _rle_decode_addrs(
+            self._encoded)
+
+
 def _undo_entry_bytes(entry: tuple) -> int:
     """Byte size of a single undo entry (removed_addrs + removed_values)."""
     a, v, _, _ = entry
-    nb = a.nbytes if isinstance(a, np.ndarray) else len(a) * 8
+    if isinstance(a, _UndoAddrs):
+        nb = a.nbytes
+    elif isinstance(a, np.ndarray):
+        nb = a.nbytes
+    else:
+        nb = len(a) * 8
     nv = v.nbytes if isinstance(v, np.ndarray) else 0
     return nb + nv
 
@@ -604,7 +730,7 @@ def _push_undo(removed_addrs: np.ndarray,
     Push one undo delta.  If the resulting history would exceed
     HISTORY_RAM_CAP_MB, evict the oldest entry first.
     """
-    new_entry   = (removed_addrs, removed_values, prev_dropped,
+    new_entry   = (_UndoAddrs(removed_addrs), removed_values, prev_dropped,
                    bool(prev_truncated))
     new_bytes   = _undo_entry_bytes(new_entry)
     # Evict oldest entries until we are under the cap (beyond normal maxlen).
@@ -629,8 +755,10 @@ def _apply_scan_undo() -> Optional[np.ndarray]:
     """
     if not state["scan_history"]:
         return None
-    removed_a, removed_v, prev_dropped, prev_truncated = (
+    stored_a, removed_v, prev_dropped, prev_truncated = (
         state["scan_history"].pop())
+    removed_a = (stored_a.array() if isinstance(stored_a, _UndoAddrs)
+                 else stored_a)
     cur_addrs = state["scan_results"]
     prev_addrs = np.union1d(cur_addrs, removed_a)
     if removed_v is not None and state.get("scan_values") is not None:
@@ -641,10 +769,8 @@ def _apply_scan_undo() -> Optional[np.ndarray]:
         prev_vals[np.searchsorted(prev_addrs, removed_a)] = removed_v
     else:
         prev_vals = state.get("scan_values")
-    state["scan_results"] = prev_addrs
-    state["scan_values"] = prev_vals
-    state["scan_dropped"] = prev_dropped
-    state["scan_truncated"] = prev_truncated
+    scan.restore((prev_addrs, prev_vals, state.get("scan_pid"), prev_dropped,
+                  prev_truncated, state.get("scan_unknown", False)))
     _close_turbo_session()
     return prev_addrs
 
@@ -720,6 +846,100 @@ _PTR_FAST_DIRECT_POOL = 8
 # 48-byte arithmetic series -- an IL2CPP static-field pointer table, not
 # parents. Five of the same shape from an earlier session survived 0/5 reloads.
 _PTR_PLAUSIBLE_FIELD_MAX = 0x200
+
+
+def _candidate_field_offset_is_plausible(candidate: dict) -> bool:
+    """Whether a chain's final hop looks like a field inside an object.
+
+    The rule above was only ever enforced on the fast-direct short-circuit.
+    The locality and reverse-index passes returned candidates in a ranking
+    that did not consider it at all, so a holder pointing thousands of bytes
+    past the target -- the exact shape recorded above as surviving 0/5
+    reloads -- could and did outrank a real multi-hop chain. Following that
+    recommendation costs two game reloads to disprove, with the real chain
+    sitting one row below the whole time.
+
+    The last offset is the displacement inside the final object, which is
+    what the rule is about; for a depth-1 candidate it is also offsets[0],
+    so this agrees with the fast-direct filter rather than competing with it.
+    """
+    offsets = candidate.get("offsets") or []
+    if not offsets:
+        return True
+    return 0 <= int(offsets[-1]) <= _PTR_PLAUSIBLE_FIELD_MAX
+
+
+def _rank_pointer_candidates(ip: str, pid: int, candidates: list,
+                             region_starts=None, region_rows=None) -> list:
+    """Drop self-revisiting chains, then rank plausible candidates first.
+
+    _resolve_permanent_candidates has three return paths -- fast-direct,
+    locality-first and reverse-index -- and each had grown its own sort.
+    Only the first applied the structural-plausibility rule, so which
+    ranking a user saw depended on which tier happened to answer, and the
+    locality tier would put a coincidence-shaped holder above a real chain.
+    One function for all three is the fix; the divergence was the bug.
+    """
+    kept, dropped = [], 0
+    for candidate in candidates:
+        try:
+            _ok, _final, steps = _resolve_pointer_chain(
+                ip, pid, int(candidate.get("base", 0)),
+                [int(x) for x in candidate.get("offsets", ())],
+                int(candidate.get("terminal_offset", 0)))
+        except Exception:
+            steps = ()
+        if _chain_revisits_an_address(steps):
+            dropped += 1
+            continue
+        kept.append(candidate)
+    if dropped:
+        add_log(f"Pointer search: dropped {dropped} chain(s) that revisit an "
+                f"address already on their own path", "warn")
+
+    def region_rank(candidate):
+        if region_starts is None:
+            return 0
+        return -_region_priority(
+            _region_for_addr(int(candidate.get("base", 0)),
+                             region_starts, region_rows) or {})
+
+    kept.sort(key=lambda c: (
+        # Structural plausibility first, ahead of score and depth: a holder
+        # pointing thousands of bytes from the target is the coincidence
+        # shape recorded at _PTR_PLAUSIBLE_FIELD_MAX, and 24 of them once
+        # verified clean and then survived 0/5 reloads. Still kept -- when
+        # nothing better exists they are the only lead -- but never first.
+        not _candidate_field_offset_is_plausible(c),
+        not bool(c.get("verified")),
+        not bool(c.get("module_name")),
+        -float(c.get("score", 0.0)),
+        int(c.get("depth", 99)),
+        region_rank(c),
+        sum(0 if int(x) % 8 == 0 else 1 for x in c.get("offsets", [])),
+        sum(abs(int(x)) for x in c.get("offsets", [])),
+        str(c.get("module_name", "")),
+        int(c.get("module_relative_offset", 0)),
+        tuple(int(x) for x in c.get("offsets", [])),
+        int(c.get("base", 0)),
+    ))
+    return kept
+
+
+def _chain_revisits_an_address(steps) -> bool:
+    """True when a resolved chain passes through the same address twice.
+
+    A walker with no cycle guard emits [16, -16368, 48] and
+    [16, -16368, -16368, 48] beside the real [16, 48]: all three resolve to
+    the target, because the extra hops step off an address and back onto it.
+    They are longer restatements of the same chain, and they push the real
+    one down the list."""
+    seen = set()
+    for address in steps or ():
+        if int(address) in seen:
+            return True
+        seen.add(int(address))
+    return False
 # Seconds the locality (tier 2) pass may run before the search gives up on it
 # and falls through to the reverse index, whose cost is bandwidth-bound and
 # therefore predictable. Two minutes is far longer than tier 2 needs when it is
@@ -730,6 +950,12 @@ _PTR_LOCALITY_TIME_BUDGET = 120.0
 # Bounded streaming pointer scanner.  These limits are separate from the
 # reverse-index resolver above and must remain defined for pointer_chain_scan.
 _PTR_STRUCT_MAX = 0x4000             # ±16 KiB; interval matching keeps this cheap
+
+
+def _ptr_struct_max() -> int:
+    """User-overridable ±window for a single pointer hop (default above)."""
+    return int(setting("ptr_offset_max"))
+
 _PTR_STRUCT_STEP = 4
 _PTR_CHUNK = 0x2000000              # 32 MiB network reads
 _PTR_BEAM_MAX = 12_000              # heap targets carried to the next depth
@@ -749,6 +975,133 @@ _POINTER_PROVISIONAL_FILE = Path(__file__).with_name(
 _PREFERENCES_FILE = Path(__file__).with_name(".rdx-preferences.json")
 
 
+# ── scan state aggregate ──────────────────────────────────────────────────────
+# scan_results, scan_values, scan_pid, scan_dropped, scan_truncated and
+# scan_unknown are one fact, not six. They were kept consistent by convention,
+# re-established by hand at each of thirteen mutation sites -- which is why
+# dropping a single result needed a manual np.delete on the parallel value
+# array *and* a _close_turbo_session() call, and why replacing the candidate
+# list took six assignments in a fixed order.
+#
+# ScanState owns those invariants at the boundary instead:
+#
+#   * values stay the same length as addresses, or are dropped entirely;
+#   * any replacement of the candidate set closes a resident TurboScan
+#     session, because the server holds its own copy of the survivor list and
+#     would otherwise hand back the pre-replacement one on the next scan;
+#   * a snapshot is a plain tuple, so undo is a swap rather than a
+#     field-by-field restore.
+#
+# The dict remains the single source of truth so the ~200 read sites are
+# untouched; this is a controller over it, not a parallel copy.
+class ScanState:
+    """Invariant-preserving controller for the correlated scan fields."""
+
+    __slots__ = ("_state",)
+
+    FIELDS = ("scan_results", "scan_values", "scan_pid", "scan_dropped",
+              "scan_truncated", "scan_unknown")
+
+    # `pid=None` on replace() means "these results came from the process we
+    # are attached to now". Clearing has to say something different -- "these
+    # results belong to no process" -- because do_show_results distinguishes
+    # a null scan_pid from a mismatched one when it blocks stale results.
+    # One sentinel keeps both meanings expressible through one parameter.
+    UNSET = object()
+
+    def __init__(self, backing: dict):
+        self._state = backing
+
+    # ── reads ──
+    @property
+    def addrs(self):
+        return self._state["scan_results"]
+
+    @property
+    def values(self):
+        return self._state.get("scan_values")
+
+    def __len__(self) -> int:
+        return len(self._state["scan_results"])
+
+    # ── invariants ──
+    def _check(self) -> None:
+        values = self._state.get("scan_values")
+        if values is not None and len(values) != len(self._state["scan_results"]):
+            # Never seen in production, but a mismatch here silently corrupts
+            # the next relational scan by pairing an address with another
+            # address's previous value. Fail loudly instead of scanning wrong.
+            raise AssertionError(
+                f"scan value/address length mismatch: "
+                f"{len(values)} values, {len(self._state['scan_results'])} addresses")
+
+    # ── writes ──
+    def replace(self, addrs, values=None, *, pid=None, unknown=False,
+                truncated=False, keep_dropped=False,
+                close_turbo=True) -> None:
+        """Install a new candidate set, consistently."""
+        if close_turbo:
+            _close_turbo_session()
+        self._state["scan_results"] = addrs
+        self._state["scan_values"] = values
+        if pid is None:
+            self._state["scan_pid"] = self._state["pid"]
+        elif pid is ScanState.UNSET:
+            self._state["scan_pid"] = None
+        else:
+            self._state["scan_pid"] = pid
+        self._state["scan_unknown"] = bool(unknown)
+        self._state["scan_truncated"] = bool(truncated)
+        if not keep_dropped:
+            self._state["scan_dropped"] = set()
+        self._check()
+
+    def narrow(self, addrs, values=None, *, truncated=False) -> None:
+        """Record the result of a next-scan over the existing candidates."""
+        self._state["scan_results"] = addrs
+        self._state["scan_values"] = values
+        self._state["scan_truncated"] = bool(truncated)
+        self._check()
+
+    def drop_index(self, index: int):
+        """Remove one candidate by position, keeping values aligned."""
+        addrs = self._state["scan_results"]
+        if not 0 <= index < len(addrs):
+            return None
+        dropped = addrs[index]
+        # A resident session is matched by connection/PID/width/value-type
+        # alone, never by candidate count, so it would happily narrow the
+        # server's pre-drop list and hand this address straight back.
+        _close_turbo_session()
+        self._state["scan_results"] = _make_addr_array(
+            a for i, a in enumerate(addrs) if i != index)
+        values = self._state.get("scan_values")
+        if values is not None:
+            self._state["scan_values"] = np.delete(values, index)
+        self._state["scan_dropped"].add(dropped)
+        self._check()
+        return dropped
+
+    def drop_address(self, address: int):
+        """Remove one candidate by address."""
+        addrs = self._state["scan_results"]
+        matches = [i for i, a in enumerate(addrs) if int(a) == int(address)]
+        return self.drop_index(matches[0]) if matches else None
+
+    def clear(self) -> None:
+        self.replace(_make_addr_array(), None, pid=ScanState.UNSET,
+                     close_turbo=False)
+
+    # ── undo ──
+    def snapshot(self) -> tuple:
+        return tuple(self._state.get(field) for field in self.FIELDS)
+
+    def restore(self, snap: tuple) -> None:
+        for field, value in zip(self.FIELDS, snap):
+            self._state[field] = value
+        self._check()
+
+
 def _load_preferences(path: Optional[Path] = None) -> dict:
     """Load small, non-sensitive UI preferences; corrupt files fail closed."""
     src = Path(path or _PREFERENCES_FILE)
@@ -761,6 +1114,11 @@ def _load_preferences(path: Optional[Path] = None) -> dict:
             value = data.get(key)
             if isinstance(value, str) and len(value) <= 1024:
                 out[key] = value
+        # Tunables are bounded on the way in: a hand-edited file must not be
+        # able to set an unbounded pointer depth or a zero-size scan window.
+        for key in _SETTING_SPECS:
+            if key in data:
+                out[key] = _coerce_setting(key, data[key])
         return out
     except (OSError, ValueError, TypeError):
         return {}
@@ -775,6 +1133,8 @@ def _save_preferences(updates: Optional[dict] = None,
     for key, value in (updates or {}).items():
         if key in {"last_ip", "last_process", "export_dir"}:
             payload[key] = str(value or "")[:1024]
+        elif key in _SETTING_SPECS:
+            payload[key] = _coerce_setting(key, value)
     dst.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=dst.name + ".", dir=str(dst.parent))
     try:
@@ -829,7 +1189,102 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             pass
 
 
+# ── tunable settings ──────────────────────────────────────────────────────────
+# The constants above are defaults, not policy. Every one of them was reasoned
+# about and several carry their own history (see _PTR_FAST_DIRECT_RANGE), so
+# they stay exactly as they are — what changes here is that the user can see
+# and override them without editing the source.
+#
+# PINCE exposes the same five pointer knobs (max depth, max positive/negative
+# offset, module-bases-only, scan scope) in its Pointer Scanner window, and
+# PS4CheaterNeo exposes its section-filter rules and a minimum section size in
+# Options. RDX had all of them as literals. Note that RDX's depth default of 5
+# and its 0x800 direct window match PINCE's independently chosen defaults
+# exactly, which is why this is a visibility change and not a tuning one.
+#
+# Every setting is bounded on load: a hand-edited preferences file must not be
+# able to talk RDX into an unbounded pointer walk or a zero-width scan window.
+_SETTING_SPECS = {
+    "ptr_max_depth": {
+        "label": "Pointer max depth",
+        "kind": "int", "default": _PTR_DEPTH_DEFAULT,
+        "min": 1, "max": MAX_CHAIN_DEPTH,
+        "help": "Chain hops to explore. Deeper finds more, costs more.",
+    },
+    "ptr_direct_range": {
+        "label": "Pointer direct window",
+        "kind": "hex", "default": _PTR_FAST_DIRECT_RANGE,
+        "min": 0x40, "max": 0x10000,
+        "help": "First-pass holder search radius. 0x800 matches PINCE; "
+                "widening it buys coincidences, not chains.",
+    },
+    "ptr_offset_max": {
+        "label": "Pointer struct window",
+        "kind": "hex", "default": _PTR_STRUCT_MAX,
+        "min": 0x100, "max": 0x100000,
+        "help": "Max |offset| accepted at each hop of the streaming scan.",
+    },
+    "ptr_module_bases_only": {
+        "label": "Module bases only",
+        "kind": "bool", "default": False,
+        "help": "Keep only chains rooted in a named module. Fewer results, "
+                "all of them expressible as module+offset.",
+    },
+    "region_min_size": {
+        "label": "Min region size",
+        "kind": "hex", "default": 0,
+        "min": 0, "max": 0x10000000,
+        "help": "Skip mappings smaller than this when scanning. 0 = off; "
+                "PS4CheaterNeo defaults to 0x32000 (200K).",
+    },
+    "region_exclude": {
+        "label": "Region exclude tokens",
+        "kind": "csv", "default": (".sprx,.prx,.so,/lib/,libkernel,libsce,"
+                                   "ps5debug,ps4debug,memdbg,etahen,goldhen"),
+        "help": "Comma-separated substrings excluded from Recommended scope.",
+    },
+}
+
+
+def _coerce_setting(key: str, value):
+    """Clamp/normalise one setting; returns the default when unusable."""
+    spec = _SETTING_SPECS[key]
+    kind = spec["kind"]
+    try:
+        if kind == "bool":
+            if isinstance(value, str):
+                return value.strip().lower() in ("1", "true", "yes", "on")
+            return bool(value)
+        if kind == "csv":
+            if isinstance(value, (list, tuple)):
+                value = ",".join(str(v) for v in value)
+            parts = [t.strip().lower() for t in str(value).split(",")]
+            parts = [t for t in parts if t][:64]
+            return ",".join(parts)
+        number = int(str(value), 0) if isinstance(value, str) else int(value)
+    except (TypeError, ValueError):
+        return spec["default"]
+    return max(spec["min"], min(spec["max"], number))
+
+
+_settings = {key: spec["default"] for key, spec in _SETTING_SPECS.items()}
+
+
+def setting(key: str):
+    """Read a tunable. Always returns a bounded, usable value."""
+    return _settings.get(key, _SETTING_SPECS[key]["default"])
+
+
+def _region_exclude_tokens() -> tuple:
+    """Exclusion substrings for the Recommended scan scope."""
+    raw = str(setting("region_exclude"))
+    return tuple(t for t in (p.strip() for p in raw.split(",")) if t)
+
+
 _preferences = _load_preferences()
+for _key in _SETTING_SPECS:
+    if _key in _preferences:
+        _settings[_key] = _preferences[_key]
 
 # Issues #7/#8/#9/#10: track the active freeze worker globally so it can be
 # stopped when the user changes process or reconnects.  Without this the old
@@ -841,6 +1296,54 @@ _freeze_thread: Optional[threading.Thread] = None
 _freeze_lock:   threading.RLock  = threading.RLock()
 _freeze_targets: dict = {}       # runtime id -> saved cheat object
 _freeze_status: dict = {}        # runtime id -> last success/error text
+
+
+_BOOKMARK_MAX = 256
+
+
+def _bookmark_key(address: int, value_type: str) -> tuple:
+    return (int(address), str(value_type))
+
+
+def _add_bookmark(address: int, value_type: str, note: str = "") -> str:
+    """Record an address for later. Returns a status line for the caller."""
+    bookmarks = state.setdefault("bookmarks", [])
+    key = _bookmark_key(address, value_type)
+    for existing in bookmarks:
+        if _bookmark_key(existing["address"], existing["value_type"]) == key:
+            if note:
+                existing["note"] = str(note)[:64]
+            return f"Bookmark already exists at {hex(int(address))}"
+    if len(bookmarks) >= _BOOKMARK_MAX:
+        return f"Bookmark limit ({_BOOKMARK_MAX}) reached"
+    bookmarks.append({
+        "address": int(address),
+        "value_type": str(value_type),
+        "note": str(note or "")[:64],
+        "pid": state.get("pid"),
+        "process": state.get("proc_name", ""),
+        "session": int(state.get("session", 0)),
+    })
+    return f"Bookmarked {hex(int(address))}"
+
+
+def _remove_bookmark(index: int) -> Optional[dict]:
+    bookmarks = state.get("bookmarks", [])
+    if 0 <= index < len(bookmarks):
+        return bookmarks.pop(index)
+    return None
+
+
+def _bookmark_is_current(bookmark: dict) -> bool:
+    """False once the console session or process it was taken in is gone.
+
+    A bookmark is a raw address with no pointer chain behind it, so after a
+    reload it names whatever now occupies that memory. Marking it stale is
+    the honest presentation; silently reading it would show a plausible
+    number belonging to something else entirely.
+    """
+    return (int(bookmark.get("session", -1)) == int(state.get("session", 0))
+            and bookmark.get("pid") == state.get("pid"))
 
 
 def _cheat_runtime_id(cheat: dict) -> str:
@@ -1066,6 +1569,22 @@ state = {
     "scan_scope":         "recommended",
     "scan_engine": "auto",          # auto / turbo / console / host
     "cheats":       [],
+    # Bookmarks are "addresses I am still investigating". Before this, the
+    # only way to keep an address across screens was to create a cheat --
+    # which sets cheats_dirty, joins export selection and triggers the
+    # unsaved-cheats quit guard. There was no way to say "keep this, I am
+    # not finished". PINCE keeps an unlimited bookmark list for the same
+    # reason. Session-scoped on purpose: a bookmark is a scratch note, and
+    # persisting it would resurrect stale addresses after a reload.
+    "bookmarks":    [],
+    # {base_address: [field, ...]} — session-scoped like bookmarks, and for
+    # the same reason: a structure describes one process's layout.
+    "structures":   {},
+    # {class_name: [field, ...]} from an Il2CppDumper dump.cs. Unlike
+    # structures and bookmarks this survives a process change: it describes
+    # the title's layout, not this session's memory, so clearing it on every
+    # reattach would mean reloading the file constantly.
+    "symbols":      {},
     "cheats_dirty": False,   # True after add/delete since the last export
     "last_deleted_cheat": None,   # (cheat_dict, original_index) — single-slot undo
     "game_id":      "",
@@ -1077,6 +1596,9 @@ state = {
     # Undo history — delta format; see _push_undo() above.
     "scan_history": deque(maxlen=5),
 }
+
+# Controller over the correlated scan fields above; see ScanState.
+scan = ScanState(state)
 
 # ── ps5debug low-level helpers ────────────────────────────────────────────────
 
@@ -2337,6 +2859,166 @@ _memdbg_fallback_notes = set()
 _memdbg_fallback_lock = threading.Lock()
 
 
+# ── target abstraction ────────────────────────────────────────────────────────
+# RDX speaks to two payloads: ps5debug-NG on TCP 744 and MemDBG on 9020. That
+# choice was made ad hoc at each call site -- _memdbg_has(CAP) guarding a
+# native attempt, then a fall-through to port 744 -- which works, but leaves no
+# single seam a backend implements, and therefore nothing a test can stand in
+# for. That matters here specifically: HARDWARE_TEST_CHECKLIST lists "the
+# MemDBG backend, in its entirety" as never having run against a real daemon,
+# and the only way to exercise it today is to fake sockets underneath it.
+#
+# Squalr isolates this as squalr-engine-targets with swappable native
+# implementations; MemoryEngine360 keeps Playstation and Xbox platform folders
+# under one core with the connection chosen at File > Connect.
+#
+# The wire functions below stay exactly as they are and remain the code path
+# the app uses -- this is a seam over them, not a rewrite of them. What it buys
+# is a single place that answers "which backend, and what can it do", and a
+# MockTarget that lets the MemDBG capability matrix be tested without a daemon.
+def _target_checked_write(ip: str, pid: int, addr: int, data: bytes) -> bool:
+    """Map-validated write, used by every Target implementation.
+
+    The wire helper `ps5_write` performs no validation of its own -- every
+    caller in the app validates first, which is how the README's "validates
+    addresses against the process map before every write" holds. `Target` is
+    a seam that *looks* like the backend write API, so a future migration of
+    call sites onto it would have silently dropped that property. Validating
+    here makes the seam safe by default instead of safe by convention.
+    """
+    error = _validate_write_addr(int(addr))
+    if error:
+        add_log(f"Target write refused at {hex(int(addr))}: {error}", "error")
+        return False
+    error = _validate_addr_in_maps(ip, int(pid), int(addr), len(data))
+    if error:
+        add_log(f"Target write refused at {hex(int(addr))}: {error}", "error")
+        return False
+    return ps5_write(ip, int(pid), int(addr), data)
+
+
+class Target:
+    """One console transport: capability reporting plus process/memory I/O."""
+
+    name = "target"
+    port = 0
+
+    # Capabilities every target is expected to answer about. These are the
+    # operations RDX degrades gracefully without, so a target that lacks one
+    # must say so rather than raise at the point of use.
+    CAP_PROCESSES = "processes"
+    CAP_MAPS = "maps"
+    CAP_READ = "read"
+    CAP_WRITE = "write"
+    CAP_WRITE_MULTI = "write_multi"
+    CAP_TURBO = "turbo"
+    CAP_REGION_CLASSIFY = "region_classify"
+
+    ALL_CAPS = (CAP_PROCESSES, CAP_MAPS, CAP_READ, CAP_WRITE,
+                CAP_WRITE_MULTI, CAP_TURBO, CAP_REGION_CLASSIFY)
+
+    def __init__(self, ip: str):
+        self.ip = str(ip)
+
+    def capabilities(self) -> frozenset:
+        raise NotImplementedError
+
+    def has(self, capability: str) -> bool:
+        return capability in self.capabilities()
+
+    def processes(self) -> list:
+        raise NotImplementedError
+
+    def maps(self, pid: int) -> list:
+        raise NotImplementedError
+
+    def read(self, pid: int, addr: int, length: int) -> bytes:
+        raise NotImplementedError
+
+    def write(self, pid: int, addr: int, data: bytes) -> bool:
+        raise NotImplementedError
+
+    def describe(self) -> str:
+        missing = [c for c in self.ALL_CAPS if not self.has(c)]
+        if not missing:
+            return f"{self.name}: all capabilities"
+        return f"{self.name}: missing {', '.join(missing)}"
+
+
+class Ps5DebugTarget(Target):
+    """ps5debug-NG on TCP 744. The reference transport."""
+
+    name = "ps5debug"
+    port = PS5_PORT
+
+    def capabilities(self) -> frozenset:
+        # ps5debug-NG implements the whole surface; TurboScan and the region
+        # classifier are probed per-console elsewhere and degrade on their own.
+        return frozenset(self.ALL_CAPS)
+
+    def processes(self) -> list:
+        return ps5_proc_list(self.ip)
+
+    def maps(self, pid: int) -> list:
+        return ps5_maps(self.ip, pid)
+
+    def read(self, pid: int, addr: int, length: int) -> bytes:
+        return ps5_read(self.ip, pid, addr, length)
+
+    def write(self, pid: int, addr: int, data: bytes) -> bool:
+        return _target_checked_write(self.ip, pid, addr, data)
+
+
+class MemDbgTarget(Target):
+    """MemDBG on TCP 9020, gated by the capability bitmap it advertises.
+
+    TurboScan and the region classifier are ps5debug commands with no MemDBG
+    equivalent, so this target reports them missing and RDX falls back to the
+    slow host scan path -- which is why the connect screen warns when port 744
+    is unreachable even though MemDBG alone is enough to read and write.
+    """
+
+    name = "memdbg"
+    port = MEMDBG_PORT
+
+    _CAP_BITS = {
+        Target.CAP_PROCESSES: MEMDBG_CAP_PROCESS_LIST,
+        Target.CAP_MAPS: MEMDBG_CAP_PROCESS_MAPS,
+        Target.CAP_READ: MEMDBG_CAP_MEMORY_READ,
+        Target.CAP_WRITE: MEMDBG_CAP_MEMORY_WRITE,
+        Target.CAP_WRITE_MULTI: MEMDBG_CAP_BATCH_WRITE,
+    }
+
+    def __init__(self, ip: str, hello: Optional[dict] = None):
+        super().__init__(ip)
+        self.hello = hello if hello is not None else (state.get("memdbg") or {})
+
+    def capabilities(self) -> frozenset:
+        bits = int(self.hello.get("capabilities", 0) or 0)
+        return frozenset(cap for cap, bit in self._CAP_BITS.items()
+                         if bits & int(bit))
+
+    def processes(self) -> list:
+        return ps5_proc_list(self.ip)
+
+    def maps(self, pid: int) -> list:
+        return ps5_maps(self.ip, pid)
+
+    def read(self, pid: int, addr: int, length: int) -> bytes:
+        return ps5_read(self.ip, pid, addr, length)
+
+    def write(self, pid: int, addr: int, data: bytes) -> bool:
+        return _target_checked_write(self.ip, pid, addr, data)
+
+
+def current_target(ip: Optional[str] = None) -> Target:
+    """The target for the active backend."""
+    endpoint = state.get("ip", "") if ip is None else ip
+    if state.get("backend") == "memdbg-experimental":
+        return MemDbgTarget(endpoint)
+    return Ps5DebugTarget(endpoint)
+
+
 def _memdbg_has(capability: int) -> bool:
     return (state.get("backend") == "memdbg-experimental" and
             bool(int((state.get("memdbg") or {}).get("capabilities", 0)) &
@@ -2903,16 +3585,170 @@ def _debug_get_dbregs(s: socket.socket, lwpid: int) -> bytes:
         raise RuntimeError("debug DBREG read rejected")
     return recv_exact(s, 128)
 
-def _debug_free_watchpoint(s: socket.socket, lwpid: int) -> Optional[int]:
+# ── hardware debug-register inspection ────────────────────────────────────────
+# The watchpoint arms cleanly and never fires (HARDWARE_TEST_CHECKLIST). Client
+# packet shape and thread fan-out were both ruled out there, leaving three
+# payload-side hypotheses -- and the session that made the observation could not
+# tell them apart, because RDX read the debug registers only *before* arming, on
+# one thread, to pick a free slot. Nothing read them back afterwards, so "no
+# event in 60 s" could equally mean the DRs were never set or that they were set
+# and the store did not trap. Those have different causes and different fixes.
+#
+# These helpers close that gap with the command RDX already implements
+# (CMD_DEBUG_GETDBREGS, which takes an lwpid). They are read-only: nothing here
+# writes a debug register. Deciding whether the *write* half
+# (CMD_DEBUG_SETDBREGS, 0xBDBB000D -- documented, not implemented) is needed is
+# exactly what the read-back is for, and it must not be implemented on
+# speculation. See the checklist's calibration note.
+_DR_PROBE_MAX_THREADS = 128       # bounded round trips; the observed target had 40
+# The debug command socket carries a 10 s timeout that persists per recv, so a
+# console that stops answering mid-sweep could stall 40 threads x 10 s ~= 7
+# minutes with the diagnostic holding the trace open. A wall-clock budget keeps
+# a diagnostic from outlasting the thing it is diagnosing.
+_DR_PROBE_TIME_BUDGET = 8.0
+
+
+def _debug_decode_dbregs(blob: bytes) -> dict:
+    """Decode a 128-byte dbreg blob into DR7 plus the four slot addresses.
+
+    Layout matches _debug_free_watchpoint's existing assumption: 16 x uint64
+    with DR0-DR3 at indices 0-3 and DR7 at index 7.
+    """
+    regs = struct.unpack("<16Q", blob)
+    dr7 = int(regs[7])
+    slots = []
+    for i in range(4):
+        # DR7 bits 2i (local) and 2i+1 (global) enable slot i.
+        enabled = bool(dr7 & (1 << (2 * i))) or bool(dr7 & (1 << (2 * i + 1)))
+        slots.append({"index": i, "enabled": enabled, "address": int(regs[i])})
+    return {"dr7": dr7, "slots": slots}
+
+
+def _debug_thread_dr_state(s: socket.socket, lwpid: int) -> Optional[dict]:
+    """DR state for one thread, or None when it cannot be read."""
     try:
-        db = _debug_get_dbregs(s, lwpid)
-        regs = struct.unpack("<16Q", db)
-        dr7 = int(regs[7])
-        for i in range(4):
-            if not (dr7 & (1 << (2 * i))) and not (dr7 & (1 << (2 * i + 1))):
-                return i
+        state_ = _debug_decode_dbregs(_debug_get_dbregs(s, lwpid))
     except Exception:
         return None
+    state_["lwpid"] = int(lwpid)
+    return state_
+
+
+def _debug_free_watchpoint_all(s: socket.socket, threads: list) -> Optional[int]:
+    """Pick a DR slot that is free on *every* readable thread.
+
+    The previous version read DR7 from threads[0] alone. If the payload applies
+    debug registers per-thread -- which is one of the open hypotheses -- a slot
+    free on thread 0 can be occupied on thread 7, so the index chosen could be
+    wrong for the thread that matters. Taking the union costs one round trip per
+    thread and cannot pick a busy slot.
+    """
+    occupied = set()
+    seen_any = False
+    deadline = time.monotonic() + _DR_PROBE_TIME_BUDGET
+    for lwpid in list(threads)[:_DR_PROBE_MAX_THREADS]:
+        if time.monotonic() >= deadline:
+            # Partial knowledge is still safe here: every slot seen busy on
+            # any thread stays excluded, so a short sweep can only make the
+            # choice more conservative, never pick an occupied slot.
+            break
+        state_ = _debug_thread_dr_state(s, lwpid)
+        if state_ is None:
+            continue
+        seen_any = True
+        for slot in state_["slots"]:
+            if slot["enabled"]:
+                occupied.add(slot["index"])
+    if not seen_any:
+        return None
+    for i in range(4):
+        if i not in occupied:
+            return i
+    return None
+
+
+def _debug_verify_watchpoint(s: socket.socket, threads: list, address: int,
+                             wp_index: int, cancel_event=None,
+                             time_budget: float = _DR_PROBE_TIME_BUDGET) -> dict:
+    """Read the debug registers back on every thread after arming.
+
+    Returns coverage, never raises: this is a diagnostic and must not be able
+    to fail a trace that would otherwise work -- which includes not being able
+    to hang it, hence the budget.
+    """
+    armed, absent, unreadable = [], [], []
+    wanted = list(threads)[:_DR_PROBE_MAX_THREADS]
+    deadline = time.monotonic() + max(float(time_budget), 0.1)
+    truncated = False
+    for index, lwpid in enumerate(wanted):
+        if (cancel_event is not None and cancel_event.is_set()) or \
+                time.monotonic() >= deadline:
+            truncated = True
+            break
+        state_ = _debug_thread_dr_state(s, lwpid)
+        if state_ is None:
+            unreadable.append(int(lwpid))
+            continue
+        slot = next((x for x in state_["slots"]
+                     if x["index"] == int(wp_index)), None)
+        # Match on the address too: a slot enabled for some *other* address is
+        # not this watchpoint, and counting it would manufacture coverage.
+        if slot and slot["enabled"] and int(slot["address"]) == int(address):
+            armed.append(int(lwpid))
+        else:
+            absent.append(int(lwpid))
+    return {"armed": armed, "absent": absent, "unreadable": unreadable,
+            "checked": len(armed) + len(absent),
+            "total": len(list(threads)),
+            "truncated": truncated,
+            "unchecked": max(0, len(wanted) - len(armed) - len(absent)
+                             - len(unreadable))}
+
+
+def _debug_watchpoint_verdict(coverage: dict) -> tuple:
+    """(verdict_key, human_sentence) for a _debug_verify_watchpoint result.
+
+    The three outcomes discriminate the checklist's remaining hypotheses.
+    """
+    armed, checked = len(coverage.get("armed", [])), coverage.get("checked", 0)
+    if checked == 0:
+        return ("unknown",
+                "debug registers could not be read back on any thread")
+    # A sweep cut short by the budget saw a sample, not the whole target.
+    # Saying "ruled out" or "the payload applies DRs per-thread" from a
+    # sample would be the same overreach the checklist's calibration note
+    # already records once.
+    partial_sample = bool(coverage.get("truncated"))
+    caveat = (f" (sample only: {checked} of {coverage.get('total', checked)} "
+              f"thread(s) read before the time budget expired)"
+              if partial_sample else "")
+    if armed == 0:
+        return ("none",
+                "the watchpoint was acknowledged but is set on no thread "
+                "that was read — payload-side; worth reporting upstream"
+                + caveat)
+    if armed == checked:
+        return ("all",
+                f"the watchpoint is set on all {armed} thread(s) read"
+                + (caveat if partial_sample else
+                   " — per-thread application is ruled out; a store that does "
+                   "not trap points at DR honouring or another mapping"))
+    return ("partial",
+            f"the watchpoint is set on {armed} of {checked} thread(s) read — "
+            "the payload applies debug registers per-thread, so arming needs "
+            "CMD_DEBUG_SETDBREGS per thread" + caveat)
+
+
+def _debug_free_watchpoint(s: socket.socket, lwpid: int) -> Optional[int]:
+    """Single-thread free-slot probe. Retained for callers with one thread;
+    _debug_free_watchpoint_all is what the trace path uses."""
+    try:
+        state_ = _debug_decode_dbregs(_debug_get_dbregs(s, lwpid))
+    except Exception:
+        return None
+    for slot in state_["slots"]:
+        if not slot["enabled"]:
+            return slot["index"]
     return None
 
 def _debug_set_watchpoint(s: socket.socket, index: int, address: int,
@@ -3122,8 +3958,15 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
         threads = _debug_thread_list(cmd)
         if not threads:
             raise RuntimeError("debugger attached but no target threads were reported")
+        # Filled by the post-arm read-back below; merged into the result so a
+        # caller can report *why* a trace found nothing, not just that it did.
+        wp_diagnostic: dict = {}
         lwpid = threads[0]
-        wp_index = _debug_free_watchpoint(cmd, lwpid)
+        # Union across every thread, not threads[0] alone: if the payload
+        # applies debug registers per-thread, a slot free on thread 0 can be
+        # occupied on another, and the index picked would be wrong for the
+        # thread that matters.
+        wp_index = _debug_free_watchpoint_all(cmd, threads)
         if wp_index is None:
             raise RuntimeError("no free hardware watchpoint slot")
         _update_debug_session(wp_index=wp_index)
@@ -3140,9 +3983,67 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
             raise RuntimeError(f"unsupported watchpoint width: {width}")
         # Write-only (DR7 RW=01) avoids stopping on harmless UI/inventory reads.
         _debug_set_watchpoint(cmd, wp_index, target_addr, wp_length, 1)
+        # One thread only, while stopped. patch97 swept every thread here,
+        # which put up to 128 sequential round trips between the stop and the
+        # resume -- in the one path this project has already watched
+        # black-screen a live game. The full sweep now runs after the resume
+        # (below); this single read costs one round trip and exists to catch
+        # the case where the two disagree, which would itself say something
+        # about whether the payload stages debug registers in the pcb.
+        try:
+            stopped_check = _debug_verify_watchpoint(
+                cmd, threads[:1], target_addr, wp_index)
+        except Exception as exc:
+            stopped_check = None
+            add_log(f"Watchpoint DR pre-resume check unavailable: {exc}", "warn")
         _debug_continue(cmd, 0)
         target_stopped = False
         _update_debug_session(stopped=False)
+        # Full sweep, with the game running again. This is also the state that
+        # actually matters: the debug registers as they stand while the store
+        # under investigation executes.
+        try:
+            wp_coverage = _debug_verify_watchpoint(
+                cmd, threads, target_addr, wp_index)
+            if wp_coverage.get("truncated"):
+                add_log("Watchpoint DR sweep stopped at its time budget; "
+                        "the verdict below is from a sample", "warn")
+            verdict_key, verdict_text = _debug_watchpoint_verdict(wp_coverage)
+            add_log(
+                f"Watchpoint DR verify: slot {wp_index} @ {hex(target_addr)} — "
+                f"set on {len(wp_coverage['armed'])}/{wp_coverage['checked']} "
+                f"readable thread(s) of {wp_coverage['total']}"
+                + (f", {len(wp_coverage['unreadable'])} unreadable"
+                   if wp_coverage["unreadable"] else ""),
+                "warn" if verdict_key != "all" else "info")
+            add_log(f"Watchpoint DR verdict: {verdict_text}",
+                    "error" if verdict_key in ("none", "unknown") else
+                    "warn" if verdict_key == "partial" else "info")
+            _update_debug_session(wp_coverage=wp_coverage,
+                                  wp_verdict=verdict_key)
+            wp_diagnostic = {"wp_coverage": wp_coverage,
+                             "wp_verdict": verdict_key,
+                             "wp_verdict_text": verdict_text,
+                             "wp_stopped_check": stopped_check}
+            # A disagreement between the two reads is itself evidence: it
+            # would mean the arm is visible to a stopped thread and not to a
+            # running one, i.e. the payload stages debug registers rather
+            # than applying them. Worth saying out loud, because it changes
+            # what the verdict above means.
+            if stopped_check is not None and threads:
+                first = int(threads[0])
+                was_armed = first in stopped_check.get("armed", [])
+                now_armed = first in wp_coverage.get("armed", [])
+                if was_armed != now_armed:
+                    add_log(
+                        f"Watchpoint DR mismatch on lwpid {first}: "
+                        f"{'set' if was_armed else 'clear'} while stopped, "
+                        f"{'set' if now_armed else 'clear'} while running — "
+                        f"the payload appears to stage debug registers",
+                        "warn")
+                    wp_diagnostic["wp_staged"] = True
+        except Exception as exc:
+            add_log(f"Watchpoint DR verify unavailable: {exc}", "warn")
 
         # Collect a few genuine target accesses.  The first hit is not always
         # the useful accessor (for example a housekeeping read), so keep trying
@@ -3197,7 +4098,13 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
             insn = decoded
             break
         if event is None or insn is None:
-            raise TimeoutError(last_reason)
+            # A timeout is precisely the case the read-back exists for: the old
+            # message said only that nothing fired, which is the observation
+            # that could not be acted on. Attach the verdict to it.
+            verdict_text = wp_diagnostic.get("wp_verdict_text")
+            raise TimeoutError(
+                f"{last_reason} — {verdict_text}" if verdict_text
+                else last_reason)
 
         regs = event["regs"]
         rip = int(regs["rip"])
@@ -3245,6 +4152,7 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
             "access_mode": access_mode,
             "instruction": insn,
             "lwpid": int(event["lwpid"]),
+            **wp_diagnostic,
         }
     finally:
         # Clear the watchpoint before detaching.
@@ -3320,7 +4228,7 @@ def _exact_pointer_holders(ip: str, pid: int, value: int,
 
 
 def _walk_from_traced_base(ip: str, pid: int, base_value: int, maps: list,
-                           max_depth: int = 5, cancel_event=None,
+                           max_depth: Optional[int] = None, cancel_event=None,
                            progress_cb=None, fanout: int = 4) -> list:
     """Walk outward from a traced object pointer to module-rooted holders.
 
@@ -3342,6 +4250,8 @@ def _walk_from_traced_base(ip: str, pid: int, base_value: int, maps: list,
     results = []
     frontier = [(int(base_value), [])]   # (address to find a holder for, trail)
     seen = {int(base_value)}
+    if max_depth is None:
+        max_depth = int(setting("ptr_max_depth"))
     depth_cap = max(1, min(int(max_depth), MAX_CHAIN_DEPTH))
     for depth in range(1, depth_cap + 1):
         if cancel_event is not None and cancel_event.is_set():
@@ -3384,7 +4294,7 @@ def _walk_from_traced_base(ip: str, pid: int, base_value: int, maps: list,
 def _pointer_candidates_from_trace(ip: str, pid: int, trace: dict,
                                    target_addr: int, cancel_event=None,
                                    progress_cb=None,
-                                   max_depth: int = 5) -> dict:
+                                   max_depth: Optional[int] = None) -> dict:
     """Turn one captured write-trace into verified module-rooted chains.
 
     This is the half of the change-triggered workflow that runs *after* the
@@ -3409,7 +4319,8 @@ def _pointer_candidates_from_trace(ip: str, pid: int, trace: dict,
     # object pointer, finding its holders is one bounded scan per level.
     candidates = _walk_from_traced_base(
         ip, pid, base_target, maps_for_walk,
-        max_depth=min(max_depth, MAX_CHAIN_DEPTH),
+        max_depth=min(int(max_depth if max_depth is not None
+                          else setting("ptr_max_depth")), MAX_CHAIN_DEPTH),
         cancel_event=cancel_event,
         progress_cb=progress_cb,
     )
@@ -4006,8 +4917,91 @@ def _get_maps_cached(ip: str, pid: int,
     return maps
 
 
+def _coalesce_scan_regions(regions: list) -> list:
+    """Merge adjacent/overlapping eligible mappings into single spans.
+
+    Two things fall out of this, and the second is a correctness fix.
+
+    Fewer, larger reads. MemoryEngine360 reports the same optimisation as a
+    Next Scan speedup -- "using a union of fragments to join smaller reads
+    into single large reads" -- and RDX is on a slower link than it is.
+
+    Array-of-bytes matches that straddle a mapping boundary. The AOB scanner
+    extends each chunk read by len(pattern)-1 so a match spanning two chunks
+    is still found, but it clamps that overlap to the region end, so a match
+    spanning two *adjacent* regions was invisible. Squalr merges adjacent
+    pages for exactly this reason and notes the consequence: "scanning for an
+    array of bytes that crosses a page boundary is trivially supported".
+
+    RDX already had the merge -- _coalesce_ranges and
+    _coalesce_pointer_regions -- but wired only into the pointer index.
+
+    Callers must apply their protection and scope filters *first*: this
+    merges whatever it is given, so feeding it unfiltered maps would splice
+    an excluded library onto the game's heap.
+    """
+    spans = []
+    for region in sorted(regions, key=lambda r: int(r.get("start", 0))):
+        start, end = int(region.get("start", 0)), int(region.get("end", 0))
+        if end <= start:
+            continue
+        if spans and start <= spans[-1]["end"]:
+            spans[-1]["end"] = max(spans[-1]["end"], end)
+            spans[-1]["merged"] += 1
+            # Intersect the protection bits rather than keeping the first
+            # region's. No scan path reads prot after coalescing today, but a
+            # span that merged a writable region with a read-only one is not
+            # writable throughout, and a future reader assuming otherwise
+            # would be wrong in the unsafe direction.
+            spans[-1]["prot"] &= int(region.get("prot", 0))
+        else:
+            spans.append({"start": start, "end": end,
+                          "name": region.get("name", ""),
+                          "prot": int(region.get("prot", 0)),
+                          "merged": 1})
+    return spans
+
+
+def _region_settings_are_default() -> bool:
+    """True while the user has not changed the region filter settings."""
+    return all(setting(key) == _SETTING_SPECS[key]["default"]
+               for key in ("region_min_size", "region_exclude"))
+
+
+def _note_recommended_filter(kept: int, total: int, where: str) -> None:
+    """Say so when the user's own region settings are what narrowed a scan.
+
+    Exposing these settings (patch88) created a failure mode that did not
+    exist while they were literals: a scan can now come back thin, or empty,
+    because of a value the user set on a different screen some time ago. The
+    existing "no eligible memory regions" message does not connect the two,
+    so the obvious next move is to suspect the console -- which during a
+    hardware session costs an attach and a reload to rule out.
+
+    Silent while the settings are at their defaults, so an ordinary scan gains
+    no noise.
+    """
+    if _region_settings_are_default():
+        return
+    dropped = int(total) - int(kept)
+    if dropped <= 0:
+        return
+    add_log(
+        f"{where}: your region settings excluded {dropped} of {total} "
+        f"mapping(s) — min size {hex(int(setting('region_min_size')))}, "
+        f"exclude '{setting('region_exclude')}'. Change them in Settings > "
+        f"Regions, or scan with the Writable/Readable scope.",
+        "error" if kept <= 0 else "warn")
+
+
 def _recommended_game_scan_region(region: dict, process: str = "") -> bool:
-    """Exclude obvious payload/library mappings from the default game scan."""
+    """Exclude obvious payload/library mappings from the default game scan.
+
+    The exclusion tokens and the minimum mapping size are user-editable
+    settings (Settings -> Regions); PS4CheaterNeo exposes the equivalent
+    preset list and its SectionFilterSize the same way. The defaults
+    reproduce the behaviour this function had when the list was a literal.
+    """
     name = str(region.get("name", "") or "").replace("\\", "/").lower()
     process_name = str(process or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
     basename = name.rsplit("/", 1)[-1]
@@ -4015,12 +5009,22 @@ def _recommended_game_scan_region(region: dict, process: str = "") -> bool:
                   (process_name and basename == process_name) or
                   "/app0/" in name or "eboot" in basename)
     library_or_payload = (
-        any(token in name for token in
-            (".sprx", ".prx", ".so", "/lib/", "libkernel", "libsce",
-             "ps5debug", "ps4debug", "memdbg", "etahen", "goldhen"))
+        any(token in name for token in _region_exclude_tokens())
         and not main_image)
     if library_or_payload:
         return False
+    # Small mappings are overwhelmingly loader/TLS/guard pages. Skipping them
+    # cuts first-scan cost on fragmented heaps, which is exactly where the
+    # result cap bites. Never applied to the main image, whose size is not a
+    # signal about whether the user's value lives in it.
+    min_size = int(setting("region_min_size"))
+    if min_size and not main_image:
+        try:
+            span = int(region.get("end", 0)) - int(region.get("start", 0))
+        except (TypeError, ValueError):
+            span = 0
+        if 0 < span < min_size:
+            return False
     prot = int(region.get("prot", 0))
     heap_named = any(token in name for token in
                      ("anon", "heap", "dlmalloc", "game"))
@@ -4136,9 +5140,14 @@ def scan_first(ip: str, pid: int, value, width: int = 4,
                       if (r['start'], r['end']) not in rw_set]
         scannable  = rw_regions + ro_only
     if str(region_scope or "") == "recommended":
+        _before = len(scannable)
         scannable = [r for r in scannable
                      if _recommended_game_scan_region(
                          r, state.get("proc_name", ""))]
+        _note_recommended_filter(len(scannable), _before, "First scan")
+    # Merge adjacent mappings into single spans before chunking: fewer and
+    # larger reads on RDX's slowest link. See _coalesce_scan_regions.
+    scannable = _coalesce_scan_regions(scannable)
     # Phase 4a: sort regions largest-first.  Benefits:
     #   • Workers pick up the biggest chunks immediately → CPU/network both
     #     saturated from the first second rather than warming up on tiny regions.
@@ -4151,7 +5160,9 @@ def scan_first(ip: str, pid: int, value, width: int = 4,
     if not scannable:
         if progress_cb:
             progress_cb(1, 1)
-        add_log("First scan: no eligible memory regions", "warn")
+        add_log("First scan: no eligible memory regions"
+                + ("" if _region_settings_are_default()
+                   else " — your region settings excluded them all"), "warn")
         return np.empty(0, dtype=_NP_ADDR_DTYPE)
 
     # Select the scanner engine from the UI setting.
@@ -4500,8 +5511,13 @@ def scan_first_pattern(ip: str, pid: int, pattern: bytes, mask: bytes,
                and (int(r.get("prot", 0)) & 0x1)
                and (not writable_only or (int(r.get("prot", 0)) & 0x2))]
     if str(region_scope or "") == "recommended":
+        _before = len(regions)
         regions = [r for r in regions if _recommended_game_scan_region(
             r, state.get("proc_name", ""))]
+        _note_recommended_filter(len(regions), _before, "AOB scan")
+    # Merge before chunking: a pattern straddling two adjacent mappings was
+    # unreachable while each region was chunked in isolation.
+    regions = _coalesce_scan_regions(regions)
     regions.sort(key=lambda r: int(r["end"]) - int(r["start"]), reverse=True)
     total_bytes = max(sum(int(r["end"]) - int(r["start"])
                           for r in regions), 1)
@@ -4662,9 +5678,24 @@ def scan_next(ip: str, pid: int, value, width: int,
     width = _value_width(type_key, width)
     packed_target = _pack_typed_value(value, type_key, width)
     kind = VALUE_TYPES[type_key]["kind"]
+    engine = state.get("scan_engine", "auto")
+    # Shape, not just availability: a nearly-converged list is cheaper to
+    # filter on the host than to negotiate a resident session for.
+    #
+    # A session that already exists forces the turbo path regardless of size,
+    # and that is not an optimisation -- it is required. The server holds the
+    # survivor list, so narrowing on the host while leaving that session
+    # resident would let the next turbo scan re-adopt the *pre-narrowing*
+    # list and silently undo this filter. (Same hazard the engine switch,
+    # the result drop and the nearby browse each call _close_turbo_session
+    # for.) Its setup cost is already paid, so there is nothing to save.
+    with _turbo_session_lock:
+        turbo_resident = _turbo_session is not None
+    turbo_worth_it = (engine == "turbo" or turbo_resident
+                      or len(prev) >= TURBO_MIN_SURVIVORS)
     if (kind in {"uint", "sint", "float"} and
             not (kind == "float" and float(tolerance) > 0) and
-            state.get("scan_engine", "auto") in ("auto", "turbo")):
+            engine in ("auto", "turbo") and turbo_worth_it):
         try:
             return ps5_scan_next_turbo(
                 ip, pid, value, width, cancel_event, progress_cb,
@@ -4792,17 +5823,23 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
                       if (r['start'], r['end']) not in rw_set]
         scannable  = rw_regions + ro_only
     if str(region_scope or "") == "recommended":
+        _before = len(scannable)
         scannable = [r for r in scannable
                      if _recommended_game_scan_region(
                          r, state.get("proc_name", ""))]
+        _note_recommended_filter(len(scannable), _before, "Unknown scan")
     # Phase 4a: sort largest-first — same rationale as scan_first.
+    # Same merge the exact and AOB paths do; see _coalesce_scan_regions.
+    scannable = _coalesce_scan_regions(scannable)
     scannable.sort(key=lambda r: r['end'] - r['start'], reverse=True)
     total_bytes = max(sum(r['end'] - r['start'] for r in scannable), 1)
 
     if not scannable:
         if progress_cb:
             progress_cb(1, 1)
-        add_log("Unknown scan: no eligible memory regions", "warn")
+        add_log("Unknown scan: no eligible memory regions"
+                + ("" if _region_settings_are_default()
+                   else " — your region settings excluded them all"), "warn")
         return (np.empty(0, dtype=_NP_ADDR_DTYPE),
                 np.empty(0, dtype=value_dtype))
 
@@ -5671,8 +6708,9 @@ def _fast_direct_pointer_hits(ip: str, pid: int, target: int, maps: list,
     if static_only:
         readable = [r for r in readable if _is_static_region(r)]
     readable.sort(key=lambda r: (-_region_priority(r), int(r["start"])))
-    low = max(_ADDR_MIN, int(target) - _PTR_FAST_DIRECT_RANGE)
-    high = min(_ADDR_MAX, int(target) + _PTR_FAST_DIRECT_RANGE)
+    direct_range = int(setting("ptr_direct_range"))
+    low = max(_ADDR_MIN, int(target) - direct_range)
+    high = min(_ADDR_MAX, int(target) + direct_range)
     hits = []
 
     # MemDBG currently implements a fast exact one-hop holder scan.  Use it as
@@ -6402,9 +7440,12 @@ def _verify_candidate_twice(ip: str, pid: int, candidate: dict, target_addr: int
 
 
 def _resolve_permanent_candidates(ip: str, pid: int, target_addr: int,
-                                   max_depth: int = 5, cancel_event=None,
+                                   max_depth: Optional[int] = None,
+                                   cancel_event=None,
                                    progress_cb=None) -> dict:
     """Resolve a dynamic address using a fast direct pass, then a priority-guided graph."""
+    if max_depth is None:
+        max_depth = int(setting("ptr_max_depth"))
     max_depth = max(1, min(int(max_depth), MAX_CHAIN_DEPTH))
     maps = _get_maps_cached(ip, pid)
     region_starts, region_rows = _build_region_lookup(maps)
@@ -6431,7 +7472,7 @@ def _resolve_permanent_candidates(ip: str, pid: int, target_addr: int,
     plausible = [c for c in fast_candidates
                  if 0 <= int(c["offsets"][0]) <= _PTR_PLAUSIBLE_FIELD_MAX]
     if plausible:
-        plausible.sort(key=lambda c: (-c["score"], int(c["offsets"][0])))
+        plausible = _rank_pointer_candidates(ip, pid, plausible)
         return {"candidates": plausible, "index_built": False,
                 "maps": maps, "method": "fast-direct"}
     if fast_candidates:
@@ -6507,7 +7548,8 @@ def _resolve_permanent_candidates(ip: str, pid: int, target_addr: int,
             candidate["confidence"] = _candidate_confidence(candidate)
             local_candidates.append(candidate)
     if local_candidates:
-        local_candidates.sort(key=lambda c: (-c["score"], c["base"]))
+        local_candidates = _rank_pointer_candidates(
+            ip, pid, local_candidates, region_starts, region_rows)
         return {"candidates": local_candidates, "index_built": False,
                 "maps": maps, "method": "locality-first"}
     index, maps, built = _get_reverse_pointer_index(
@@ -6685,19 +7727,21 @@ def _resolve_permanent_candidates(ip: str, pid: int, target_addr: int,
     for c in candidates:
         c["confidence"] = _candidate_confidence(c)
 
-    # Single canonical ranking used for both the displayed winner and selection.
-    candidates.sort(key=lambda c: (
-        not bool(c.get("verified")),
-        not bool(c.get("module_name")),
-        int(c.get("depth", 99)),
-        -_region_priority(_region_for_addr(int(c.get("base", 0)), region_starts, region_rows) or {}),
-        sum(0 if int(x) % 8 == 0 else 1 for x in c.get("offsets", [])),
-        sum(abs(int(x)) for x in c.get("offsets", [])),
-        str(c.get("module_name", "")),
-        int(c.get("module_relative_offset", 0)),
-        tuple(int(x) for x in c.get("offsets", [])),
-        int(c.get("base", 0)),
-    ))
+    # PINCE's "Module Bases Only". A chain rooted in an anonymous mapping
+    # cannot be written as module+offset, so it can never survive a reboot
+    # even if it survives two reloads. Filtering here rather than during the
+    # walk keeps the search itself unchanged and the setting reversible.
+    if setting("ptr_module_bases_only"):
+        rooted = [c for c in candidates if c.get("module_name")]
+        dropped = len(candidates) - len(rooted)
+        if dropped:
+            add_log(f"Module-bases-only: dropped {dropped} chain(s) with no "
+                    f"named module root", "warn")
+        candidates = rooted
+
+    candidates = _rank_pointer_candidates(
+        ip, pid, candidates, region_starts, region_rows)
+
     if not candidates and fast_candidates:
         # Every tier has now run and found nothing better. Hand back the
         # near-misses from the fast pass rather than nothing at all, clearly
@@ -6802,14 +7846,14 @@ def _pointer_scan_chunk(sock: _ScanSocket, start: int, size: int,
         ri = positions[right]
         rv = vals[right]
         rd = target_arr[ri].astype(np.int64) - rv.astype(np.int64)
-        in_range = np.abs(rd) <= _PTR_STRUCT_MAX
+        in_range = np.abs(rd) <= _ptr_struct_max()
         range_mask[right] |= in_range
     left = positions > 0
     if left.any():
         li = positions[left] - 1
         lv = vals[left]
         ld = target_arr[li].astype(np.int64) - lv.astype(np.int64)
-        in_range = np.abs(ld) <= _PTR_STRUCT_MAX
+        in_range = np.abs(ld) <= _ptr_struct_max()
         range_mask[left] |= in_range
     if diagnostic is not None:
         raw_count = int(np.count_nonzero(range_mask))
@@ -6831,10 +7875,10 @@ def _pointer_scan_chunk(sock: _ScanSocket, start: int, size: int,
     for idx, holder_u in zip(indices.tolist(), holders.tolist()):
         value = int(vals[idx])
         lo = int(np.searchsorted(target_arr,
-                                 np.uint64(max(_ADDR_MIN, value - _PTR_STRUCT_MAX)),
+                                 np.uint64(max(_ADDR_MIN, value - _ptr_struct_max())),
                                  side="left"))
         hi = int(np.searchsorted(target_arr,
-                                 np.uint64(min(_ADDR_MAX, value + _PTR_STRUCT_MAX)),
+                                 np.uint64(min(_ADDR_MAX, value + _ptr_struct_max())),
                                  side="right"))
         for target_u in target_arr[lo:hi].tolist():
             target = int(target_u)
@@ -6862,7 +7906,7 @@ def _pointer_scan_chunk(sock: _ScanSocket, start: int, size: int,
 
 def pointer_chain_scan(ip: str, pid: int,
                        target_addr: int,
-                       max_depth: int = _PTR_DEPTH_DEFAULT,
+                       max_depth: Optional[int] = None,
                        cancel_event=None,
                        progress_cb=None,
                        diagnostic_report: Optional[dict] = None) -> list:
@@ -6880,7 +7924,12 @@ def pointer_chain_scan(ip: str, pid: int,
         millions of chains;
       * the default depth is five, with up to eight supported;
       * all heap address families remain eligible until a static root is found.
+
+    ``max_depth`` resolves to the user's Settings value when not given, so a
+    caller that passes nothing follows the setting rather than a literal.
     """
+    if max_depth is None:
+        max_depth = int(setting("ptr_max_depth"))
     started = time.monotonic()
     candidates = []
 
@@ -6912,7 +7961,7 @@ def pointer_chain_scan(ip: str, pid: int,
             "target": int(target_addr), "maps_total": len(maps),
             "maps_scanned": len(readable_maps), "excluded_regions": excluded,
             "depths": [], "limits": {
-                "offset_max": _PTR_STRUCT_MAX, "offset_step": _PTR_STRUCT_STEP,
+                "offset_max": _ptr_struct_max(), "offset_step": _PTR_STRUCT_STEP,
                 "beam_max": _PTR_BEAM_MAX, "max_depth": max_depth,
             }})
     readable = _coalesce_pointer_regions(readable_maps)
@@ -6959,7 +8008,7 @@ def pointer_chain_scan(ip: str, pid: int,
             diagnostic_report["depths"].append(depth_diag)
 
         add_log(f"Pointer scan depth {depth}: {len(current_targets):,} targets, "
-                f"interval-matched ±{hex(_PTR_STRUCT_MAX)}")
+                f"interval-matched ±{hex(_ptr_struct_max())}")
 
         sock = None
         try:
@@ -7159,6 +8208,262 @@ def pointer_chain_scan(ip: str, pid: int,
     return candidates
 
 
+# ── instance discovery by type pointer ────────────────────────────────────────
+# XenoScan's headline primitive, which RDX had no equivalent of: enumerate live
+# class instances and group them by their underlying type. Its stated mechanism
+# is "any class with a virtual-function table".
+#
+# That transfers to RDX's actual target better than to a generic PC scanner.
+# Every IL2CPP object begins with a pointer to its Il2CppClass, which is the
+# same signature a vtable pointer is: a qword at offset 0 that points into a
+# module/static region and is SHARED BY EVERY INSTANCE of that type. So the
+# discriminator is not the value itself but how often it repeats.
+#
+# The whole workflow up to now has been "know a number, scan for it, narrow
+# it", which cannot find state that never appears on screen. This adds "show me
+# the objects", and hands the pointer search a typed base rather than a bare
+# heap address.
+#
+# Everything here is read-only.
+_TYPE_SCAN_MIN_INSTANCES = 8        # below this a repeat is not evidence of a type
+_TYPE_SCAN_MAX_CANDIDATES = 8_000_000   # bounded collected slots (~128 MB peak)
+_TYPE_SCAN_MAX_TYPES = 512          # distinct types returned
+_TYPE_SCAN_MAX_INSTANCES = 4096     # instance addresses retained per type
+_TYPE_SCAN_MAX_DISTINCT = 250_000   # distinct type pointers tallied
+# Consecutive failed chunk reads that mean "the console is gone" rather than
+# "this span is unmapped". Unmapped spans are scattered; a dead link fails
+# every read from the point it dies.
+_TYPE_SCAN_MAX_CONSECUTIVE_FAILS = 8
+_TYPE_SCAN_CHUNK = 0x1000000        # 16 MiB reads
+
+
+def _static_interval_arrays(maps: list) -> tuple:
+    """Coalesced (starts, ends) arrays for regions a type pointer may target."""
+    ranges = _coalesce_ranges([
+        (int(r.get("start", 0)), int(r.get("end", 0)))
+        for r in maps
+        if int(r.get("end", 0)) > int(r.get("start", 0)) and _is_static_region(r)])
+    if not ranges:
+        return (np.empty(0, dtype=np.uint64), np.empty(0, dtype=np.uint64))
+    return (np.asarray([a for a, _ in ranges], dtype=np.uint64),
+            np.asarray([b for _, b in ranges], dtype=np.uint64))
+
+
+def _values_in_intervals(values: np.ndarray, starts: np.ndarray,
+                         ends: np.ndarray) -> np.ndarray:
+    """Boolean mask: which values fall inside any [start, end) interval."""
+    if not len(starts) or not len(values):
+        return np.zeros(len(values), dtype=bool)
+    idx = np.searchsorted(starts, values, side="right") - 1
+    inside = idx >= 0
+    clipped = np.clip(idx, 0, len(starts) - 1)
+    return inside & (values < ends[clipped])
+
+
+def _group_type_pointers(values: np.ndarray, holders: np.ndarray,
+                         min_instances: int = _TYPE_SCAN_MIN_INSTANCES) -> list:
+    """Group holder addresses by the repeated pointer value they contain.
+
+    A value seen once is an ordinary pointer. A value seen at the base of many
+    similarly-shaped allocations is a type identity, which is the whole basis
+    of the technique.
+    """
+    if not len(values):
+        return []
+    order = np.argsort(values, kind="stable")
+    sorted_values = values[order]
+    sorted_holders = holders[order]
+    unique, first_index, counts = np.unique(
+        sorted_values, return_index=True, return_counts=True)
+    keep = counts >= int(min_instances)
+    groups = []
+    for value, start, count in zip(unique[keep], first_index[keep],
+                                   counts[keep]):
+        instances = sorted_holders[int(start):int(start) + int(count)]
+        groups.append({
+            "type_ptr": int(value),
+            "count": int(count),
+            "instances": np.sort(instances[:_TYPE_SCAN_MAX_INSTANCES]).copy(),
+        })
+    groups.sort(key=lambda g: (-g["count"], g["type_ptr"]))
+    return groups[:_TYPE_SCAN_MAX_TYPES]
+
+
+def _group_counted_types(counts: dict, instances: dict,
+                         min_instances: int = _TYPE_SCAN_MIN_INSTANCES) -> list:
+    """Shape already-tallied counts into the same rows _group_type_pointers
+    returns, so both paths hand the UI one format."""
+    groups = []
+    for value, count in counts.items():
+        if count < int(min_instances):
+            continue
+        addrs = sorted(instances.get(value, ()))[:_TYPE_SCAN_MAX_INSTANCES]
+        groups.append({
+            "type_ptr": int(value),
+            "count": int(count),
+            "instances": np.asarray(addrs, dtype=np.uint64),
+        })
+    groups.sort(key=lambda g: (-g["count"], g["type_ptr"]))
+    return groups[:_TYPE_SCAN_MAX_TYPES]
+
+
+def scan_type_instances(ip: str, pid: int,
+                        min_instances: int = _TYPE_SCAN_MIN_INSTANCES,
+                        cancel_event=None, progress_cb=None) -> list:
+    """Find live object instances grouped by the type pointer at their base.
+
+    Read-only. Streams heap regions, keeps only 8-aligned qwords whose value
+    lands in a static/module region, and groups the holders by that value.
+    """
+    if cancel_event is None:
+        cancel_event = threading.Event()
+    maps = _get_maps_cached(ip, pid)
+    if not maps:
+        return []
+    starts, ends = _static_interval_arrays(maps)
+    if not len(starts):
+        add_log("Type scan: no static regions to point into", "warn")
+        return []
+
+    # Objects live in writable, non-static mappings. Excluding static regions
+    # keeps the module's own pointer tables out of the instance set -- those
+    # repeat too, and would otherwise dominate the result.
+    heap = [r for r in _pointer_readable_regions(maps)
+            if (int(r.get("prot", 0)) & 0x2) and not _is_static_region(r)]
+    heap = _coalesce_scan_regions(heap)
+    if not heap:
+        add_log("Type scan: no writable heap regions", "warn")
+        return []
+
+    total_bytes = max(sum(r["end"] - r["start"] for r in heap), 1)
+    done_bytes = 0
+    # Aggregate per chunk rather than collecting every candidate and grouping
+    # at the end. The collect-then-group form peaked at 268 MB on a 256 MiB
+    # heap and would reach roughly 500 MB at the candidate cap -- badly out of
+    # proportion for a tool that caps its whole undo history at 128 MB.
+    # Counting as we go makes peak memory a function of how many distinct
+    # type pointers exist, which is thousands, not of how much heap was read.
+    counts: dict = {}
+    instances: dict = {}
+    collected = 0
+    truncated = False
+    read_failures = 0
+    consecutive_failures = 0
+    successful_reads = 0
+    last_failure: Optional[Exception] = None
+    sock = None
+    try:
+        sock = _ScanSocket(ip, pid)
+        for region in heap:
+            cursor = int(region["start"])
+            end = int(region["end"])
+            while cursor < end:
+                if cancel_event.is_set():
+                    raise InterruptedError("type scan cancelled")
+                size = min(_TYPE_SCAN_CHUNK, end - cursor)
+                try:
+                    raw = sock.read(cursor, size, cancel_event)
+                    consecutive_failures = 0
+                    successful_reads += 1
+                except Exception as exc:
+                    # An unreadable span mid-heap is normal and must not
+                    # abandon a scan that is otherwise working. A *run* of
+                    # failures is not normal -- it means the console went
+                    # away, and swallowing that produced "0 types found",
+                    # which reads exactly like "this title has no type
+                    # pointers". Two very different things, same output.
+                    read_failures += 1
+                    consecutive_failures += 1
+                    last_failure = exc
+                    if consecutive_failures >= _TYPE_SCAN_MAX_CONSECUTIVE_FAILS:
+                        raise ConnectionError(
+                            f"{consecutive_failures} consecutive read failures "
+                            f"from {hex(cursor)}; the console stopped "
+                            f"responding ({exc})") from exc
+                    cursor += size
+                    done_bytes += size
+                    continue
+                usable = len(raw) - (len(raw) % 8)
+                if usable >= 8:
+                    values = np.frombuffer(raw[:usable], dtype="<u8")
+                    mask = _values_in_intervals(values, starts, ends)
+                    if mask.any():
+                        hits = np.flatnonzero(mask)
+                        room = _TYPE_SCAN_MAX_CANDIDATES - collected
+                        if len(hits) > room:
+                            hits = hits[:room]
+                            truncated = True
+                        chunk_values = values[hits]
+                        chunk_holders = (np.uint64(cursor)
+                                         + hits.astype(np.uint64) * 8)
+                        uniq, first, cnt = np.unique(
+                            chunk_values, return_index=True,
+                            return_counts=True)
+                        for value, idx, count in zip(uniq.tolist(),
+                                                     first.tolist(),
+                                                     cnt.tolist()):
+                            if (value not in counts
+                                    and len(counts) >= _TYPE_SCAN_MAX_DISTINCT):
+                                # Refusing new keys keeps the dict bounded
+                                # without discarding tallies already built.
+                                truncated = True
+                                continue
+                            counts[value] = counts.get(value, 0) + count
+                            kept = instances.setdefault(value, [])
+                            if len(kept) < _TYPE_SCAN_MAX_INSTANCES:
+                                same = chunk_holders[chunk_values == value]
+                                room_i = _TYPE_SCAN_MAX_INSTANCES - len(kept)
+                                kept.extend(int(a) for a in same[:room_i])
+                        collected += len(hits)
+                cursor += size
+                done_bytes += size
+                if progress_cb:
+                    progress_cb(min(done_bytes, total_bytes), total_bytes)
+                if collected >= _TYPE_SCAN_MAX_CANDIDATES:
+                    truncated = True
+                    break
+            if collected >= _TYPE_SCAN_MAX_CANDIDATES:
+                break
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    # A heap small enough to fit in one or two chunks can never reach the
+    # consecutive-failure threshold, so that rule alone would still let a dead
+    # link look like an empty result. Nothing read at all is the unambiguous
+    # case and is checked regardless of how many chunks there were.
+    if read_failures and successful_reads == 0:
+        raise ConnectionError(
+            f"every chunk read failed ({read_failures}); the console stopped "
+            f"responding ({last_failure})")
+    if read_failures:
+        # Say so even on a successful scan: a partial read set changes what a
+        # thin result means.
+        add_log(f"Type scan: {read_failures} chunk read(s) failed and were "
+                f"skipped (last: {last_failure})", "warn")
+    if not counts:
+        if read_failures:
+            add_log("Type scan found nothing, but reads were failing — this "
+                    "is not evidence that the title has no type pointers",
+                    "warn")
+        return []
+    groups = _group_counted_types(counts, instances, min_instances)
+    if truncated:
+        add_log(f"Type scan: candidate cap ({_TYPE_SCAN_MAX_CANDIDATES:,}) hit; "
+                f"results are partial", "warn")
+    # Name the type pointer's home module -- that is what makes a row readable.
+    for group in groups:
+        module_name, _base, rel = _module_info_for_addr(group["type_ptr"], maps)
+        group["module_name"] = module_name or ""
+        group["module_relative_offset"] = rel
+    add_log(f"Type scan: {len(groups)} type(s) with >= {min_instances} "
+            f"instances from {collected:,} candidate slot(s)")
+    return groups
+
+
 def _validate_write_addr(addr: int) -> Optional[str]:
     """Return an error string if addr is outside safe user-space range, else None."""
     if addr < _ADDR_MIN:
@@ -7327,10 +8632,19 @@ def _pointer_module_base(maps: list, module_name: str) -> Optional[int]:
 
 
 def _save_pointer_provisionals(records: list,
-                               path: Optional[Path] = None) -> None:
+                               path: Optional[Path] = None,
+                               epochs: Optional[list] = None) -> None:
     """Atomically persist provisional chains for validation after a reload."""
     dst = Path(path or _POINTER_PROVISIONAL_FILE)
     payload = {"version": 1, "candidates": records}
+    if epochs is not None:
+        payload["epochs"] = list(epochs)[-_PTR_EPOCH_LOG_MAX:]
+    else:
+        # Preserve a log written by an earlier call: callers that only
+        # rewrite the candidate list must not silently drop the history.
+        existing = _load_pointer_epochs(dst)
+        if existing:
+            payload["epochs"] = existing
     dst.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=dst.name + ".", dir=str(dst.parent))
     try:
@@ -7371,6 +8685,77 @@ def _load_pointer_provisionals(path: Optional[Path] = None) -> list:
         return []
 
 
+_PTR_EPOCH_LOG_MAX = 12          # reload epochs retained for the funnel view
+
+
+def _load_pointer_epochs(path: Optional[Path] = None) -> list:
+    """Load the per-reload survivor log; a damaged file fails closed.
+
+    Kept separate from _load_pointer_provisionals so a corrupt or absent log
+    can never stop the candidates themselves from loading — the log is a
+    narration of how the project got here, not part of the promotion rule.
+    """
+    src = Path(path or _POINTER_PROVISIONAL_FILE)
+    try:
+        data = json.loads(src.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or int(data.get("version", 0)) != 1:
+            return []
+        epochs = data.get("epochs", [])
+        if not isinstance(epochs, list):
+            return []
+        return [e for e in epochs if isinstance(e, dict)][-_PTR_EPOCH_LOG_MAX:]
+    except (OSError, ValueError, TypeError, AttributeError):
+        return []
+
+
+def _record_pointer_epoch(result: dict, process: str = "",
+                          path: Optional[Path] = None) -> list:
+    """Append one reload epoch to the log and return the whole log.
+
+    PINCE's user watches a pointer-map file shrink at each filter pass, so
+    the narrowing is visible and it is obvious when it has stopped paying.
+    RDX's two-reload gate is stricter and stays exactly as it is; this only
+    makes the same narrowing legible, by recording what each epoch started
+    with, what survived, and why the rest died.
+    """
+    survivors = result.get("survivors", []) or []
+    rejected = result.get("rejected", []) or []
+    reasons: dict = {}
+    for record in rejected:
+        reason = str(record.get("rejection_reason", "unknown"))
+        reasons[reason] = reasons.get(reason, 0) + 1
+    epochs = _load_pointer_epochs(path)
+    epochs.append({
+        "epoch": len(epochs) + 1,
+        "considered": len(survivors) + len(rejected),
+        "survived": len(survivors),
+        "rejected": len(rejected),
+        "reasons": reasons,
+        "process": str(process or ""),
+        "at": time.strftime("%Y-%m-%d %H:%M"),
+    })
+    return epochs[-_PTR_EPOCH_LOG_MAX:]
+
+
+def _format_epoch_rows(epochs: list) -> list:
+    """Render the epoch log as aligned funnel rows for the project screen."""
+    rows = []
+    for entry in epochs:
+        considered = int(entry.get("considered", 0) or 0)
+        survived = int(entry.get("survived", 0) or 0)
+        pct = (100.0 * survived / considered) if considered else 0.0
+        reasons = entry.get("reasons", {}) or {}
+        top = ""
+        if reasons:
+            worst = max(reasons.items(), key=lambda kv: kv[1])
+            top = f"   mostly: {worst[0]} ({worst[1]})"
+        rows.append(
+            f"Reload {int(entry.get('epoch', 0)):<2} "
+            f"{considered:>5} -> {survived:<5} kept ({pct:4.0f}%)"
+            f"{top}")
+    return rows
+
+
 def _coerce_int_field(record: dict, key: str, default: int = 0) -> int:
     """Read an int from an untrusted persisted record without raising.
 
@@ -7401,10 +8786,12 @@ def _pointer_project_summary(process: str = "", maps: Optional[list] = None,
                    ("", game_identity)]
     survivals = max((_coerce_int_field(r, "reload_survivals") for r in records),
                     default=0)
+    epochs = _load_pointer_epochs(path)
     return {
         "count": len(records),
         "survivals": min(max(survivals, 0), 2),
         "complete": survivals >= 2,
+        "epochs": epochs,
         "target": (_coerce_int_field(records[0], "observed_target")
                    if records else None),
         "process": wanted_process,
@@ -7485,7 +8872,8 @@ def _pointer_game_identity(process: str, maps: list) -> str:
 
 def _merge_pointer_provisionals(records: list, process: str,
                                 path: Optional[Path] = None,
-                                game_identity: Optional[str] = None) -> list:
+                                game_identity: Optional[str] = None,
+                                epochs: Optional[list] = None) -> list:
     """Replace one game's candidates without erasing other games."""
     wanted = str(process or "")
     def same_scope(record):
@@ -7500,7 +8888,7 @@ def _merge_pointer_provisionals(records: list, process: str,
     preserved = [x for x in _load_pointer_provisionals(path)
                  if not same_scope(x)]
     merged = preserved + list(records)
-    _save_pointer_provisionals(merged, path)
+    _save_pointer_provisionals(merged, path, epochs=epochs)
     return merged
 
 
@@ -8069,15 +9457,22 @@ def _dash_hex(hexstr: str) -> str:
     return "-".join(hexstr[i:i + 2] for i in range(0, len(hexstr), 2))
 
 
-def generate_mc4_bytes(mods: list, game_id: str, game_ver: str, game_title: str,
-                       process: str, author: str = "RDX CheatMaker") -> bytes:
-    """Build a CheatRunner-compatible .mc4 trainer.
+def generate_trainer_xml(mods: list, game_id: str, game_ver: str, game_title: str,
+                         process: str, author: str = "RDX CheatMaker") -> str:
+    """Build the plaintext Trainer/Cheat/Cheatline XML document.
+
+    This is the shared body of both console trainer containers: `.shn` is
+    this string written as-is, and `.mc4` is the same string passed through
+    _mc4_encrypt().  They are the same schema and the same consumers —
+    CheatRunner and PS4CheaterNeo both read either — so splitting the
+    document out of generate_mc4_bytes() is what lets RDX emit the pair
+    without a second XML builder that could drift from this one.
 
     Takes the same already-resolved module-relative scalar patch list
-    generate_etahen_json() produces (see its docstring): mc4's <Cheatline>
-    has no field for pointer/dereference chains and CheatRunner applies a
-    toggle as a one-shot write like etaHEN, not a live freeze, so the
-    eligible-cheat set is identical and is computed once by the caller.
+    generate_etahen_json() produces (see its docstring): <Cheatline> has no
+    field for pointer/dereference chains and these managers apply a toggle
+    as a one-shot write like etaHEN, not a live freeze, so the eligible-cheat
+    set is identical and is computed once by the caller.
     """
     lines = ['<?xml version="1.0" encoding="utf-8"?>',
              '<Trainer xmlns:xsd="http://www.w3.org/2001/XMLSchema" '
@@ -8101,7 +9496,32 @@ def generate_mc4_bytes(mods: list, game_id: str, game_ver: str, game_title: str,
             lines.append('    </Cheatline>')
         lines.append('  </Cheat>')
     lines.append('</Trainer>')
-    xml_text = "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n"
+
+
+def generate_shn_text(mods: list, game_id: str, game_ver: str, game_title: str,
+                      process: str, author: str = "RDX CheatMaker") -> str:
+    """Build a CheatRunner/PS4CheaterNeo-compatible .shn trainer.
+
+    `.shn` is the plaintext form of the very document `.mc4` encrypts, so
+    this is generate_trainer_xml() under the name its consumers use.
+
+    Emitting it beside the .mc4 is also a diagnostic. The .mc4 path has never
+    been consumed by a live CheatRunner (see HARDWARE_TEST_CHECKLIST.md), and
+    a rejection there currently cannot distinguish a wrong schema from a
+    wrong container — both fail identically. With the pair on disk, .shn
+    accepted + .mc4 rejected isolates the fault to the AES/base64 container;
+    both rejected isolates it to the schema.
+    """
+    return generate_trainer_xml(mods, game_id, game_ver, game_title,
+                                process, author)
+
+
+def generate_mc4_bytes(mods: list, game_id: str, game_ver: str, game_title: str,
+                       process: str, author: str = "RDX CheatMaker") -> bytes:
+    """Build a CheatRunner-compatible .mc4 trainer: the encrypted .shn."""
+    xml_text = generate_trainer_xml(mods, game_id, game_ver, game_title,
+                                    process, author)
     return _mc4_encrypt(xml_text.encode("utf-8"))
 
 
@@ -8542,6 +9962,10 @@ def screen_connect(stdscr) -> str:
         else:
             state["backend"] = "ps5debug"
             state["memdbg"] = None
+        # One line naming the transport and anything it cannot do, so a
+        # session that silently fell back to the slow host scan path says so
+        # in the log rather than only in its timings.
+        add_log(f"Transport — {current_target(ip).describe()}")
         procs = ps5_proc_list(ip)
         # A successful connection starts a new protocol session.  PIDs can be
         # reused after rest mode/restart and can coincide across consoles, so
@@ -8612,13 +10036,12 @@ def _clear_scan_state(stop_freezes: bool = True) -> None:
     if stop_freezes:
         _stop_freeze_worker()
     _close_turbo_session()
-    state["scan_results"]   = _make_addr_array()
-    state["scan_values"]    = None
-    state["scan_dropped"]   = set()
+    # Bookmarks are raw addresses with no chain behind them, so they mean
+    # nothing once the scan state they were taken alongside is gone.
+    state["bookmarks"]      = []
+    state["structures"]     = {}
+    scan.clear()
     state["scan_history"]   = deque(maxlen=5)
-    state["scan_pid"]       = None
-    state["scan_truncated"] = False
-    state["scan_unknown"]   = False
     with _map_cache_lock:
         _map_cache.clear()
     # NOTE: learned command-support caches are deliberately NOT cleared here.
@@ -8630,6 +10053,56 @@ def _clear_scan_state(stop_freezes: bool = True) -> None:
     _invalidate_pointer_index()
     _ScanSocket.clear_pool()
     gc.collect()
+
+
+# ── game-process identification ───────────────────────────────────────────────
+# The process list carries only pid and name, so on a first run every row looks
+# alike and the user has to know that the game is the one called "eboot.bin".
+# Two signals separate it, in increasing cost and confidence:
+#
+#   1. name — the game/app is "eboot.bin" on both consoles. Free, but system
+#      applications use the same name, so it is a candidate test, not proof.
+#   2. an /app0/ mapping — /app0 is the mounted title image, so a process
+#      owning one *is* the running title. Costs a maps call per candidate,
+#      which is why it runs only against processes that pass test 1.
+#
+# Test 2 runs on a daemon thread so the picker stays interactive on a slow
+# link, and every failure degrades silently to test 1 rather than blocking
+# attach behind an identification that is only ever a convenience.
+_GAME_NAME_HINTS = ("eboot.bin", "eboot")
+_GAME_IDENT_MAX_PROBES = 4
+
+
+def _is_game_candidate(name) -> bool:
+    """True for processes worth spending an /app0/ probe on."""
+    base = str(name or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return base in _GAME_NAME_HINTS
+
+
+def _process_owns_app0(ip: str, pid: int) -> bool:
+    """True when the process has an /app0/ mapping, i.e. it is the title."""
+    maps = _get_maps_cached(ip, pid)
+    return any("/app0/" in str(r.get("name", "") or "").replace("\\", "/").lower()
+               for r in maps)
+
+
+def _identify_game_processes(ip: str, candidates: list, confirmed: dict,
+                             lock: threading.Lock, cancel) -> None:
+    """Fill `confirmed` with {pid: bool} for each candidate that answers.
+
+    Never raises: identification is a convenience, and a console that will
+    not serve maps for one process must not stop the user attaching to it.
+    """
+    for proc in candidates[:_GAME_IDENT_MAX_PROBES]:
+        if cancel.is_set():
+            return
+        pid = int(proc.get("pid", 0))
+        try:
+            owns = _process_owns_app0(ip, pid)
+        except Exception:
+            continue
+        with lock:
+            confirmed[pid] = owns
 
 
 def screen_proc_select(stdscr, procs: list) -> str:
@@ -8644,8 +10117,35 @@ def screen_proc_select(stdscr, procs: list) -> str:
 
     procs = _sorted(procs_orig)
     preferred = str(state.get("last_process", "eboot.bin") or "eboot.bin")
+    game_candidates = [p for p in procs_orig if _is_game_candidate(p.get("name"))]
+    confirmed_games: dict = {}
+    ident_lock = threading.Lock()
+    ident_cancel = threading.Event()
+    ident_thread = None
+    if game_candidates:
+        ident_thread = threading.Thread(
+            target=_identify_game_processes,
+            args=(state["ip"], game_candidates, confirmed_games,
+                  ident_lock, ident_cancel),
+            daemon=True)
+        ident_thread.start()
+
+    def _game_rank(proc) -> int:
+        """0 = confirmed title, 1 = name candidate, 2 = everything else."""
+        with ident_lock:
+            if confirmed_games.get(int(proc.get("pid", 0))) is True:
+                return 0
+        return 1 if _is_game_candidate(proc.get("name")) else 2
+
+    # Preference order for the initial cursor: the process the user attached
+    # to last, then the likeliest game, then the top of the list. Without the
+    # middle term a first run always landed on row 0, which is a system
+    # process on every console this was tested against.
     sel = next((i for i, p in enumerate(procs)
-                if str(p.get("name", "")) == preferred), 0)
+                if str(p.get("name", "")) == preferred), None)
+    if sel is None:
+        sel = next((i for i, p in enumerate(procs)
+                    if _is_game_candidate(p.get("name"))), 0)
     filter_str = ""
     while True:
         stdscr.clear()
@@ -8657,6 +10157,9 @@ def screen_proc_select(stdscr, procs: list) -> str:
 
         visible_procs = [p for p in procs
                          if filter_str.lower() in p['name'].lower()]
+        # Stable sort by game-rank keeps the chosen sort order (name/pid)
+        # inside each group while floating the title to the top.
+        visible_procs.sort(key=_game_rank)
         # Clamp sel whenever the visible list changes size.
         sel = min(sel, max(0, len(visible_procs) - 1))
 
@@ -8664,16 +10167,32 @@ def screen_proc_select(stdscr, procs: list) -> str:
         safe_addstr(stdscr, 3, 3, f"Filter: {filter_hint}", color(C_WARN))
         safe_addstr(stdscr, 3, w - 22,
                     f"Sort: {sort_by} [Tab]  ", color(C_NORM))
+        with ident_lock:
+            n_confirmed = sum(1 for v in confirmed_games.values() if v)
+            still_probing = (ident_thread is not None
+                             and ident_thread.is_alive())
+        if n_confirmed:
+            safe_addstr(stdscr, 4, 3,
+                        "▶ = running title (owns an /app0/ mapping)",
+                        color(C_OK))
+        elif still_probing:
+            safe_addstr(stdscr, 4, 3, "· identifying the running title…",
+                        color(C_ACC))
 
         visible = max(1, h - 9)
         start   = max(0, sel - visible // 2)
         for i, p in enumerate(visible_procs[start:start + visible]):
             idx  = start + i
             dim  = p['pid'] < 10
+            rank = _game_rank(p)
             attr = (color(C_SEL)
                     if idx == sel
-                    else (color(C_NORM) | curses.A_DIM if dim else color(C_NORM)))
-            line = f"  PID {p['pid']:6d}   {p['name']}"
+                    else (color(C_OK) | curses.A_BOLD if rank == 0
+                          else color(C_NORM) | curses.A_DIM if dim
+                          else color(C_NORM)))
+            marker = "▶ " if rank == 0 else "· " if rank == 1 else "  "
+            suffix = "   ← game" if rank == 0 else ""
+            line = f"{marker}PID {p['pid']:6d}   {p['name']}{suffix}"
             safe_addstr(stdscr, 5 + i, 2, line[:w - 4].ljust(w - 4), attr)
 
         draw_statusbar(stdscr, [
@@ -8697,6 +10216,7 @@ def screen_proc_select(stdscr, procs: list) -> str:
             sel     = 0
         elif key in (curses.KEY_ENTER, 10, 13) and visible_procs:
             p = visible_procs[sel]
+            ident_cancel.set()
             if p["pid"] != state["pid"]:   # process actually changed
                 _clear_scan_state()
             state["pid"]       = p["pid"]
@@ -8711,6 +10231,7 @@ def screen_proc_select(stdscr, procs: list) -> str:
             # has a live typeahead filter, and 'q' is a normal, common
             # character in process names — treating it as a quit shortcut
             # would make it impossible to ever type. Esc is unambiguous.
+            ident_cancel.set()
             return "connect"
         elif key in (curses.KEY_BACKSPACE, 127, 8):   # 8 = BS on some terminals
             filter_str = filter_str[:-1]
@@ -8792,17 +10313,10 @@ def _command_palette_rank(query: str, label: str):
 
 
 def do_command_palette(stdscr) -> None:
-    commands = [
-        ("First Scan", "scan_first"), ("Next Scan", "scan_next"),
-        ("Results", "results"), ("Cheat List", "cheat_list"),
-        ("Pointer Project", "pointer_project"),
-        ("Find Permanent Pointer", "pointer_scan"), ("Write Address", "write"),
-        ("Freeze Address", "freeze"), ("Import Trainer", "import"),
-        ("Export Trainers", "export"), ("Scan Settings", "scan_settings"),
-        ("Logs", "log"), ("Clear Results", "clear"),
-        ("Clear Scan History", "clear_history"), ("Change Process", "proc"),
-        ("Reconnect Console", "reconnect"), ("Verify Pointer", "ptr_verify"),
-    ]
+    # One registry, so a command added there appears here automatically and
+    # carries its own availability rule with it.
+    commands = [(command.label, command.name)
+                for command in _commands().values() if command.in_palette]
     query = ""
     sel = 0
     while True:
@@ -8817,9 +10331,19 @@ def do_command_palette(stdscr) -> None:
         matches = [c for _, c in ranked]
         if matches:
             sel = min(sel, len(matches) - 1)
-            for i, (label, _) in enumerate(matches[:visible]):
-                attr = color(C_SEL) | curses.A_BOLD if i == sel else color(C_NORM)
-                safe_addstr(stdscr, 4 + i, 4, ("▶ " if i == sel else "  ") + label, attr)
+            for i, (label, name) in enumerate(matches[:visible]):
+                reason = _commands()[name].unavailable_reason()
+                if i == sel:
+                    attr = color(C_SEL) | curses.A_BOLD
+                elif reason:
+                    attr = color(C_NORM) | curses.A_DIM
+                else:
+                    attr = color(C_NORM)
+                # The palette used to offer every command unconditionally,
+                # including ones the main menu already knew could not run.
+                suffix = f"   — {reason}" if reason else ""
+                safe_addstr(stdscr, 4 + i, 4,
+                            ("▶ " if i == sel else "  ") + label + suffix, attr)
         else:
             safe_addstr(stdscr, 4, 4, "No matching commands.", color(C_WARN))
         draw_statusbar(stdscr, [("↑↓", C_NORM), ("Enter run", C_OK), ("Backspace", C_NORM), ("Esc", C_NORM)])
@@ -8850,21 +10374,123 @@ def do_command_palette(stdscr) -> None:
             query += chr(key); sel = 0
 
 
+# ── command registry ──────────────────────────────────────────────────────────
+# One table, three consumers. dispatch() held a 15-entry action dict,
+# do_command_palette() held the same actions again as display labels, and
+# _main_menu_entries() held a third overlapping copy -- so a new command had to
+# be added in three places and an availability rule (like "Next Scan needs
+# results") existed only in the main menu, which is why the palette happily
+# offered commands that could not run.
+#
+# This is the informal command enum those three tables already were, made
+# explicit. Squalr does the same thing deliberately -- "shared command models
+# live in squalr-engine-api; command-line parsing is an adapter that lowers
+# CLI/REPL-style input into those shared commands" -- which is what lets one
+# engine serve a GUI, a CLI and a TUI. RDX has one front end today, but the
+# duplication was already costing it correctness.
+class Command:
+    """One user-invokable action."""
+
+    __slots__ = ("name", "label", "handler", "menu_key", "color",
+                 "requires_results", "requires_process", "in_palette")
+
+    def __init__(self, name, label, handler, *, menu_key=None, color=None,
+                 requires_results=False, requires_process=False,
+                 in_palette=True):
+        self.name = name
+        self.label = label
+        self.handler = handler
+        self.menu_key = menu_key
+        self.color = color
+        self.requires_results = requires_results
+        self.requires_process = requires_process
+        self.in_palette = in_palette
+
+    def unavailable_reason(self) -> Optional[str]:
+        """Why this cannot run right now, or None when it can."""
+        if self.requires_process and state.get("pid") is None:
+            return "attach to a process first"
+        if self.requires_results and len(state.get("scan_results", ())) == 0:
+            return "no scan results yet"
+        return None
+
+    def is_available(self) -> bool:
+        return self.unavailable_reason() is None
+
+
+def _build_command_registry() -> dict:
+    """The single source of truth for dispatch, palette and main menu."""
+    commands = [
+        Command("scan_first", "First Scan", do_scan_first,
+                menu_key="S", color=C_NORM, requires_process=True),
+        Command("scan_next", "Next Scan", do_scan_next,
+                menu_key="N", color=C_NORM, requires_results=True),
+        Command("results", "Results", do_show_results,
+                menu_key="R", color=C_ACC, requires_results=True),
+        Command("pointer_project", "Pointer Project", do_pointer_project,
+                menu_key="P", color=C_ACC, requires_process=True),
+        Command("cheat_list", "Cheats", do_cheat_list,
+                menu_key="C", color=C_NORM),
+        Command("scan_settings", "Settings", do_scan_settings,
+                menu_key="T", color=C_ACC),
+        Command("bookmarks", "Bookmarks", do_bookmarks),
+        Command("hex_view", "Hex View", _dispatch_hex_view,
+                requires_process=True),
+        Command("structure_view", "Structure View", _dispatch_structure_view,
+                requires_process=True),
+        Command("type_scan", "Type Scan (find objects)", do_type_scan,
+                requires_process=True),
+        Command("load_symbols", "Load Symbols (Il2CppDumper)", do_load_symbols),
+        Command("pointer_scan", "Find Permanent Pointer", do_pointer_scan,
+                requires_process=True),
+        Command("ptr_verify", "Verify Pointer", do_ptr_verify_manual,
+                requires_process=True),
+        Command("write", "Write Address", do_write, requires_process=True),
+        Command("freeze", "Freeze Address", do_freeze,
+                requires_process=True),
+        Command("import", "Import Trainer", do_import),
+        Command("export", "Export Trainers", do_export),
+        Command("log", "Logs", do_log),
+        Command("clear", "Clear Results", do_clear_results),
+        Command("clear_history", "Clear Scan History", do_clear_history),
+        Command("proc", "Change Process", None),
+        Command("reconnect", "Reconnect Console", None),
+    ]
+    return {command.name: command for command in commands}
+
+
+_COMMANDS: dict = {}
+
+
+def _commands() -> dict:
+    """Registry, built lazily so it can reference handlers defined later."""
+    global _COMMANDS
+    if not _COMMANDS:
+        _COMMANDS = _build_command_registry()
+    return _COMMANDS
+
+
+def _command_unavailable_reason(name) -> Optional[str]:
+    """Why a menu/palette entry cannot run, or None. Quit has no command."""
+    command = _commands().get(name) if name else None
+    return command.unavailable_reason() if command else None
+
+
+def _command_available(name) -> bool:
+    return _command_unavailable_reason(name) is None
+
+
 def _main_menu_entries():
-    """Return the deliberately small primary workflow menu.
+    """The deliberately small primary workflow menu, from the registry.
 
     Advanced/destructive utilities remain discoverable through the command
     palette instead of competing with the scan/results/cheat workflow.
     """
-    return [
-        ("S", "First Scan", "scan_first", C_NORM),
-        ("N", "Next Scan",  "scan_next",  C_NORM),
-        ("R", "Results",    "results",    C_ACC),
-        ("P", "Pointer Project", "pointer_project", C_ACC),
-        ("C", "Cheats",     "cheat_list", C_NORM),
-        ("T", "Settings",   "scan_settings", C_ACC),
-        ("Q", "Quit",       None,          C_ERR),
-    ]
+    entries = [(command.menu_key, command.label, command.name, command.color)
+               for command in _commands().values()
+               if command.menu_key]
+    entries.append(("Q", "Quit", None, C_ERR))
+    return entries
 
 
 def _confirm_quit(stdscr) -> bool:
@@ -8909,22 +10535,18 @@ def screen_main(stdscr):
                     i = start_i + j
                     if i >= len(menu):
                         continue
-                    key, label, _, cp = menu[i]
-                    unavailable = (
-                        (label == "Next Scan" and len(state["scan_results"]) == 0) or
-                        (label == "Results" and len(state["scan_results"]) == 0)
-                    )
+                    key, label, action, cp = menu[i]
+                    # Availability travels with the command now, so the menu
+                    # and the palette cannot drift apart.
+                    unavailable = not _command_available(action)
                     attr = (color(C_SEL) | curses.A_BOLD if i == sel else
                             color(C_NORM) | curses.A_DIM if unavailable else color(cp))
                     safe_addstr(stdscr, 7 + j, x,
                                 f"[{key}] {label}"[:max(w - x - 2, 0)], attr)
         else:
             safe_addstr(stdscr, 5, 3, "WORKFLOW", color(C_TITLE) | curses.A_BOLD)
-            for i, (key, label, _, cp) in enumerate(menu):
-                unavailable = (
-                    (label == "Next Scan" and len(state["scan_results"]) == 0) or
-                    (label == "Results" and len(state["scan_results"]) == 0)
-                )
+            for i, (key, label, action, cp) in enumerate(menu):
+                unavailable = not _command_available(action)
                 attr = (color(C_SEL) | curses.A_BOLD if i == sel else
                         color(C_NORM) | curses.A_DIM if unavailable else color(cp))
                 safe_addstr(stdscr, 7 + i, 3,
@@ -8942,10 +10564,18 @@ def screen_main(stdscr):
         if key == curses.KEY_RESIZE:
             curses.update_lines_cols()
             continue
-        if key == curses.KEY_UP:
+        # j/k/g/G are aliases only on screens with no live typeahead filter.
+        # screen_proc_select and do_command_palette deliberately have none:
+        # there every printable character is query text, which is the same
+        # reason 'q' is not bound to quit on those two screens.
+        if key in (curses.KEY_UP, ord('k')):
             sel = max(0, sel - 1)
-        elif key == curses.KEY_DOWN:
+        elif key in (curses.KEY_DOWN, ord('j')):
             sel = min(len(menu) - 1, sel + 1)
+        elif key == ord('g'):
+            sel = 0
+        elif key == ord('G'):
+            sel = len(menu) - 1
         elif key in (curses.KEY_ENTER, 10, 13):
             action = menu[sel][2]
             if action is None:
@@ -8964,12 +10594,9 @@ def screen_main(stdscr):
         else:
             for k, label, action, _ in menu:
                 if key in (ord(k.lower()), ord(k.upper())):
-                    unavailable = (
-                        (label == "Next Scan" and len(state["scan_results"]) == 0) or
-                        (label == "Results" and len(state["scan_results"]) == 0)
-                    )
-                    if unavailable:
-                        add_log(f"{label} is unavailable until a scan is complete", "warn")
+                    reason = _command_unavailable_reason(action)
+                    if reason:
+                        add_log(f"{label} unavailable — {reason}", "warn")
                         break
                     if action is None:
                         if _confirm_quit(stdscr):
@@ -8982,12 +10609,25 @@ def screen_main(stdscr):
 
 def do_help(stdscr) -> None:
     lines = [
-        "Navigation   ↑↓ Select   Enter Run   Esc Back   Q Quit",
+        "Navigation   ↑↓ or j/k   g/G top/bottom   Enter Run   Esc Back",
         "Global       / Command Palette   ? Help",
         "Scanning     S First Scan   N Next Scan   R Results",
         "Pointers     P Pointer Project (persisted 2-reload workflow)",
         "Results      A Apply   C Cheat   R Find permanent   N Refine",
+        "Results      B Bookmark   Enter inspect → H for a hex view",
+        "Type Scan    / then \"Type Scan\" — groups heap objects by the",
+        "             type pointer at their base. Read-only.",
+        "Hex view     Read-only. ↑↓/jk row, PgUp/PgDn page, a address,",
+        "             n back to anchor, s structure. It never writes.",
+        "Structure    Named typed fields over an address. Enter renames,",
+        "             T retypes, R re-dissects, +/- resize, C changes,",
+        "             Y overlays a class from a loaded dump.cs. Read-only.",
+        "Symbols      / then \"Load Symbols\" — reads an Il2CppDumper",
+        "             dump.cs so fields get real names, not field_0014.",
         "Cheats       F/Space Toggle   A Apply   E Edit   D Delete",
+        "Bookmarks    / then \"Bookmarks\"   Enter inspect   C promote",
+        "             (j/k work everywhere except the process picker and",
+        "             the palette, where letters are filter text.)",
         "Advanced     Export/Import/Freeze/Logs have no direct key —",
         "             press / then type the command name to run them.",
         "Setup        T Settings",
@@ -8998,32 +10638,24 @@ def do_help(stdscr) -> None:
     message_box(stdscr, lines, "Keyboard Help", C_ACC)
 
 def dispatch(stdscr, action: str):
-    actions = {
-        "pointer_scan": do_pointer_scan,
-        "pointer_project": do_pointer_project,
-        "ptr_verify":   do_ptr_verify_manual,
-        "scan_first":    do_scan_first,
-        "scan_next":     do_scan_next,
-        "scan_settings": do_scan_settings,
-        "results":       do_show_results,
-        "write":         do_write,
-        "cheat_list":    do_cheat_list,
-        "export":        do_export,
-        "import":        do_import,
-        "freeze":        do_freeze,
-        "log":           do_log,
-        "clear":         do_clear_results,
-        "clear_history": do_clear_history,
-    }
+    """Run one registered command by name."""
     if action == "proc":
         return "proc"
     if action == "reconnect":
         _stop_freeze_worker()
         state["connected"] = False
         return "connect"
-    fn = actions.get(action)
-    if fn:
-        fn(stdscr)
+    command = _commands().get(action)
+    if command is None:
+        add_log(f"Unknown command: {action}", "warn")
+        return None
+    reason = command.unavailable_reason()
+    if reason is not None:
+        add_log(f"{command.label} unavailable — {reason}", "warn")
+        return None
+    if command.handler is None:
+        return None
+    return command.handler(stdscr)
 
 
 def do_clear_history(stdscr) -> None:
@@ -9155,31 +10787,187 @@ def _run_scan_with_progress(stdscr, thread_fn, total_label: str,
     return not cancel_event.is_set()
 
 
+def _format_setting(key: str) -> str:
+    """Render a tunable the way it is entered."""
+    spec, value = _SETTING_SPECS[key], setting(key)
+    if spec["kind"] == "bool":
+        return "on" if value else "off"
+    if spec["kind"] == "hex":
+        return hex(int(value))
+    if spec["kind"] == "csv":
+        text = str(value)
+        return text if len(text) <= 46 else text[:43] + "..."
+    return str(value)
+
+
+def _edit_setting(stdscr, key: str, y: int) -> bool:
+    """Prompt for one tunable. True when the stored value changed."""
+    spec = _SETTING_SPECS[key]
+    before = setting(key)
+    if spec["kind"] == "bool":
+        chosen = cycle_input(stdscr, f"{spec['label']}: ", y, 3,
+                             ["off", "on"], "on" if before else "off",
+                             allow_cancel=True)
+        if chosen is None:
+            return False
+        after = _coerce_setting(key, chosen)
+    else:
+        raw = input_box(stdscr, f"{spec['label']}: ", y, 3, 52,
+                        _format_setting(key), allow_cancel=True,
+                        cancel_with_q=False)
+        if raw is None:
+            return False
+        after = _coerce_setting(key, raw)
+        # _coerce_setting clamps rather than rejects, so tell the user when
+        # what they typed is not what got stored.
+        if spec["kind"] in ("int", "hex"):
+            try:
+                asked = int(str(raw), 0)
+            except (TypeError, ValueError):
+                message_box(stdscr,
+                            [f"{raw!r} is not a number — {spec['label']} "
+                             f"left at {_format_setting(key)}."],
+                            "Unchanged", C_WARN)
+                return False
+            if asked != after:
+                message_box(stdscr,
+                            [f"Clamped to the supported range "
+                             f"{hex(spec['min'])}..{hex(spec['max'])}.",
+                             f"{spec['label']} is now {hex(after)}."],
+                            "Clamped", C_WARN)
+    if after == before:
+        return False
+    _settings[key] = after
+    _save_preferences({key: after})
+    add_log(f"{spec['label']} = {_format_setting(key)}")
+    return True
+
+
 def do_scan_settings(stdscr) -> None:
-    options = ["Auto (Turbo → Console → Host)", "Turbo only", "Console only", "Host only"]
-    keys = ["auto", "turbo", "console", "host"]
-    current = state.get("scan_engine", "auto")
-    if current not in keys:
-        current = "auto"
-    stdscr.clear()
-    draw_border(stdscr, "SCAN SETTINGS")
-    safe_addstr(stdscr, 2, 3,
-                "Auto tries the fastest available engine and falls back safely.",
-                color(C_NORM))
-    selected = cycle_input(
-        stdscr, "Scan engine: ", 5, 3, options, options[keys.index(current)],
-        allow_cancel=True)
-    if selected is None:
-        add_log("Scan settings unchanged")
-        return
-    chosen = keys[options.index(selected)]
-    if chosen != current:
-        # Switching to host/console and back would otherwise re-adopt the
-        # session left resident by the last turbo scan, silently discarding
-        # every narrowing the host path did in between.
-        _close_turbo_session()
-    state["scan_engine"] = chosen
-    add_log(f"Scan engine set to {state['scan_engine']}")
+    """Scan, region and pointer tunables.
+
+    Previously this screen held one dropdown. The pointer bounds and the
+    region filter rules lived as literals in the source, which is where PINCE
+    and PS4CheaterNeo both put them on screen instead. The defaults are
+    unchanged — RDX's depth of 5 and 0x800 window match PINCE's own defaults
+    — so this exposes them rather than retuning anything.
+    """
+    engine_options = ["Auto (Turbo → Console → Host)", "Turbo only",
+                      "Console only", "Host only"]
+    engine_keys = ["auto", "turbo", "console", "host"]
+    rows = [
+        ("section", "SCAN"),
+        ("engine", None),
+        ("section", "REGIONS"),
+        ("setting", "region_exclude"),
+        ("setting", "region_min_size"),
+        ("section", "POINTERS"),
+        ("setting", "ptr_max_depth"),
+        ("setting", "ptr_direct_range"),
+        ("setting", "ptr_offset_max"),
+        ("setting", "ptr_module_bases_only"),
+        ("action", "reset"),
+    ]
+    selectable = [i for i, (kind, _) in enumerate(rows) if kind != "section"]
+    sel = selectable[0]
+
+    while True:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        draw_border(stdscr, "SETTINGS")
+        engine = state.get("scan_engine", "auto")
+        if engine not in engine_keys:
+            engine = "auto"
+        for i, (kind, key) in enumerate(rows):
+            y = 3 + i
+            if y >= h - 3:
+                break
+            if kind == "section":
+                safe_addstr(stdscr, y, 3, key,
+                            color(C_TITLE) | curses.A_BOLD)
+                continue
+            chosen = i == sel
+            attr = color(C_SEL) | curses.A_BOLD if chosen else color(C_NORM)
+            if kind == "engine":
+                label, value = "Scan engine", engine_options[engine_keys.index(engine)]
+            elif kind == "action":
+                label, value = "Restore defaults", ""
+            else:
+                label, value = _SETTING_SPECS[key]["label"], _format_setting(key)
+            marker = "▸ " if chosen else "  "
+            safe_addstr(stdscr, y, 3,
+                        f"{marker}{label:<24} {value}"[:max(w - 6, 0)], attr)
+
+        kind, key = rows[sel]
+        helptext = ("Reset every setting on this screen to its built-in default."
+                    if kind == "action" else
+                    "Auto tries the fastest available engine and falls back safely."
+                    if kind == "engine" else _SETTING_SPECS[key]["help"])
+        for n, line in enumerate(_wrap_help(helptext, max(w - 8, 20))[:2]):
+            safe_addstr(stdscr, h - 4 + n, 3, line, color(C_WARN))
+        draw_statusbar(stdscr, [("↑↓ / jk", C_NORM), ("Enter edit", C_OK),
+                                ("Esc/Q back", C_NORM)])
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch == curses.KEY_RESIZE:
+            curses.update_lines_cols(); continue
+        if ch in (curses.KEY_UP, ord('k')):
+            prior = [i for i in selectable if i < sel]
+            sel = prior[-1] if prior else selectable[-1]
+        elif ch in (curses.KEY_DOWN, ord('j')):
+            later = [i for i in selectable if i > sel]
+            sel = later[0] if later else selectable[0]
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            kind, key = rows[sel]
+            if kind == "engine":
+                chosen = cycle_input(stdscr, "Scan engine: ", h - 6, 3,
+                                     engine_options,
+                                     engine_options[engine_keys.index(engine)],
+                                     allow_cancel=True)
+                if chosen is not None:
+                    picked = engine_keys[engine_options.index(chosen)]
+                    if picked != engine:
+                        # Switching away and back would otherwise re-adopt the
+                        # session the last turbo scan left resident, silently
+                        # discarding every narrowing the host path did between.
+                        _close_turbo_session()
+                        state["scan_engine"] = picked
+                        add_log(f"Scan engine set to {picked}")
+            elif kind == "action":
+                if confirm_box(stdscr,
+                               "Restore every setting on this screen to its "
+                               "built-in default?", "Restore Defaults"):
+                    for skey, spec in _SETTING_SPECS.items():
+                        _settings[skey] = spec["default"]
+                        _save_preferences({skey: spec["default"]})
+                    add_log("Settings restored to defaults", "warn")
+            else:
+                changed = _edit_setting(stdscr, key, h - 6)
+                # A changed pointer/region bound invalidates work computed
+                # under the old one; a stale reverse index would otherwise be
+                # reused and silently ignore the new setting.
+                if changed and key in ("ptr_direct_range", "ptr_offset_max",
+                                       "region_exclude", "region_min_size"):
+                    _invalidate_pointer_index()
+                    with _map_cache_lock:
+                        _map_cache.clear()
+        elif ch in (ord('q'), ord('Q'), 27):
+            return
+
+
+def _wrap_help(text: str, width: int) -> list:
+    """Wrap one help string to the screen without importing textwrap."""
+    words, lines, current = str(text).split(), [], ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if len(candidate) > width and current:
+            lines.append(current); current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
 
 
 def _current_scan_type() -> str:
@@ -9367,16 +11155,13 @@ def do_scan_first(stdscr) -> None:
     results = progress["results"] if progress["results"] is not None else _make_addr_array()
     # Free old arrays before the new assignment to avoid holding two full
     # arrays in RAM simultaneously (old + new) during the reassignment.
-    state["scan_results"]  = _make_addr_array()
-    state["scan_values"]   = None
+    scan.clear()
     state["scan_history"]  = deque(maxlen=5)
-    state["scan_dropped"]  = set()
     gc.collect()
-    state["scan_results"]  = results
-    state["scan_values"]   = progress.get("values")
-    state["scan_pid"]      = state["pid"]
-    state["scan_truncated"] = progress.get("truncated", False)
-    state["scan_unknown"]  = unknown_mode
+    scan.replace(results, progress.get("values"),
+                 unknown=unknown_mode,
+                 truncated=progress.get("truncated", False),
+                 close_turbo=False)
     add_log(f"{'Unknown' if unknown_mode else 'First'} scan "
             f"type={type_key} w={width} aligned={aligned}: "
             f"{len(results):,} candidates, "
@@ -9472,8 +11257,7 @@ def do_scan_next(stdscr) -> None:
         removed_a = np.setdiff1d(prev_addrs, results, assume_unique=True)
         _push_undo(removed_a, None, set(state["scan_dropped"]),
                    state.get("scan_truncated", False))
-        state["scan_results"] = results
-        state["scan_values"] = None
+        scan.narrow(results, None)
         state["scan_pattern"] = canonical
         # A dropped address is removed from scan_results at drop time, so it
         # can never reappear in a later Next Scan's (necessarily narrower)
@@ -9580,8 +11364,7 @@ def do_scan_next(stdscr) -> None:
                    state.get("scan_truncated", False))
         del new_sorted, removed_mask, removed_a, removed_v   # free intermediates
 
-        state["scan_results"] = new_addrs
-        state["scan_values"]  = new_values
+        scan.narrow(new_addrs, new_values)
         # A dropped address is removed from scan_results at drop time, so it
         # can never reappear in a later Next Scan's (necessarily narrower)
         # output -- there is nothing left worth carrying forward.
@@ -9654,13 +11437,12 @@ def do_scan_next(stdscr) -> None:
                    state.get("scan_truncated", False))
         del new_sorted, removed_mask, removed_a
 
-        state["scan_results"] = results
-        state["scan_values"]  = None
+        scan.narrow(results, None,
+                    truncated=progress.get("truncated", False))
         # A dropped address is removed from scan_results at drop time, so it
         # can never reappear in a later Next Scan's (necessarily narrower)
         # output -- there is nothing left worth carrying forward.
         state["scan_dropped"] = set()
-        state["scan_truncated"] = progress.get("truncated", False)
 
         hist_mb = _history_bytes() / 1_048_576
         add_log(f"Exact next scan type={type_key} val={val}: "
@@ -9862,12 +11644,7 @@ def do_browse_nearby(stdscr, anchor: int) -> None:
     # TurboScan session would make the next Next Scan silently discard the
     # whole nearby set and narrow the old server-side list instead.
     _close_turbo_session()
-    state["scan_results"] = candidate_addr
-    state["scan_values"] = candidate_values
-    state["scan_pid"] = state["pid"]
-    state["scan_unknown"] = False
-    state["scan_truncated"] = False
-    state["scan_dropped"] = set()
+    scan.replace(candidate_addr, candidate_values, close_turbo=False)
     state["scan_history"].clear()
     add_log(f"Nearby browse @ {hex(int(anchor))}: "
             f"{len(candidate_addr):,} plausible candidates")
@@ -9940,12 +11717,7 @@ def do_discover_nearby(stdscr, anchor: int) -> None:
         # Wholesale replacement — discard any resident session first, same
         # reason as do_browse_nearby.
         _close_turbo_session()
-        state["scan_results"] = changed_addr
-        state["scan_values"] = new_values
-        state["scan_pid"] = state["pid"]
-        state["scan_unknown"] = False
-        state["scan_truncated"] = False
-        state["scan_dropped"] = set()
+        scan.replace(changed_addr, new_values, close_turbo=False)
         state["scan_history"].clear()
         add_log(f"Anchored discovery @ {hex(int(anchor))}: "
                 f"{len(changed_addr):,} nearby candidates")
@@ -10499,7 +12271,7 @@ def do_show_results(stdscr) -> None:
                 f"Type: {wlabel}   Process: {state['proc_name']} (PID {state['pid']}){trunc_warn}",
                 color(C_ERR) if trunc_warn else color(C_WARN))
             safe_addstr(stdscr, 3, 3,
-                "↑↓/PgUp/PgDn navigate   G jump   Enter inspect   D drop   U undo   M more   Q back",
+                "↑↓/jk navigate   G jump   Enter inspect   B bookmark   D drop   U undo   M more   Q back",
                 color(C_NORM))
 
             split_view = w >= 92
@@ -10525,6 +12297,7 @@ def do_show_results(stdscr) -> None:
                 safe_addstr(stdscr, 8, pane_x, f"Type      {wlabel}", color(C_NORM))
                 safe_addstr(stdscr, 10, pane_x, "A  Apply value", color(C_OK))
                 safe_addstr(stdscr, 11, pane_x, "C  Create cheat", color(C_OK))
+                safe_addstr(stdscr, 16, pane_x, "B  Bookmark", color(C_NORM))
                 safe_addstr(stdscr, 12, pane_x,
                             "R  Find permanent pointer", color(C_ACC))
                 safe_addstr(stdscr, 13, pane_x, "D  Drop result", color(C_ERR))
@@ -10559,9 +12332,13 @@ def do_show_results(stdscr) -> None:
             if key == curses.KEY_RESIZE:
                 curses.update_lines_cols()
                 continue
-            if key == curses.KEY_UP and sel > 0:
+            # Only j/k here: 'g'/'G' already open "jump to result index" on
+            # this screen, and that binding predates the vim aliases. Taking
+            # it for go-to-bottom would silently change what an existing key
+            # does, which is worse than the alias being incomplete.
+            if key in (curses.KEY_UP, ord('k')) and sel > 0:
                 sel -= 1
-            elif key == curses.KEY_DOWN and sel < len(results) - 1:
+            elif key in (curses.KEY_DOWN, ord('j')) and sel < len(results) - 1:
                 sel += 1
             elif key == curses.KEY_PPAGE:
                 sel = max(0, sel - visible)
@@ -10616,6 +12393,8 @@ def do_show_results(stdscr) -> None:
                 results = state["scan_results"]
                 with cache_lock:
                     val_cache.clear()
+            elif key in (ord('b'), ord('B')) and len(results) > 0:
+                add_log(_add_bookmark(int(results[sel]), _current_scan_type()))
             elif key in (ord('c'), ord('C')) and len(results) > 0:
                 stdscr.nodelay(False)
                 _add_cheat_at(stdscr, results[sel])
@@ -10688,23 +12467,15 @@ def do_show_results(stdscr) -> None:
                     break
                 continue
             elif key in (ord('d'), ord('D')):
-                dropped_idx = sel
-                dropped = results[sel]
-                results = _make_addr_array(a for i, a in enumerate(results) if i != sel)
-                state["scan_results"] = results
-                # A resident TurboScan session is matched by connection/PID/
-                # width/value-type alone, never by candidate count, so it
-                # would happily narrow the server's pre-drop list and hand
-                # this address straight back on the next Next Scan.
-                _close_turbo_session()
-                # Unknown-value scans keep a parallel value snapshot.  Remove
-                # the matching element or the next relational scan sees a
-                # mismatched/corrupted address-value pair.
-                if state.get("scan_values") is not None:
-                    state["scan_values"] = np.delete(
-                        state["scan_values"], dropped_idx)
-                # Track dropped address separately from scan history
-                state["scan_dropped"].add(dropped)
+                # drop_index owns all three consequences that used to be
+                # spelled out here: closing the resident TurboScan session
+                # (which is matched by connection/PID/width/value-type, never
+                # by candidate count, so it would hand this address straight
+                # back), removing the parallel previous-value element so the
+                # next relational scan cannot pair an address with another
+                # address's value, and recording the drop.
+                dropped = scan.drop_index(sel)
+                results = state["scan_results"]
                 with cache_lock:
                     val_cache.pop(dropped, None)
                 if len(results) == 0:
@@ -10729,6 +12500,777 @@ def do_show_results(stdscr) -> None:
             refresh_thread.join(timeout=2.0)   # 1.5 s socket timeout + 0.5 s margin
 
 
+# ── hex viewer ────────────────────────────────────────────────────────────────
+# Read-only by design. Every comparable tool ships a memory viewer -- Cheat
+# Engine's Memory Viewer, PINCE's MemoryView, PS4CheaterNeo's hex editor,
+# MemoryEngine360's -- and RDX had none, which matters here more than it would
+# on a PC tool: RDX expresses chains as [base+0x18]-0x10, so checking that a
+# candidate lands where it should is inherently "look at the bytes at this
+# base", and there was no way to do that.
+#
+# It does not write. RDX already has three audited write paths (Apply, cheats,
+# freeze) that validate against the process map first; a fourth one reachable
+# by cursoring around a hex dump would be the easiest way in the program to
+# corrupt a running game by accident.
+_HEX_BYTES_PER_ROW = 16
+_HEX_WINDOW_ROWS = 64            # rows fetched per read, not rows displayed
+_HEX_REFRESH_INTERVAL = 2.0
+
+
+def _hex_render_rows(base: int, data: bytes, unreadable: bool = False) -> list:
+    """Render a byte window as (address, hex column, ascii column) rows."""
+    rows = []
+    for offset in range(0, len(data), _HEX_BYTES_PER_ROW):
+        chunk = data[offset:offset + _HEX_BYTES_PER_ROW]
+        if unreadable:
+            hex_col = " ".join("??" for _ in range(_HEX_BYTES_PER_ROW))
+            ascii_col = "?" * _HEX_BYTES_PER_ROW
+        else:
+            hex_col = " ".join(f"{b:02X}" for b in chunk)
+            hex_col += "   " * (_HEX_BYTES_PER_ROW - len(chunk))
+            ascii_col = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        rows.append((base + offset, hex_col, ascii_col))
+    return rows
+
+
+def _hex_changed_offsets(previous: Optional[bytes], current: bytes) -> set:
+    """Byte offsets that differ between two reads of the same window.
+
+    ReClass.NET ships this as "highlight changed memory", and it earns its
+    place here for a reason specific to RDX: "find the thing that changes when
+    I do X" is exactly what the unknown-value and relational scans exist to
+    serve. Shown on a window that is already being re-read on a timer, it
+    answers the same question at a glance, on one object, with no scan at all.
+
+    Returns an empty set when there is nothing to compare against, so a first
+    frame highlights nothing rather than everything.
+    """
+    if not previous or len(previous) != len(current):
+        return set()
+    return {i for i, (a, b) in enumerate(zip(previous, current)) if a != b}
+
+
+def _hex_fetch(ip: str, pid: int, base: int, length: int) -> tuple:
+    """Read a window. Returns (data, unreadable) and never raises.
+
+    Unmapped memory is normal while scrolling -- the viewer walks straight
+    off the end of a mapping -- so a failed read renders as '??' rather than
+    an error box the user has to dismiss on every keypress.
+    """
+    try:
+        data = ps5_read(ip, pid, base, length)
+        if len(data) < length:
+            data = data + b"\x00" * (length - len(data))
+            return data, False
+        return data, False
+    except Exception:
+        return b"\x00" * length, True
+
+
+def do_hex_view(stdscr, address: int) -> None:
+    """Read-only hex dump anchored at `address`."""
+    if state.get("pid") is None:
+        message_box(stdscr, ["Attach to a process first."], "Hex View", C_WARN)
+        return
+    anchor = int(address)
+    base = anchor - (anchor % _HEX_BYTES_PER_ROW)
+    data, unreadable = b"", True
+    window_base = None
+    last_read = 0.0
+    previous_data = None
+    changed = set()
+    highlight = True
+
+    stdscr.nodelay(True)
+    try:
+        while True:
+            now = time.time()
+            h, w = stdscr.getmaxyx()
+            visible = max(1, h - 7)
+            span = visible * _HEX_BYTES_PER_ROW
+            need_refetch = (window_base != base
+                            or now - last_read >= _HEX_REFRESH_INTERVAL)
+            if need_refetch:
+                fresh, unreadable = _hex_fetch(
+                    state["ip"], int(state["pid"]), base, span)
+                # Only diff against the same window: scrolling is not a change.
+                changed = (_hex_changed_offsets(previous_data, fresh)
+                           if (highlight and window_base == base
+                               and not unreadable) else set())
+                previous_data, data = fresh, fresh
+                window_base, last_read = base, now
+
+            stdscr.clear()
+            draw_border(stdscr, f"HEX VIEW  {hex(base)}  (read-only)")
+            safe_addstr(stdscr, 2, 3,
+                        f"Process {state['proc_name']} (PID {state['pid']})"
+                        f"   anchor {hex(anchor)}",
+                        color(C_NORM))
+            if unreadable:
+                safe_addstr(stdscr, 2, max(3, w - 26), "UNREADABLE REGION",
+                            color(C_ERR) | curses.A_BOLD)
+            safe_addstr(stdscr, 3, 3,
+                        # Kept under 72 columns: safe_addstr clips, and the
+                        # longer form lost "Q back" at the documented minimum
+                        # terminal size.
+                        "↑↓/jk row  a addr  n anchor  s struct  "
+                        "b mark  c changes  Q back",
+                        color(C_NORM))
+
+            for i, (row_addr, hex_col, ascii_col) in enumerate(
+                    _hex_render_rows(base, data, unreadable)[:visible]):
+                on_anchor = row_addr <= anchor < row_addr + _HEX_BYTES_PER_ROW
+                attr = (color(C_ACC) | curses.A_BOLD if on_anchor
+                        else color(C_ERR) if unreadable else color(C_NORM))
+                y = 5 + i
+                row_off = row_addr - base
+                safe_addstr(stdscr, y, 2, f"{row_addr:016X} ", attr)
+                # Per-byte so a changed byte can be picked out of its row.
+                # Drawn as segments rather than one string; 16 writes a row is
+                # nothing next to the network read that produced the row.
+                for b in range(_HEX_BYTES_PER_ROW):
+                    x = 2 + 17 + b * 3
+                    if x + 2 >= w - 2:
+                        break
+                    cell = hex_col[b * 3:b * 3 + 2]
+                    hot = (row_off + b) in changed
+                    safe_addstr(stdscr, y, x, cell,
+                                color(C_WARN) | curses.A_BOLD if hot else attr)
+                ax = 2 + 17 + _HEX_BYTES_PER_ROW * 3
+                if ax + _HEX_BYTES_PER_ROW + 2 < w - 2:
+                    safe_addstr(stdscr, y, ax, "|", attr)
+                    for b, ch in enumerate(ascii_col):
+                        hot = (row_off + b) in changed
+                        safe_addstr(stdscr, y, ax + 1 + b, ch,
+                                    color(C_WARN) | curses.A_BOLD if hot
+                                    else attr)
+                    safe_addstr(stdscr, y, ax + 1 + len(ascii_col), "|", attr)
+
+            age = int(now - last_read)
+            draw_statusbar(stdscr, [
+                (f"{hex(base)}", C_WARN), ("↑↓/jk", C_NORM),
+                ("a address", C_ACC), ("n anchor", C_ACC),
+                ("b bookmark", C_OK), ("Esc/Q back", C_NORM),
+                (f"{len(changed)} changed" if changed else
+                 "changes on" if highlight else "changes off",
+                 C_WARN if changed else C_NORM),
+                ("?? unreadable" if unreadable else f"~{age}s old",
+                 C_ERR if unreadable else C_NORM),
+            ])
+            stdscr.refresh()
+
+            key = stdscr.getch()
+            if key == -1:
+                time.sleep(0.05)
+                continue
+            if key == curses.KEY_RESIZE:
+                curses.update_lines_cols(); window_base = None; continue
+            if key in (curses.KEY_UP, ord('k')):
+                base = max(0, base - _HEX_BYTES_PER_ROW)
+            elif key in (curses.KEY_DOWN, ord('j')):
+                base += _HEX_BYTES_PER_ROW
+            elif key == curses.KEY_PPAGE:
+                base = max(0, base - span)
+            elif key == curses.KEY_NPAGE:
+                base += span
+            elif key in (ord('n'), ord('N')):
+                base = anchor - (anchor % _HEX_BYTES_PER_ROW)
+            elif key in (ord('c'), ord('C')):
+                highlight = not highlight
+                if not highlight:
+                    changed = set()
+            elif key in (ord('s'), ord('S')):
+                stdscr.nodelay(False)
+                do_structure_view(stdscr, base)
+                stdscr.nodelay(True)
+            elif key in (ord('b'), ord('B')):
+                add_log(_add_bookmark(base, _current_scan_type()))
+            elif key in (ord('a'), ord('A')):
+                stdscr.nodelay(False)
+                raw = input_box(stdscr, "Go to address: ", h - 2, 3, 20,
+                                hex(base), allow_cancel=True,
+                                cancel_with_q=False)
+                stdscr.nodelay(True)
+                if raw:
+                    try:
+                        target = int(str(raw).strip(), 0)
+                        base = max(0, target - (target % _HEX_BYTES_PER_ROW))
+                    except ValueError:
+                        add_log(f"Not an address: {raw}", "warn")
+            elif key in (ord('q'), ord('Q'), 27):
+                return
+    finally:
+        stdscr.nodelay(False)
+
+
+# ── structure view ────────────────────────────────────────────────────────────
+# The second half of the memory-viewer gap. PINCE describes it as "define and
+# view memory structures with named, typed members, and overlay them on any
+# address"; Cheat Engine reaches the same thing as Ctrl+D from a memory record.
+#
+# It earns its place in RDX for the same reason the hex pane did: chains are
+# expressed as [base+0x18]-0x10, so the question the user actually has is
+# "what lives at this base, and which field is mine". A hex dump answers that
+# in bytes; a structure answers it in fields.
+#
+# Auto-dissect classifies each aligned slot by what its bytes could plausibly
+# be, checking candidate pointers against the live memory map. It is a
+# starting point the user then names and corrects, not an authority -- an
+# integer that happens to look like a mapped address is indistinguishable from
+# a pointer at this level, and is labelled the way it reads.
+_STRUCT_DEFAULT_SPAN = 0x80         # bytes dissected by default
+_STRUCT_MAX_SPAN = 0x400
+# Structure layouts are remembered per base address so field names survive
+# leaving and re-entering the screen. Nothing bounded that dict: Type Scan can
+# hand back 4096 instances, and walking them with S left one entry each, every
+# entry holding up to _STRUCT_MAX_SPAN/4 field dicts. Oldest-out keeps the
+# convenience without the unbounded session growth.
+_STRUCT_MAX_REMEMBERED = 64
+
+
+def _remember_structure(base: int, fields: list) -> None:
+    """Store a layout for `base`, evicting the oldest beyond the cap."""
+    layouts = state.setdefault("structures", {})
+    layouts[int(base)] = fields
+    while len(layouts) > _STRUCT_MAX_REMEMBERED:
+        # dicts preserve insertion order, so the first key is the oldest.
+        layouts.pop(next(iter(layouts)))
+_STRUCT_TYPES = ("u64", "i64", "u32", "i32", "u16", "i16", "u8", "i8",
+                 "f32", "f64", "ptr", "bytes")
+
+
+def _struct_slot_type(raw: bytes, offset: int, maps: list,
+                      region_starts=None, region_rows=None) -> str:
+    """Classify one 8-byte-aligned slot by what its bytes plausibly are."""
+    chunk = raw[offset:offset + 8]
+    if len(chunk) < 8:
+        return "u32" if len(chunk) >= 4 else "u8"
+    qword = int.from_bytes(chunk, "little")
+    # A value that resolves inside a mapped region is far more likely to be a
+    # pointer than a coincidental integer of that magnitude.
+    if qword and _ADDR_MIN <= qword <= _ADDR_MAX and maps:
+        if region_starts is not None:
+            if _region_for_addr(qword, region_starts, region_rows):
+                return "ptr"
+        elif any(int(r.get("start", 0)) <= qword < int(r.get("end", 0))
+                 for r in maps):
+            return "ptr"
+    dword = int.from_bytes(chunk[:4], "little")
+    if dword:
+        as_float = struct.unpack("<f", chunk[:4])[0]
+        # Game floats are overwhelmingly modest magnitudes; the exponent test
+        # rejects the denormal/huge patterns that arbitrary integers produce.
+        if (as_float == as_float                      # not NaN
+                and abs(as_float) not in (float("inf"),)
+                and 1e-4 < abs(as_float) < 1e9):
+            return "f32"
+    return "u32"
+
+
+def _struct_auto_fields(raw: bytes, maps: Optional[list] = None) -> list:
+    """Propose a field list for a freshly-read window."""
+    maps = maps or []
+    region_starts, region_rows = (_build_region_lookup(maps) if maps
+                                  else (None, None))
+    fields = []
+    offset = 0
+    while offset + 8 <= len(raw):
+        kind = _struct_slot_type(raw, offset, maps, region_starts, region_rows)
+        fields.append({"offset": offset, "name": f"field_{offset:04X}",
+                       "type": kind})
+        # A pointer occupies the whole qword; everything else is read as a
+        # 4-byte slot so adjacent 32-bit fields stay separately addressable.
+        offset += 8 if kind == "ptr" else 4
+    return fields
+
+
+_STRUCT_TYPE_WIDTH = {
+    "u64": 8, "i64": 8, "f64": 8, "ptr": 8,
+    "u32": 4, "i32": 4, "f32": 4,
+    "u16": 2, "i16": 2,
+    "u8": 1, "i8": 1,
+    # A one-byte "bytes" field was useless: the type is offered in the picker
+    # and rendered a single pair of hex digits. A short run is what anyone
+    # selecting it actually wants to see.
+    "bytes": 8,
+}
+
+
+def _struct_field_width(field: dict) -> int:
+    """Bytes one field occupies. Shared so change-detection and rendering
+    cannot disagree about how much memory a field covers."""
+    return _STRUCT_TYPE_WIDTH.get(str(field.get("type", "u32")), 4)
+
+
+def _struct_field_value(raw: bytes, field: dict) -> str:
+    """Render one field's current value from an already-read window."""
+    offset = int(field.get("offset", 0))
+    kind = str(field.get("type", "u32"))
+    width = _struct_field_width(field)
+    chunk = raw[offset:offset + width]
+    if len(chunk) < width:
+        return "??"
+    try:
+        if kind == "ptr":
+            return hex(int.from_bytes(chunk, "little"))
+        if kind == "bytes":
+            return " ".join(f"{b:02X}" for b in chunk)
+        return _format_typed_value(
+            _unpack_typed_value(chunk, kind, width), kind, width)
+    except Exception:
+        return "??"
+
+
+# ── IL2CPP symbol import ──────────────────────────────────────────────────────
+# The structure view names fields field_0014 because auto-dissect can only
+# infer from bytes. Il2CppDumper already knows the answer: for a Unity IL2CPP
+# title it emits dump.cs (classes and fields with reconstructed names and
+# offsets) and il2cpp.h (C struct definitions). Loading one replaces the
+# generated names with real ones and, more usefully, gives each slot a
+# *declared* type -- strictly better than the heuristic, because an integer
+# that happens to look like a mapped address is indistinguishable from a
+# pointer by inspection and is not by declaration.
+#
+# Scope is deliberately narrow: RDX imports a dump the user already has. It
+# does not produce one -- that needs the title's global-metadata.dat and IL2CPP
+# binary extracted from the game, which is a user-side step and not something a
+# memory scanner should be doing. With no symbols loaded the structure view
+# behaves exactly as it did before, so this is purely additive.
+_SYMBOL_MAX_CLASSES = 20_000
+_SYMBOL_MAX_FIELDS = 512          # per class
+
+# dump.cs field line, e.g.
+#   public int currentHealth; // 0x18
+#   private static readonly System.String Name; // 0x0
+_DUMPCS_CLASS_RE = re.compile(
+    r'^\s*(?:\[[^\]]*\]\s*)*'
+    r'(?:public|private|protected|internal)?\s*'
+    r'(?:static\s+|sealed\s+|abstract\s+|partial\s+|readonly\s+)*'
+    r'(?:class|struct)\s+([A-Za-z_][\w.<>`]*)')
+_DUMPCS_FIELD_RE = re.compile(
+    r'^\s*(?:\[[^\]]*\]\s*)*'
+    r'(?:public|private|protected|internal)\s+'
+    r'(?:static\s+|readonly\s+|const\s+|volatile\s+)*'
+    r'([\w.<>\[\]`,]+)\s+([A-Za-z_]\w*)\s*;\s*//\s*(0x[0-9A-Fa-f]+)')
+
+# Map IL2CPP/C# declared types onto RDX's structure field kinds.
+_IL2CPP_TYPE_MAP = {
+    "byte": "u8", "sbyte": "i8", "bool": "u8", "char": "u16",
+    "short": "i16", "ushort": "u16",
+    "int": "i32", "uint": "u32", "Int32": "i32", "UInt32": "u32",
+    "long": "i64", "ulong": "u64", "Int64": "i64", "UInt64": "u64",
+    "float": "f32", "Single": "f32",
+    "double": "f64", "Double": "f64",
+    "System.Int32": "i32", "System.UInt32": "u32",
+    "System.Single": "f32", "System.Double": "f64",
+    "System.Boolean": "u8", "System.Byte": "u8",
+    "System.Int64": "i64", "System.UInt64": "u64",
+}
+
+
+def _il2cpp_field_kind(declared: str) -> str:
+    """RDX structure type for one declared C# type.
+
+    Anything not a known value type is a managed reference, which in memory is
+    a pointer -- that is the case worth getting right, because it is exactly
+    what auto-dissect guesses at.
+    """
+    name = str(declared or "").strip()
+    if name in _IL2CPP_TYPE_MAP:
+        return _IL2CPP_TYPE_MAP[name]
+    short = name.rsplit(".", 1)[-1]
+    if short in _IL2CPP_TYPE_MAP:
+        return _IL2CPP_TYPE_MAP[short]
+    return "ptr"
+
+
+def parse_il2cpp_dump(text: str, cancel_event=None, progress_cb=None) -> dict:
+    """Parse Il2CppDumper `dump.cs` into {class_name: [field, ...]}.
+
+    Fields carry the same shape the structure view already uses
+    ({offset, name, type}) so they can be dropped straight in.
+
+    Takes a cancel event and progress callback because a real dump.cs for a
+    large title runs to tens of megabytes and this parses at roughly 10 MB/s
+    -- long enough that running it inline froze the terminal with no feedback,
+    which is not how any other long operation in RDX behaves.
+    """
+    classes: dict = {}
+    current = None
+    lines = str(text).splitlines()
+    total = max(len(lines), 1)
+    for index, line in enumerate(lines):
+        if cancel_event is not None and (index & 0x3FF) == 0:
+            if cancel_event.is_set():
+                raise InterruptedError("symbol parse cancelled")
+            if progress_cb:
+                progress_cb(index, total)
+        class_match = _DUMPCS_CLASS_RE.match(line)
+        if class_match:
+            if len(classes) >= _SYMBOL_MAX_CLASSES:
+                break
+            current = class_match.group(1)
+            classes.setdefault(current, [])
+            continue
+        if current is None:
+            continue
+        field_match = _DUMPCS_FIELD_RE.match(line)
+        if not field_match:
+            continue
+        declared, name, offset_hex = field_match.groups()
+        fields = classes[current]
+        if len(fields) >= _SYMBOL_MAX_FIELDS:
+            continue
+        try:
+            offset = int(offset_hex, 16)
+        except ValueError:
+            continue
+        fields.append({"offset": offset, "name": name,
+                       "type": _il2cpp_field_kind(declared),
+                       "declared": declared})
+    # Drop classes that yielded no located fields; they cannot overlay anything.
+    return {k: sorted(v, key=lambda f: f["offset"])
+            for k, v in classes.items() if v}
+
+
+def _symbol_class_names() -> list:
+    return sorted(state.get("symbols", {}).keys())
+
+
+def do_load_symbols(stdscr) -> None:
+    """Load an Il2CppDumper dump.cs for use by the structure view."""
+    stdscr.clear()
+    draw_border(stdscr, "LOAD SYMBOLS")
+    safe_addstr(stdscr, 2, 3,
+                "Loads an Il2CppDumper dump.cs so the structure view can use",
+                color(C_NORM))
+    safe_addstr(stdscr, 3, 3,
+                "real class and field names instead of field_0014.",
+                color(C_NORM))
+    safe_addstr(stdscr, 5, 3,
+                "RDX does not produce the dump — run Il2CppDumper against the",
+                color(C_WARN))
+    safe_addstr(stdscr, 6, 3,
+                "title's IL2CPP binary and global-metadata.dat yourself.",
+                color(C_WARN))
+    raw_path = input_box(stdscr, "dump.cs path: ", 8, 3, 70,
+                         state.get("export_dir", str(Path.home())),
+                         allow_cancel=True, cancel_with_q=False)
+    if raw_path is None:
+        return
+    path = Path(raw_path).expanduser()
+    if not path.exists() or not path.is_file():
+        message_box(stdscr, [f"File not found: {path}"], "Load Symbols", C_ERR)
+        return
+    try:
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError as exc:
+        message_box(stdscr, [f"Could not read: {exc}"], "Load Symbols", C_ERR)
+        return
+    cancel_event = threading.Event()
+    progress = {"done": 0, "total": 1, "results": None, "error": None}
+
+    def worker():
+        try:
+            progress["results"] = parse_il2cpp_dump(
+                text, cancel_event,
+                lambda d, t: progress.update(done=d, total=max(t, 1)))
+        except InterruptedError:
+            progress["error"] = "cancelled"
+        except Exception as exc:
+            progress["error"] = str(exc)
+
+    if not _run_scan_with_progress(stdscr, worker, "Parsing dump.cs",
+                                   cancel_event, progress):
+        return
+    if progress["error"]:
+        if progress["error"] != "cancelled":
+            message_box(stdscr, [f"Could not parse dump.cs: {progress['error']}"],
+                        "Load Symbols", C_ERR)
+        return
+    classes = progress["results"] or {}
+    if not classes:
+        message_box(stdscr,
+                    ["No classes with located fields were found.",
+                     "",
+                     "This does not look like an Il2CppDumper dump.cs, or it",
+                     "was produced without DumpFieldOffset enabled."],
+                    "Load Symbols", C_WARN)
+        return
+    state["symbols"] = classes
+    total_fields = sum(len(v) for v in classes.values())
+    add_log(f"Symbols loaded: {len(classes)} class(es), "
+            f"{total_fields} located field(s) from {path.name}")
+    message_box(stdscr,
+                [f"Loaded {len(classes)} class(es), {total_fields} field(s).",
+                 "",
+                 "In the structure view press Y to overlay a class."],
+                "Symbols Loaded", C_OK)
+
+
+def _pick_symbol_class(stdscr) -> Optional[str]:
+    """Filterable class picker for the structure view's Y action."""
+    names = _symbol_class_names()
+    if not names:
+        message_box(stdscr,
+                    ["No symbols loaded.",
+                     "",
+                     "Use the command palette -> Load Symbols to load an",
+                     "Il2CppDumper dump.cs first."],
+                    "Structure", C_WARN)
+        return None
+    query, sel = "", 0
+    while True:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        draw_border(stdscr, f"OVERLAY CLASS  ({len(names)} loaded)")
+        safe_addstr(stdscr, 2, 3, f"> {query}_", color(C_ACC) | curses.A_BOLD)
+        matches = [n for n in names if query.lower() in n.lower()]
+        visible = max(1, min(14, h - 7))
+        if matches:
+            sel = min(sel, len(matches) - 1)
+            for i, name in enumerate(matches[:visible]):
+                attr = (color(C_SEL) | curses.A_BOLD if i == sel
+                        else color(C_NORM))
+                count = len(state.get("symbols", {}).get(name, ()))
+                safe_addstr(stdscr, 4 + i, 4,
+                            f"{'▶ ' if i == sel else '  '}{name}  "
+                            f"({count} fields)"[:w - 8], attr)
+        else:
+            safe_addstr(stdscr, 4, 4, "No matching class.", color(C_WARN))
+        draw_statusbar(stdscr, [("type to filter", C_WARN), ("↑↓", C_NORM),
+                                ("Enter overlay", C_OK), ("Esc cancel", C_NORM)])
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key == curses.KEY_RESIZE:
+            curses.update_lines_cols(); continue
+        if key == 27:
+            # Same rule as the other filtered screens: 'q' is query text here.
+            return None
+        if key == curses.KEY_UP:
+            sel = max(0, sel - 1)
+        elif key == curses.KEY_DOWN:
+            sel = min(max(len(matches) - 1, 0), sel + 1)
+        elif key in (curses.KEY_ENTER, 10, 13) and matches:
+            return matches[sel]
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            query = query[:-1]; sel = 0
+        elif 32 <= key <= 126:
+            query += chr(key); sel = 0
+
+
+def _struct_pointer_target(field: dict, raw: bytes,
+                           maps: Optional[list] = None,
+                           region_starts=None, region_rows=None) -> str:
+    """Describe where a pointer field points, for the structure view.
+
+    ReClass.NET calls this Pointer Preview. It matters more here than the
+    feature name suggests: telling a real object pointer from an integer that
+    happens to look like a mapped address is the hardest judgement in RDX's
+    whole pointer workflow, and the one _PTR_FAST_DIRECT_RANGE's comment block
+    documents getting wrong twice. The region a pointer lands in is the cheap
+    half of that judgement and needs no network read.
+    """
+    if str(field.get("type")) != "ptr":
+        return ""
+    offset = int(field.get("offset", 0))
+    chunk = raw[offset:offset + 8]
+    if len(chunk) < 8:
+        return ""
+    value = int.from_bytes(chunk, "little")
+    if not value:
+        return "NULL"
+    region = None
+    if region_starts is not None:
+        region = _region_for_addr(value, region_starts, region_rows)
+    elif maps:
+        region = next((r for r in maps
+                       if int(r.get("start", 0)) <= value < int(r.get("end", 0))),
+                      None)
+    if region is None:
+        # Points nowhere mapped: almost certainly not a pointer at all.
+        return "unmapped"
+    name = str(region.get("name", "") or "anon").rsplit("/", 1)[-1]
+    return f"-> {name}+{value - int(region.get('start', 0)):#x}"
+
+
+def do_structure_view(stdscr, address: int) -> None:
+    """Overlay a named, typed field list on `address`."""
+    if state.get("pid") is None:
+        message_box(stdscr, ["Attach to a process first."], "Structure", C_WARN)
+        return
+    base = int(address)
+    span = _STRUCT_DEFAULT_SPAN
+    fields = state.setdefault("structures", {}).get(base)
+    raw, unreadable = _hex_fetch(state["ip"], int(state["pid"]), base, span)
+    if fields is None:
+        try:
+            maps = _get_maps_cached(state["ip"], int(state["pid"]))
+        except Exception:
+            maps = []
+        fields = _struct_auto_fields(raw, maps)
+        _remember_structure(base, fields)
+    sel = 0
+    last_read = time.time()
+    previous_raw = None
+    changed_fields: set = set()
+    highlight = True
+    overlay_class = None
+    try:
+        struct_maps = _get_maps_cached(state["ip"], int(state["pid"]))
+    except Exception:
+        struct_maps = []
+    region_starts, region_rows = (_build_region_lookup(struct_maps)
+                                  if struct_maps else (None, None))
+
+    stdscr.nodelay(True)
+    try:
+        while True:
+            now = time.time()
+            if now - last_read >= 1.0:
+                fresh, unreadable = _hex_fetch(
+                    state["ip"], int(state["pid"]), base, span)
+                if highlight and not unreadable:
+                    byte_changes = _hex_changed_offsets(previous_raw, fresh)
+                    # A field is changed if any byte it covers moved.
+                    # The field's own width, not a flat 8 bytes. With a flat
+                    # span two adjacent u8 fields both lit up when one byte
+                    # moved, and a symbol-overlaid class of 32-bit fields lit
+                    # up two rows per change.
+                    changed_fields = {
+                        int(f["offset"]) for f in fields
+                        if any(o in byte_changes
+                               for o in range(int(f["offset"]),
+                                              int(f["offset"])
+                                              + _struct_field_width(f)))}
+                else:
+                    changed_fields = set()
+                previous_raw, raw = fresh, fresh
+                last_read = now
+            h, w = stdscr.getmaxyx()
+            stdscr.clear()
+            draw_border(stdscr,
+                    f"STRUCTURE  {hex(base)}"
+                    + (f"  [{overlay_class}]" if overlay_class else "")
+                    + "  (read-only)")
+            safe_addstr(stdscr, 2, 3,
+                        f"{len(fields)} field(s) over {span} bytes"
+                        f"   {state['proc_name']} (PID {state['pid']})",
+                        color(C_ERR) if unreadable else color(C_NORM))
+            safe_addstr(stdscr, 3, 3,
+                        "Enter rename  T type  +/- span  R re-dissect  "
+                        "C changes  Y symbols  H hex  Q back", color(C_NORM))
+            visible = max(1, h - 7)
+            sel = max(0, min(sel, max(0, len(fields) - 1)))
+            start = max(0, sel - visible // 2)
+            for i, field in enumerate(fields[start:start + visible]):
+                idx = start + i
+                hot = int(field["offset"]) in changed_fields
+                attr = (color(C_SEL) | curses.A_BOLD if idx == sel
+                        else color(C_WARN) | curses.A_BOLD if hot
+                        else color(C_ACC) if field["type"] == "ptr"
+                        else color(C_NORM))
+                target = _struct_pointer_target(
+                    field, raw, struct_maps, region_starts, region_rows)
+                line = (f"{'>' if idx == sel else ' '}"
+                        f"{'*' if hot else ' '}"
+                        f"+{int(field['offset']):04X}  "
+                        f"{str(field['type']):<6} "
+                        f"{str(field['name'])[:22]:<22} "
+                        f"{_struct_field_value(raw, field)}"
+                        f"{'  ' + target if target else ''}")
+                safe_addstr(stdscr, 5 + i, 2, line[:w - 4].ljust(w - 4), attr)
+            draw_statusbar(stdscr, [("↑↓ / jk", C_NORM), ("Enter rename", C_OK),
+                                    ("T type", C_ACC), ("R re-dissect", C_WARN),
+                                    (f"{len(changed_fields)} changed"
+                                     if changed_fields else
+                                     "changes on" if highlight
+                                     else "changes off",
+                                     C_WARN if changed_fields else C_NORM),
+                                    ("H hex", C_NORM), ("Esc/Q back", C_NORM)])
+            stdscr.refresh()
+
+            key = stdscr.getch()
+            if key == -1:
+                time.sleep(0.05); continue
+            if key == curses.KEY_RESIZE:
+                curses.update_lines_cols(); continue
+            if key in (curses.KEY_UP, ord('k')):
+                sel = max(0, sel - 1)
+            elif key in (curses.KEY_DOWN, ord('j')):
+                sel = min(max(0, len(fields) - 1), sel + 1)
+            elif key == ord('g'):
+                sel = 0
+            elif key == ord('G'):
+                sel = max(0, len(fields) - 1)
+            elif key in (ord('y'), ord('Y')):
+                stdscr.nodelay(False)
+                chosen = _pick_symbol_class(stdscr)
+                stdscr.nodelay(True)
+                if chosen:
+                    # Replace the guessed layout wholesale. A declared field
+                    # list is better information than auto-dissect can infer,
+                    # so merging the two would only reintroduce guesses.
+                    symbol_fields = [dict(f) for f in
+                                     state.get("symbols", {}).get(chosen, ())]
+                    if symbol_fields:
+                        fields = symbol_fields
+                        _remember_structure(base, fields)
+                        overlay_class = chosen
+                        sel = 0
+                        changed_fields = set()
+                        add_log(f"Overlaid {chosen} ({len(fields)} fields) "
+                                f"at {hex(base)}")
+            elif key in (ord('c'), ord('C')):
+                highlight = not highlight
+                if not highlight:
+                    changed_fields = set()
+            elif key in (ord('h'), ord('H')):
+                stdscr.nodelay(False)
+                do_hex_view(stdscr, base + int(fields[sel]["offset"])
+                            if fields else base)
+                stdscr.nodelay(True)
+            elif key in (ord('+'), ord('=')):
+                span = min(_STRUCT_MAX_SPAN, span * 2); last_read = 0.0
+            elif key == ord('-'):
+                span = max(0x20, span // 2); last_read = 0.0
+            elif key in (ord('r'), ord('R')):
+                stdscr.nodelay(False)
+                if confirm_box(stdscr,
+                               "Re-dissect this address? Field names you have "
+                               "set will be lost.", "Re-dissect"):
+                    try:
+                        maps = _get_maps_cached(state["ip"], int(state["pid"]))
+                    except Exception:
+                        maps = []
+                    raw, unreadable = _hex_fetch(
+                        state["ip"], int(state["pid"]), base, span)
+                    fields = _struct_auto_fields(raw, maps)
+                    _remember_structure(base, fields)
+                stdscr.nodelay(True)
+            elif key in (curses.KEY_ENTER, 10, 13) and fields:
+                stdscr.nodelay(False)
+                name = input_box(stdscr, "Field name: ", h - 2, 3, 24,
+                                 str(fields[sel]["name"]), allow_cancel=True,
+                                 cancel_with_q=False)
+                stdscr.nodelay(True)
+                if name:
+                    fields[sel]["name"] = str(name)[:32]
+            elif key in (ord('t'), ord('T')) and fields:
+                stdscr.nodelay(False)
+                chosen = cycle_input(stdscr, "Field type: ", h - 2, 3,
+                                     list(_STRUCT_TYPES),
+                                     str(fields[sel]["type"]),
+                                     allow_cancel=True)
+                stdscr.nodelay(True)
+                if chosen:
+                    fields[sel]["type"] = chosen
+            elif key in (ord('q'), ord('Q'), 27):
+                return
+    finally:
+        stdscr.nodelay(False)
+
+
 def _inspect_result(stdscr, addr: int, live_value: str = "…") -> None:
     """Compact address inspector; keeps common actions one screen away."""
     while True:
@@ -10747,8 +13289,12 @@ def _inspect_result(stdscr, addr: int, live_value: str = "…") -> None:
         safe_addstr(stdscr, 9, 5, "C  Create cheat", color(C_OK))
         safe_addstr(stdscr, 10, 5, "P  Find permanent pointer", color(C_ACC))
         safe_addstr(stdscr, 11, 5, "D  Drop result", color(C_ERR))
+        safe_addstr(stdscr, 12, 5, "H  Hex view (read-only)", color(C_NORM))
+        safe_addstr(stdscr, 14, 5, "S  Structure view", color(C_NORM))
+        safe_addstr(stdscr, 13, 5, "B  Bookmark", color(C_NORM))
         draw_statusbar(stdscr, [("A apply", C_OK), ("C cheat", C_OK),
-                                ("P permanent", C_ACC), ("D drop", C_ERR),
+                                ("P permanent", C_ACC), ("H hex", C_NORM),
+                                ("B bookmark", C_OK), ("D drop", C_ERR),
                                 ("Esc/Q back", C_NORM)])
         stdscr.refresh()
         key = stdscr.getch()
@@ -10787,6 +13333,12 @@ def _inspect_result(stdscr, addr: int, live_value: str = "…") -> None:
                     if len(raw) == width else "?")
             except Exception:
                 live_value = "?"
+        elif key in (ord('h'), ord('H')):
+            do_hex_view(stdscr, addr)
+        elif key in (ord('s'), ord('S')):
+            do_structure_view(stdscr, addr)
+        elif key in (ord('b'), ord('B')):
+            add_log(_add_bookmark(addr, type_key))
         elif key in (ord('c'), ord('C')):
             _add_cheat_at(stdscr, addr)
             return
@@ -10801,16 +13353,9 @@ def _inspect_result(stdscr, addr: int, live_value: str = "…") -> None:
             # not sorted, so it returned an index belonging to a different
             # address and np.delete silently desynchronised scan_values from
             # scan_results for every later relational scan.
-            try:
-                hits = np.flatnonzero(np.asarray(old_results) == np.uint64(addr))
-                drop_idx = int(hits[0]) if len(hits) else -1
-            except Exception:
-                drop_idx = -1
-            state["scan_results"] = _make_addr_array(a for a in old_results if int(a) != addr)
-            if old_values is not None and 0 <= drop_idx < len(old_values):
-                state["scan_values"] = np.delete(old_values, drop_idx)
-            state["scan_dropped"].add(addr)
-            _close_turbo_session()   # see the Results drop handler
+            # drop_address keeps the parallel previous-value array aligned
+            # and closes the resident session; see ScanState.drop_index.
+            scan.drop_address(addr)
             add_log(f"Dropped result {hex(addr)}", "warn")
             return
 
@@ -11117,6 +13662,249 @@ def _inspect_cheat(stdscr, idx: int) -> None:
                 return
 
 
+def do_type_scan(stdscr) -> None:
+    """Find live objects grouped by the type pointer at their base."""
+    if state.get("pid") is None:
+        message_box(stdscr, ["Attach to a process first."], "Type Scan", C_WARN)
+        return
+    stdscr.clear()
+    draw_border(stdscr, "TYPE SCAN")
+    safe_addstr(stdscr, 2, 3,
+                "Groups heap objects by the type pointer at their base.",
+                color(C_NORM))
+    safe_addstr(stdscr, 3, 3,
+                "For IL2CPP titles that is the Il2CppClass pointer, so each "
+                "group is one class.", color(C_NORM))
+    safe_addstr(stdscr, 4, 3, "Read-only: nothing is written.", color(C_OK))
+    raw_min = input_box(stdscr, "Minimum instances: ", 6, 3, 8,
+                        str(_TYPE_SCAN_MIN_INSTANCES), allow_cancel=True,
+                        cancel_with_q=False)
+    if raw_min is None:
+        return
+    try:
+        min_instances = max(2, int(str(raw_min).strip(), 0))
+    except ValueError:
+        message_box(stdscr, [f"Not a number: {raw_min}"], "Type Scan", C_ERR)
+        return
+
+    cancel_event = threading.Event()
+    progress = {"done": 0, "total": 1, "results": None, "error": None}
+
+    def worker():
+        try:
+            progress["results"] = scan_type_instances(
+                state["ip"], int(state["pid"]), min_instances,
+                cancel_event,
+                lambda d, t: progress.update(done=d, total=max(t, 1)))
+        except InterruptedError:
+            progress["error"] = "cancelled"
+        except Exception as exc:
+            progress["error"] = str(exc)
+
+    if not _run_scan_with_progress(stdscr, worker, "Scanning heap for types",
+                                   cancel_event, progress):
+        return
+    if progress["error"]:
+        message_box(stdscr, [f"Type scan failed: {progress['error']}"],
+                    "Type Scan", C_ERR)
+        return
+    groups = progress["results"] or []
+    if not groups:
+        message_box(stdscr,
+                    ["No type pointers found.",
+                     "",
+                     "Either the title does not use a type-pointer layout,",
+                     "or the minimum instance count is too high."],
+                    "Type Scan", C_WARN)
+        return
+
+    sel = 0
+    while True:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        draw_border(stdscr, f"TYPES  ({len(groups)} found)")
+        safe_addstr(stdscr, 2, 3,
+                    "Enter open instances   S structure view   Q back",
+                    color(C_NORM))
+        visible = max(1, h - 7)
+        sel = max(0, min(sel, len(groups) - 1))
+        start = max(0, sel - visible // 2)
+        for i, group in enumerate(groups[start:start + visible]):
+            idx = start + i
+            attr = (color(C_SEL) | curses.A_BOLD if idx == sel
+                    else color(C_NORM))
+            module = group.get("module_name") or "?"
+            rel = group.get("module_relative_offset")
+            where = (f"{module}+{rel:#x}" if rel is not None else module)
+            line = (f"{'>' if idx == sel else ' '} "
+                    f"{group['count']:>7,} x  "
+                    f"{hex(group['type_ptr']):<18} {where}")
+            safe_addstr(stdscr, 4 + i, 2, line[:w - 4].ljust(w - 4), attr)
+        draw_statusbar(stdscr, [("↑↓ / jk", C_NORM),
+                                ("Enter instances", C_OK),
+                                ("S structure", C_ACC), ("Esc/Q back", C_NORM)])
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key == curses.KEY_RESIZE:
+            curses.update_lines_cols(); continue
+        if key in (curses.KEY_UP, ord('k')):
+            sel = max(0, sel - 1)
+        elif key in (curses.KEY_DOWN, ord('j')):
+            sel = min(len(groups) - 1, sel + 1)
+        elif key == ord('g'):
+            sel = 0
+        elif key == ord('G'):
+            sel = len(groups) - 1
+        elif key in (ord('s'), ord('S')):
+            instances = groups[sel]["instances"]
+            if len(instances):
+                do_structure_view(stdscr, int(instances[0]))
+        elif key in (curses.KEY_ENTER, 10, 13):
+            group = groups[sel]
+            instances = _make_addr_array(int(a) for a in group["instances"])
+            if not len(instances):
+                continue
+            if not confirm_box(
+                    stdscr,
+                    f"Load {len(instances):,} instance address(es) of "
+                    f"{hex(group['type_ptr'])} into Results?\n"
+                    "This replaces the current scan results.",
+                    "Open Instances"):
+                continue
+            # These are object bases, not values of the current scan type, so
+            # there is no meaningful previous-value array to carry. Switch the
+            # display type to u64 as well: left on u32 the Results screen
+            # renders the low half of each object's type pointer, which is a
+            # number that means nothing. As u64 every row shows the whole type
+            # pointer, identical down the list, which is a useful confirmation
+            # that these really are instances of one type.
+            state["scan_type"] = "u64"
+            state["scan_width"] = 8
+            scan.replace(instances, None)
+            add_log(f"Type scan: loaded {len(instances):,} instance(s) of "
+                    f"{hex(group['type_ptr'])} into Results; display type set "
+                    f"to u64 so each row shows its type pointer")
+            do_show_results(stdscr)
+            return
+        elif key in (ord('q'), ord('Q'), 27):
+            return
+
+
+def _dispatch_structure_view(stdscr) -> None:
+    """Palette entry: ask for a base address, then overlay a structure."""
+    if state.get("pid") is None:
+        message_box(stdscr, ["Attach to a process first."], "Structure", C_WARN)
+        return
+    seed = (hex(int(state["scan_results"][0]))
+            if len(state.get("scan_results", ())) else "0x0")
+    raw = input_box(stdscr, "Structure base address: ", 4, 3, 20, seed,
+                    allow_cancel=True, cancel_with_q=False)
+    if not raw:
+        return
+    try:
+        do_structure_view(stdscr, int(str(raw).strip(), 0))
+    except ValueError:
+        message_box(stdscr, [f"Not an address: {raw}"], "Structure", C_ERR)
+
+
+def _dispatch_hex_view(stdscr) -> None:
+    """Palette entry: ask for an address, then open the viewer there."""
+    if state.get("pid") is None:
+        message_box(stdscr, ["Attach to a process first."], "Hex View", C_WARN)
+        return
+    seed = (hex(int(state["scan_results"][0]))
+            if len(state.get("scan_results", ())) else "0x0")
+    raw = input_box(stdscr, "Hex view address: ", 4, 3, 20, seed,
+                    allow_cancel=True, cancel_with_q=False)
+    if not raw:
+        return
+    try:
+        do_hex_view(stdscr, int(str(raw).strip(), 0))
+    except ValueError:
+        message_box(stdscr, [f"Not an address: {raw}"], "Hex View", C_ERR)
+
+
+def do_bookmarks(stdscr) -> None:
+    """Addresses kept for investigation, separate from saved cheats."""
+    sel = 0
+    while True:
+        bookmarks = state.get("bookmarks", [])
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        draw_border(stdscr, f"BOOKMARKS  ({len(bookmarks)})")
+        if not bookmarks:
+            safe_addstr(stdscr, 3, 3, "No bookmarks yet.", color(C_WARN))
+            safe_addstr(stdscr, 5, 3,
+                        "Press B on a result or in the address inspector to",
+                        color(C_NORM))
+            safe_addstr(stdscr, 6, 3,
+                        "keep an address here without creating a cheat.",
+                        color(C_NORM))
+            draw_statusbar(stdscr, [("Esc/Q back", C_NORM)])
+            stdscr.refresh()
+            if stdscr.getch() in (ord('q'), ord('Q'), 27):
+                return
+            continue
+
+        sel = max(0, min(sel, len(bookmarks) - 1))
+        safe_addstr(stdscr, 2, 3,
+                    "Enter inspect   C promote to cheat   D delete   Q back",
+                    color(C_NORM))
+        visible = max(1, h - 7)
+        start = max(0, sel - visible // 2)
+        for i, bookmark in enumerate(bookmarks[start:start + visible]):
+            idx = start + i
+            stale = not _bookmark_is_current(bookmark)
+            attr = (color(C_SEL) | curses.A_BOLD if idx == sel
+                    else color(C_ERR) if stale else color(C_NORM))
+            note = bookmark.get("note", "")
+            flag = " STALE" if stale else ""
+            line = (f"{'>' if idx == sel else ' '} "
+                    f"{hex(int(bookmark['address'])):<18} "
+                    f"{bookmark['value_type']:<6}{flag:<7} {note}")
+            safe_addstr(stdscr, 4 + i, 2, line[:w - 4].ljust(w - 4), attr)
+
+        draw_statusbar(stdscr, [("↑↓ / jk", C_NORM), ("Enter inspect", C_OK),
+                                ("C cheat", C_OK), ("D delete", C_ERR),
+                                ("Esc/Q back", C_NORM)])
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key == curses.KEY_RESIZE:
+            curses.update_lines_cols(); continue
+        if key in (curses.KEY_UP, ord('k')):
+            sel = max(0, sel - 1)
+        elif key in (curses.KEY_DOWN, ord('j')):
+            sel = min(len(bookmarks) - 1, sel + 1)
+        elif key == ord('g'):
+            sel = 0
+        elif key == ord('G'):
+            sel = len(bookmarks) - 1
+        elif key in (curses.KEY_ENTER, 10, 13):
+            bookmark = bookmarks[sel]
+            if not _bookmark_is_current(bookmark):
+                message_box(stdscr,
+                            ["This bookmark was taken in a different process",
+                             "or console session, so its address no longer",
+                             "refers to the same thing. Delete it and scan again."],
+                            "Stale Bookmark", C_ERR)
+                continue
+            _inspect_result(stdscr, int(bookmark["address"]))
+        elif key in (ord('c'), ord('C')):
+            bookmark = bookmarks[sel]
+            if not _bookmark_is_current(bookmark):
+                message_box(stdscr, ["Stale bookmark — cannot become a cheat."],
+                            "Stale Bookmark", C_ERR)
+                continue
+            _add_cheat_at(stdscr, int(bookmark["address"]))
+        elif key in (ord('d'), ord('D')):
+            removed = _remove_bookmark(sel)
+            if removed:
+                add_log(f"Removed bookmark {hex(int(removed['address']))}")
+                sel = max(0, sel - 1)
+        elif key in (ord('q'), ord('Q'), 27):
+            return
+
+
 def do_cheat_list(stdscr) -> None:
     cheats      = state["cheats"]
     sel         = 0
@@ -11235,8 +14023,10 @@ def do_cheat_list(stdscr) -> None:
             if key == curses.KEY_RESIZE:
                 curses.update_lines_cols()
                 continue
-            if key == curses.KEY_UP    and sel > 0:               sel -= 1
-            elif key == curses.KEY_DOWN and sel < len(cheats) - 1: sel += 1
+            if key in (curses.KEY_UP, ord('k')) and sel > 0:               sel -= 1
+            elif key in (curses.KEY_DOWN, ord('j')) and sel < len(cheats) - 1: sel += 1
+            elif key == ord('g') and cheats:                       sel = 0
+            elif key == ord('G') and cheats:                       sel = len(cheats) - 1
             elif key in (curses.KEY_ENTER, 10, 13) and cheats:
                 stdscr.nodelay(False)
                 _inspect_cheat(stdscr, sel)
@@ -11506,23 +14296,36 @@ def _do_import_static_patch_mods(stdscr, path: Path, mods: list,
         "Import Complete", C_OK)
 
 
-def _do_import_mc4(stdscr, path: Path) -> None:
+def _do_import_mc4(stdscr, path: Path, encrypted: bool = True) -> None:
+    """Import a .mc4 (encrypted) or .shn (plaintext) trainer.
+
+    Both are the same Trainer/Cheat/Cheatline document; only the container
+    differs, so they share mc4_xml_to_mods() and differ by one decode step.
+    """
+    label = "CheatRunner .mc4" if encrypted else ".shn trainer"
+    suffix = ".mc4" if encrypted else ".shn"
     try:
-        xml_text = _mc4_decrypt(path.read_bytes()).decode("utf-8")
+        if encrypted:
+            xml_text = _mc4_decrypt(path.read_bytes()).decode("utf-8")
+        else:
+            # utf-8-sig for the same reason the JSON path uses it: a
+            # Windows-authored trainer carries a BOM, and ET.fromstring
+            # rejects one with a bare "syntax error" that says nothing.
+            xml_text = path.read_text(encoding="utf-8-sig")
         trainer_attrs, mods = mc4_xml_to_mods(xml_text)
     except Exception as exc:
         message_box(stdscr,
-            [f"Could not decode .mc4: {exc}",
-             "It may be corrupt, or not a real .mc4 trainer."],
+            [f"Could not decode {suffix}: {exc}",
+             f"It may be corrupt, or not a real {suffix} trainer."],
             "Import Failed", C_ERR)
         return
     if not mods:
         message_box(stdscr,
-            ["No usable <Cheat>/<Cheatline> entries found in this .mc4."],
+            [f"No usable <Cheat>/<Cheatline> entries found in this {suffix}."],
             "Import Failed", C_ERR)
         return
     _do_import_static_patch_mods(
-        stdscr, path, mods, "CheatRunner .mc4", trainer_attrs.get("Cusa", ""),
+        stdscr, path, mods, label, trainer_attrs.get("Cusa", ""),
         trainer_attrs.get("Process", ""))
 
 
@@ -11530,7 +14333,7 @@ def do_import(stdscr) -> None:
     stdscr.clear()
     draw_border(stdscr, "IMPORT TRAINER")
     safe_addstr(stdscr, 2, 3,
-                "Imports an RDX .rdx.json, an etaHEN/GoldHEN JSON, or a .mc4.",
+                "Imports an RDX .rdx.json, an etaHEN/GoldHEN JSON, a .mc4 or a .shn.",
                 color(C_NORM))
     raw_path = input_box(
         stdscr, "Trainer path: ", 4, 3, 70,
@@ -11545,7 +14348,10 @@ def do_import(stdscr) -> None:
         return
 
     if path.suffix.lower() == ".mc4":
-        _do_import_mc4(stdscr, path)
+        _do_import_mc4(stdscr, path, encrypted=True)
+        return
+    if path.suffix.lower() == ".shn":
+        _do_import_mc4(stdscr, path, encrypted=False)
         return
 
     # Sniff for the etaHEN/GoldHEN static-patch JSON schema (a top-level
@@ -11804,6 +14610,13 @@ def do_export(stdscr) -> None:
 
     export_cheats = [c for c in state["cheats"] if belongs_to_current_game(c)]
     excluded_count = len(state["cheats"]) - len(export_cheats)
+    # belongs_to_current_game admits a cheat on either arm of an OR, and the
+    # two arms mean different things once the file is written: a portable entry
+    # survives a reload, a same-session one is a raw address that will point at
+    # whatever occupies that memory next time. The predicate has already run;
+    # only the answer was being discarded. Counting it is what lets the export
+    # screen say which kind of trainer it just produced.
+    session_bound = [c for c in export_cheats if not _is_portable_cheat(c)]
     if not export_cheats:
         message_box(
             stdscr,
@@ -11910,9 +14723,11 @@ def do_export(stdscr) -> None:
                       "_" + sanitize_filename(process))
     etahen_name = base_name + process_suffix + ".json"
     mc4_name = base_name + process_suffix + ".mc4"
+    shn_name = base_name + process_suffix + ".shn"
     rdx_path = output_dir / rdx_name
     etahen_path = output_dir / etahen_name
     mc4_path = output_dir / mc4_name
+    shn_path = output_dir / shn_name
 
     # Capture the disable value at creation time whenever possible.  Older
     # in-memory entries predate that field, so make one best-effort live read
@@ -11959,26 +14774,37 @@ def do_export(stdscr) -> None:
         export_cheats, gid, gver, gtit, process, maps, author)
     mc4_bytes = (generate_mc4_bytes(etahen_mods, gid, gver, gtit, process, author)
                 if etahen_mods else None)
+    # Plaintext twin of the .mc4, same schema and same consumers. Written
+    # unconditionally beside it so a CheatRunner rejection can be attributed
+    # to the container or the schema — see generate_shn_text().
+    shn_text = (generate_shn_text(etahen_mods, gid, gver, gtit, process, author)
+                if etahen_mods else None)
     # .mc4 has more than one consumer. CheatRunner reads it from its own
     # directory, but GoldHEN and etaHEN each keep a cheats/mc4/ folder
     # alongside their cheats/json/ one, so naming only CheatRunner's path
     # sent the file somewhere the manager RDX had just selected would never
     # look for it.
     mc4_dirs = ["/data/cheatrunner/cheats/mc4/"]
+    shn_dirs = ["/data/cheatrunner/cheats/shn/"]
     if str(gid).upper().startswith("CUSA"):
         platform_name = "GoldHEN"
         deploy_dir = "/user/data/GoldHEN/cheats/json/"
         mc4_dirs.insert(0, "/user/data/GoldHEN/cheats/mc4/")
+        shn_dirs.insert(0, "/user/data/GoldHEN/cheats/shn/")
     elif str(gid).upper().startswith("PPSA"):
         platform_name = "etaHEN"
         deploy_dir = "/data/etaHEN/cheats/json/"
         mc4_dirs.insert(0, "/data/etaHEN/cheats/mc4/")
+        shn_dirs.insert(0, "/data/etaHEN/cheats/shn/")
     else:
         platform_name = "GoldHEN/etaHEN-compatible"
         deploy_dir = "the console manager's cheats/json directory"
 
     preflight = [
         f"Native RDX entries: {len(export_cheats)}",
+        (f"  ⚠ {len(session_bound)} of these are session-bound and will NOT "
+         f"resolve after a reload" if session_bound else
+         "  all carry a module root or verified chain — reload-safe"),
         f"{platform_name} static patches: {len(etahen_mods)}",
         f"Static export skipped: {len(skipped)}",
         f"Other-game/stale excluded: {excluded_count}",
@@ -11990,11 +14816,13 @@ def do_export(stdscr) -> None:
         preflight.append(f"Console deploy: {deploy_dir}{etahen_name}")
         preflight.append(
             f".mc4: {len(etahen_mods)} patches -> {mc4_dirs[0]}")
+        preflight.append(
+            f".shn (plaintext twin): {len(etahen_mods)} patches -> {shn_dirs[0]}")
     if not confirm_box(stdscr, "\n".join(preflight) + "\n\nWrite these files?",
                        "Export Preflight"):
         add_log("Trainer export cancelled at preflight")
         return
-    existing = [p.name for p in (rdx_path, etahen_path, mc4_path)
+    existing = [p.name for p in (rdx_path, etahen_path, mc4_path, shn_path)
                 if p.exists() and (p == rdx_path or etahen_mods)]
     if existing and not confirm_box(
             stdscr, "Overwrite existing file(s)?\n" + "\n".join(existing),
@@ -12007,9 +14835,24 @@ def do_export(stdscr) -> None:
         # actually written — excluded stale/other-game entries and cheats
         # the user deselected in the picker were not.
         state["cheats_dirty"] = excluded_count > 0 or deselected_count > 0
-        add_log(f"Exported RDX trainer {rdx_path}")
+        add_log(f"Exported RDX trainer {rdx_path}"
+                + (f" — {len(session_bound)}/{len(export_cheats)} entries "
+                   f"session-bound (not reload-safe)" if session_bound
+                   else " — all entries reload-safe"),
+                "warn" if session_bound else "info")
         lines = [f"RDX trainer: {rdx_path}",
                  f"  {len(export_cheats)} entry/entries; pointer chains supported."]
+        if session_bound:
+            # "pointer chains supported" describes the format, not these
+            # entries. Without this the user finds out their trainer was
+            # session-bound when they try to use it, not when they wrote it.
+            lines.extend([
+                f"  ⚠ {len(session_bound)} of {len(export_cheats)} entry/entries "
+                f"are session-bound",
+                "    raw heap addresses with no module root or verified chain.",
+                "    They work now and will not resolve after a game reload.",
+                "    Use Pointer Project to promote them to permanent chains.",
+            ])
         if excluded_count:
             lines.append(
                 f"  Skipped {excluded_count} stale/other-game entry/entries.")
@@ -12034,6 +14877,16 @@ def do_export(stdscr) -> None:
                     f"  {len(etahen_mods)} static module patch(es).",
                     "Upload via FTP to whichever manager you use:",
                 ] + [f"  {d}{mc4_name}" for d in mc4_dirs])
+            if shn_text is not None:
+                _atomic_write_text(shn_path, shn_text)
+                add_log(f"Exported .shn {shn_path} "
+                        f"({len(etahen_mods)} patches, plaintext twin of the .mc4)")
+                lines.extend([
+                    "",
+                    f".shn trainer: {shn_path}",
+                    "  Same patches as the .mc4, unencrypted. Load this one if",
+                    "  the .mc4 is rejected — it tells you which layer failed.",
+                ] + [f"  {d}{shn_name}" for d in shn_dirs])
         else:
             lines.extend([
                 "",
@@ -12142,6 +14995,20 @@ def do_freeze(stdscr, selected_cheat: Optional[dict] = None) -> None:
         while time.time() < deadline and not stop_event.is_set():
             if frozen_endpoint != (state["ip"], state["pid"], state["session"]):
                 add_log("Manual freeze stopped because the session changed", "warn")
+                break
+            # Re-validate the mapping every tick, as the saved-cheat freeze
+            # worker already does. Validating once and then writing for the
+            # rest of the window meant that if the title unmapped or moved
+            # that region mid-freeze, this kept writing into whatever now
+            # occupies the address -- the one thing in this tool that can
+            # corrupt a running game without the user doing anything wrong.
+            # _WRITE_MAP_CACHE_TTL makes the repeat check cheap.
+            map_error = _validate_addr_in_maps(
+                state["ip"], state["pid"], address, len(data),
+                _WRITE_MAP_CACHE_TTL)
+            if map_error:
+                add_log(f"Manual freeze stopped: {hex(address)} is no longer "
+                        f"a valid write target ({map_error})", "error")
                 break
             if not ps5_write(state["ip"], state["pid"], address, data,
                              cancel_event=stop_event, timeout=1.0):
@@ -12300,13 +15167,30 @@ def do_pointer_project(stdscr) -> None:
             safe_addstr(stdscr, 4, 3,
                         f"Previous temporary address: {hex(summary['target'])}",
                         color(C_NORM))
-        safe_addstr(stdscr, 6, 3,
+        # Per-reload funnel. Without it the two-reload wait is opaque: the
+        # user sees "not yet permanent" and cannot tell a project that is
+        # converging from one that is killing every chain it has.
+        row = 6
+        epoch_rows = _format_epoch_rows(summary.get("epochs", []))
+        if epoch_rows:
+            safe_addstr(stdscr, row, 3, "SURVIVORS PER RELOAD",
+                        color(C_TITLE) | curses.A_BOLD)
+            row += 1
+            h, w = stdscr.getmaxyx()
+            for line in epoch_rows[-4:]:
+                if row >= h - 8:
+                    break
+                safe_addstr(stdscr, row, 3, line[:max(w - 6, 0)],
+                            color(C_NORM))
+                row += 1
+            row += 1
+        safe_addstr(stdscr, row, 3,
                     "After each real game reload, find the value's new address,",
                     color(C_ACC))
-        safe_addstr(stdscr, 7, 3,
+        safe_addstr(stdscr, row + 1, 3,
                     "then resume with that result. Two survivals unlock saving.",
                     color(C_ACC))
-        selected = cycle_input(stdscr, "Action: ", 10, 3, options,
+        selected = cycle_input(stdscr, "Action: ", row + 3, 3, options,
                                options[0], allow_cancel=True)
         if selected is None or selected == "Back":
             return
@@ -12322,6 +15206,9 @@ def do_pointer_project(stdscr) -> None:
                            "Clear Pointer Project"):
                 removed = _clear_pointer_project(
                     state.get("proc_name", ""), maps)
+                # The funnel describes candidates that no longer exist.
+                _save_pointer_provisionals(
+                    _load_pointer_provisionals(), epochs=[])
                 state["pointer_project_summary"] = _pointer_project_summary(
                     state.get("proc_name", ""), maps)
                 add_log(f"Cleared {removed} pointer-project candidate(s)",
@@ -12399,10 +15286,13 @@ def do_resolve_permanent(stdscr, target_addr: int) -> None:
             reload_result = {"survivors": [], "rejected": saved}
         add_log(f"Reload validation: {len(reload_result['survivors'])} survived, "
                 f"{len(reload_result['rejected'])} rejected")
+        epochs = _record_pointer_epoch(reload_result, state.get("proc_name", ""))
+        for row in _format_epoch_rows(epochs[-1:]):
+            add_log(row)
         # Do not repeatedly reconsider chains that already failed this reload.
         _merge_pointer_provisionals(
             reload_result["survivors"], state.get("proc_name", ""),
-            game_identity=game_identity)
+            game_identity=game_identity, epochs=epochs)
         state["pointer_project_summary"] = _pointer_project_summary(
             state.get("proc_name", ""), current_maps)
 
@@ -12677,7 +15567,7 @@ def do_pointer_scan(stdscr, target_addr: Optional[int] = None,
     # Five levels cover common module -> manager -> object -> component ->
     # value layouts. The permanent resolver can exhaustively fall back through
     # six levels and the scanner API supports up to MAX_CHAIN_DEPTH.
-    max_depth    = _PTR_DEPTH_DEFAULT
+    max_depth    = int(setting("ptr_max_depth"))
     cancel_event = threading.Event()
     progress     = {"done": 0, "total": max_depth, "results": None, "error": None}
 
@@ -13179,8 +16069,10 @@ def do_log(stdscr) -> None:
         ])
         stdscr.refresh()
         key = stdscr.getch()
-        if key == curses.KEY_UP and offset > 0: offset -= 1
-        elif key == curses.KEY_DOWN and offset < max(0, len(snap)-1): offset += 1
+        if key in (curses.KEY_UP, ord('k')) and offset > 0: offset -= 1
+        elif key in (curses.KEY_DOWN, ord('j')) and offset < max(0, len(snap)-1): offset += 1
+        elif key == ord('g'): offset = 0
+        elif key == ord('G'): offset = max(0, len(snap) - visible)
         elif key == curses.KEY_PPAGE: offset = max(0, offset - visible)
         elif key == curses.KEY_NPAGE: offset = min(max(0, len(snap)-visible), offset + visible)
         elif key in (ord('s'), ord('S')):

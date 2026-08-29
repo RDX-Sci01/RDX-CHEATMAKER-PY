@@ -1298,6 +1298,31 @@ _freeze_targets: dict = {}       # runtime id -> saved cheat object
 _freeze_status: dict = {}        # runtime id -> last success/error text
 
 
+# Trainer files are third-party input. HEN-Cheats-Collection alone carries
+# 2,364 games' worth in JSON/MC4/SHN, so the common case is importing a file
+# somebody else wrote, and a corrupt or hostile one is a normal thing to meet.
+#
+# Every other collection in this program is bounded -- bookmarks at 256,
+# remembered structures at 64, symbol classes at 20,000, scan results at 2 M,
+# undo history at 128 MB, wire-decoded process and map entries at 4,096 and
+# 65,536. Imported cheats were the sole exception: 200,000 entries from a
+# 20 MB file were accepted at 283 MB peak, and each enabled freeze costs a
+# per-tick address resolution that explicitly cannot be batched.
+#
+# 1,024 is far above any real trainer (published ones run to tens of entries)
+# and far below the point where the cheat list or the freeze tick stops being
+# usable.
+MAX_IMPORT_CHEATS = 1024
+# Read guard applied before parsing rather than after: the parse peaks at
+# roughly ten times the file size, so rejecting a 20 MB trainer costs 200 MB
+# if the check comes afterwards.
+MAX_TRAINER_FILE_BYTES = 8 * 1024 * 1024
+
+# Appended to an exported cheat's name when its freeze semantics do not
+# survive the container. Short on purpose: it shares a line with the cheat's
+# own name in someone else's menu.
+_ONE_SHOT_MARKER = "[1-shot]"
+
 _BOOKMARK_MAX = 256
 
 
@@ -1305,14 +1330,25 @@ def _bookmark_key(address: int, value_type: str) -> tuple:
     return (int(address), str(value_type))
 
 
-def _add_bookmark(address: int, value_type: str, note: str = "") -> str:
-    """Record an address for later. Returns a status line for the caller."""
+def _add_bookmark(address: int, value_type: str, note: str = "",
+                  chain: Optional[dict] = None) -> str:
+    """Record an address for later. Returns a status line for the caller.
+
+    `chain` optionally carries {module_name, module_relative_offset, offsets,
+    terminal_offset} from a verified pointer search. A bookmark holding one
+    rebases on the next attach instead of expiring -- see
+    _bookmark_is_current.
+    """
     bookmarks = state.setdefault("bookmarks", [])
     key = _bookmark_key(address, value_type)
     for existing in bookmarks:
         if _bookmark_key(existing["address"], existing["value_type"]) == key:
             if note:
                 existing["note"] = str(note)[:64]
+            if chain and not existing.get("chain"):
+                existing["chain"] = dict(chain)
+                return (f"Bookmark at {hex(int(address))} now carries a "
+                        f"pointer chain")
             return f"Bookmark already exists at {hex(int(address))}"
     if len(bookmarks) >= _BOOKMARK_MAX:
         return f"Bookmark limit ({_BOOKMARK_MAX}) reached"
@@ -1323,8 +1359,119 @@ def _add_bookmark(address: int, value_type: str, note: str = "") -> str:
         "pid": state.get("pid"),
         "process": state.get("proc_name", ""),
         "session": int(state.get("session", 0)),
+        "chain": dict(chain) if chain else None,
     })
-    return f"Bookmarked {hex(int(address))}"
+    return (f"Bookmarked {hex(int(address))}"
+            + (" with its pointer chain" if chain else ""))
+
+
+def _salvageable_chains(items: list) -> list:
+    """Pointer chains inside a trainer written for a different game build.
+
+    A version-mismatched trainer is normally a dead end: the addresses in it
+    are wrong for the build that is running. But an entry carrying a
+    module-rooted chain is not just an address -- it is a record of a
+    structure someone already worked out. Game layouts change far less
+    between patches than absolute addresses do, so those offsets are usually
+    still correct and are worth re-verifying rather than discarding.
+
+    This is the common case, not an edge case: HEN-Cheats-Collection carries
+    2,364 games and updates, organised by title ID *and* version, so holding
+    a trainer for a version you are not running is ordinary.
+
+    EdiZon SE does the same thing from the other direction, extracting a
+    chain from a cheat "made for a previous version of the game".
+
+    Returns [{name, module_name, module_relative_offset, offsets,
+    terminal_offset}] for the entries worth offering.
+    """
+    salvage = []
+    for c in items:
+        if not isinstance(c, dict):
+            continue
+        module_name = str(c.get("module_name", c.get("module", "")) or "")
+        raw_offsets = c.get("offsets")
+        if not module_name or not isinstance(raw_offsets, list):
+            continue
+        if not (1 <= len(raw_offsets) <= MAX_CHAIN_DEPTH):
+            continue
+        try:
+            offsets = [int(x, 0) if isinstance(x, str) else int(x)
+                       for x in raw_offsets]
+            module_rel = c.get("module_relative_offset", c.get("module_offset"))
+            module_rel = (int(module_rel, 0) if isinstance(module_rel, str)
+                          else int(module_rel))
+        except (TypeError, ValueError):
+            continue
+        if module_rel < 0 or module_rel > _ADDR_MAX:
+            continue
+        if any(abs(x) > _PTR_RESOLVE_OFFSET_MAX for x in offsets):
+            continue
+        salvage.append({
+            "name": str(c.get("name", "unnamed")),
+            "module_name": module_name,
+            "module_relative_offset": module_rel,
+            "offsets": offsets,
+            "terminal_offset": int(c.get("terminal_offset", 0) or 0),
+        })
+        if len(salvage) >= MAX_IMPORT_CHEATS:
+            break
+    return salvage
+
+
+def _verify_salvaged_chain(chain: dict) -> Optional[int]:
+    """Resolve a salvaged chain against the running build, or None.
+
+    Nothing is trusted from the file: the module base comes from the live
+    map and the chain is walked from there, exactly as a saved cheat's is.
+    """
+    try:
+        maps = _get_maps_cached(state["ip"], int(state["pid"]))
+        module_base = _pointer_module_base(maps, chain["module_name"])
+        if module_base is None:
+            return None
+        base = module_base + int(chain["module_relative_offset"])
+        ok, final, _steps = _resolve_pointer_chain(
+            state["ip"], int(state["pid"]), base,
+            [int(x) for x in chain["offsets"]],
+            int(chain.get("terminal_offset", 0)))
+        if not ok:
+            return None
+        if _validate_addr_in_maps(state["ip"], int(state["pid"]),
+                                  int(final), 1):
+            return None
+        return int(final)
+    except Exception:
+        return None
+
+
+def _attach_chain_to_bookmark(address: int, candidate: dict) -> Optional[str]:
+    """Give any bookmark at `address` the verified chain just found for it.
+
+    Returns a status line when one was attached, else None. Silent when no
+    bookmark is on that address -- the pointer search is used far more often
+    from Results than from the bookmark list, and it should not start
+    creating bookmarks nobody asked for.
+    """
+    chain = {
+        "module_name": str(candidate.get("module_name", "") or ""),
+        "module_relative_offset": int(
+            candidate.get("module_relative_offset", 0)),
+        "offsets": [int(x) for x in candidate.get("offsets", ())],
+        "terminal_offset": int(candidate.get("terminal_offset", 0)),
+    }
+    if not chain["module_name"]:
+        return None
+    for bookmark in state.get("bookmarks", []):
+        if int(bookmark.get("address", 0)) != int(address):
+            continue
+        if bookmark.get("chain"):
+            return None
+        bookmark["chain"] = chain
+        return (f"Bookmark {hex(int(address))} now carries "
+                f"{chain['module_name']}+{chain['module_relative_offset']:#x} "
+                f"— it will survive a reload")
+    return None
 
 
 def _remove_bookmark(index: int) -> Optional[dict]:
@@ -1335,15 +1482,62 @@ def _remove_bookmark(index: int) -> Optional[dict]:
 
 
 def _bookmark_is_current(bookmark: dict) -> bool:
-    """False once the console session or process it was taken in is gone.
+    """Whether a bookmark still refers to the thing it was taken on.
 
-    A bookmark is a raw address with no pointer chain behind it, so after a
-    reload it names whatever now occupies that memory. Marking it stale is
-    the honest presentation; silently reading it would show a plausible
-    number belonging to something else entirely.
+    A bookmark with no chain is a raw address, so after a reload it names
+    whatever now occupies that memory. Marking those stale is the honest
+    presentation; silently reading one would show a plausible number
+    belonging to something else entirely. That reasoning is unchanged.
+
+    What changed is the premise: a bookmark does not *have* to be a raw
+    address. One carrying a verified module-rooted chain rebases on the next
+    attach exactly as a saved cheat does, so it survives the reload that
+    would have expired it. EdiZon SE reaches the same conclusion from the
+    other direction -- its bookmarks "adjust to changing main and heap start
+    address on subsequent launch of the game".
     """
+    if bookmark.get("chain"):
+        return _bookmark_chain_resolves(bookmark) is not None
     return (int(bookmark.get("session", -1)) == int(state.get("session", 0))
             and bookmark.get("pid") == state.get("pid"))
+
+
+def _bookmark_chain_resolves(bookmark: dict) -> Optional[int]:
+    """Live address for a chained bookmark, or None when it cannot rebase.
+
+    Reuses the cheat path's rebasing primitives rather than repeating them:
+    the module base is looked up in the current maps and the chain walked
+    from there, so a bookmark and a cheat built on the same chain resolve
+    identically.
+    """
+    chain = bookmark.get("chain") or {}
+    module_name = str(chain.get("module_name", "") or "")
+    if not module_name:
+        return None
+    try:
+        maps = _get_maps_cached(state["ip"], int(state["pid"]))
+        module_base = _pointer_module_base(maps, module_name)
+        if module_base is None:
+            return None
+        base = module_base + int(chain.get("module_relative_offset", 0))
+        offsets = [int(x) for x in chain.get("offsets", ())]
+        if not offsets:
+            return base
+        ok, final, _steps = _resolve_pointer_chain(
+            state["ip"], int(state["pid"]), base, offsets,
+            int(chain.get("terminal_offset", 0)))
+        return int(final) if ok else None
+    except Exception:
+        return None
+
+
+def _bookmark_live_address(bookmark: dict) -> int:
+    """The address to read now: rebased when chained, stored otherwise."""
+    if bookmark.get("chain"):
+        resolved = _bookmark_chain_resolves(bookmark)
+        if resolved is not None:
+            return resolved
+    return int(bookmark.get("address", 0))
 
 
 def _cheat_runtime_id(cheat: dict) -> str:
@@ -8461,7 +8655,149 @@ def scan_type_instances(ip: str, pid: int,
         group["module_relative_offset"] = rel
     add_log(f"Type scan: {len(groups)} type(s) with >= {min_instances} "
             f"instances from {collected:,} candidate slot(s)")
+    # Follow each type pointer one more hop for its class name. Bounded and
+    # entirely optional -- a title that does not use this layout simply shows
+    # pointers, exactly as before.
+    try:
+        named = label_type_groups(ip, pid, groups, maps,
+                                  cancel_event=cancel_event)
+        if named:
+            add_log(f"Type scan: resolved {named} class name(s) from live "
+                    f"memory (no dump.cs needed)")
+        elif groups:
+            add_log("Type scan: no class names resolved — this title may not "
+                    "use an IL2CPP layout, or its name offset is unknown",
+                    "warn")
+    except Exception as exc:
+        add_log(f"Type scan: class-name lookup unavailable: {exc}", "warn")
     return groups
+
+
+# ── IL2CPP class names from live memory ───────────────────────────────────────
+# Type Scan already finds the thing this needs. Every IL2CPP object begins with
+# a pointer to its Il2CppClass, and Type Scan groups objects by exactly that
+# qword, returning it as `type_ptr`. The pointer was being used only to name
+# the module it lives in; following it one more hop yields the class name.
+#
+# Breeze does this on Switch and states the shape plainly:
+#
+#     class_info = [candidate_base]
+#     class_name = [[candidate_base] + 0x10]     # c-string
+#
+# The offset is the part not to copy. Il2CppClass has been reordered between
+# IL2CPP releases, so a hardcoded 0x10 would name classes correctly on some
+# titles and confidently produce garbage on others -- which, for a feature
+# whose entire job is labelling, is worse than having no feature. So: probe a
+# small set of plausible offsets, follow each to a string, and accept one only
+# if it reads like a real type name. When nothing does, say nothing and leave
+# the raw pointer on screen.
+#
+# All read-only.
+_KLASS_NAME_OFFSETS = (0x10, 0x08, 0x18, 0x20, 0x28, 0x00)
+_KLASS_NAME_MAX_LEN = 128
+_KLASS_NAME_CACHE_MAX = 4096
+_klass_name_cache: dict = {}
+_klass_name_lock = threading.Lock()
+# Enough C# identifier characters to accept generics, nested types and
+# namespaced names without accepting arbitrary binary that happens to be
+# printable.
+_KLASS_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.<>`|+\[\], ]{0,127}$")
+
+
+def _plausible_class_name(raw: bytes) -> Optional[str]:
+    """Decode a candidate C string, or None when it is not a type name."""
+    end = raw.find(b"\x00")
+    if end <= 0:                     # empty string, or no terminator in range
+        return None
+    try:
+        text = raw[:end].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if not _KLASS_NAME_RE.match(text):
+        return None
+    # A name that is all punctuation-ish, or a single character, is far more
+    # likely to be coincidence than a type.
+    if len(text) < 2 or not any(c.isalpha() for c in text):
+        return None
+    return text
+
+
+def _read_klass_name(ip: str, pid: int, klass_ptr: int,
+                     maps: Optional[list] = None) -> Optional[str]:
+    """Resolve an Il2CppClass pointer to its type name, or None.
+
+    Never raises: this is a labelling convenience layered on Type Scan, and a
+    title that does not use this layout must simply go unlabelled rather than
+    fail the scan that found it.
+    """
+    key = int(klass_ptr)
+    with _klass_name_lock:
+        if key in _klass_name_cache:
+            return _klass_name_cache[key]
+    name = None
+    try:
+        maps = maps if maps is not None else _get_maps_cached(ip, pid)
+        starts, rows = _build_region_lookup(maps)
+        # One read covers every candidate offset instead of one read each.
+        span = max(_KLASS_NAME_OFFSETS) + 8
+        header = ps5_read(ip, pid, key, span)
+        for offset in _KLASS_NAME_OFFSETS:
+            if offset + 8 > len(header):
+                continue
+            name_ptr = int.from_bytes(header[offset:offset + 8], "little")
+            if not (_ADDR_MIN <= name_ptr <= _ADDR_MAX):
+                continue
+            # Check the target is mapped before dereferencing it; an
+            # unmapped read is a wasted round trip and a logged failure.
+            if not _region_for_addr(name_ptr, starts, rows):
+                continue
+            try:
+                raw = ps5_read(ip, pid, name_ptr, _KLASS_NAME_MAX_LEN)
+            except Exception:
+                continue
+            candidate = _plausible_class_name(raw)
+            if candidate:
+                name = candidate
+                break
+    except Exception:
+        name = None
+    with _klass_name_lock:
+        if len(_klass_name_cache) >= _KLASS_NAME_CACHE_MAX:
+            _klass_name_cache.clear()
+        _klass_name_cache[key] = name
+    return name
+
+
+def _invalidate_klass_names() -> None:
+    """Class pointers are process-scoped; drop them when the process changes."""
+    with _klass_name_lock:
+        _klass_name_cache.clear()
+
+
+def label_type_groups(ip: str, pid: int, groups: list,
+                      maps: Optional[list] = None,
+                      limit: int = 64,
+                      time_budget: float = 8.0,
+                      cancel_event=None) -> int:
+    """Attach a live class name to as many groups as the budget allows.
+
+    Bounded on purpose. Each name costs up to two round trips and a scan can
+    return hundreds of types, so this labels the rows a user will actually
+    look at first and leaves the rest showing their pointer. Returns how many
+    were named.
+    """
+    named = 0
+    deadline = time.monotonic() + max(float(time_budget), 0.1)
+    for group in list(groups)[:max(int(limit), 0)]:
+        if time.monotonic() >= deadline:
+            break
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        name = _read_klass_name(ip, pid, int(group.get("type_ptr", 0)), maps)
+        if name:
+            group["class_name"] = name
+            named += 1
+    return named
 
 
 def _validate_write_addr(addr: int) -> Optional[str]:
@@ -9238,10 +9574,29 @@ def generate_etahen_json(cheats: list, game_id: str, game_ver: str,
             skipped.append((name, f"invalid scalar patch: {exc}"))
             continue
         description = "RDX module-relative scalar write."
-        if str(cheat.get("type", "")) == "freeze":
+        downgraded = str(cheat.get("type", "")) == "freeze"
+        if downgraded:
             description += " etaHEN applies it once per toggle; it is not a live freeze."
+        # The hint above never reaches the person running the cheat. Measured:
+        # `.shn`/`.mc4` carry name, offset, on and off, and the Trainer XML
+        # schema has no field for `hint` or `type` at all, so both are dropped
+        # in transit. Provenance survives (the `Moder`/`credits` attributes),
+        # but this particular note does not -- and it is the one that changes
+        # what the cheat *does*.
+        #
+        # A cheat set up here as a continuous freeze becomes a one-shot write
+        # in every manager that consumes these formats. That is a real
+        # semantic downgrade, it varies per entry, and nothing else tells the
+        # user about it. EdiZon SE solves the same class of problem by putting
+        # what matters in the label, which is the one field every manager
+        # shows.
+        #
+        # Marked only on the entries that are actually downgraded: a marker on
+        # every row would be noise, and the name is what a player reads in a
+        # menu.
+        exported_name = f"{name} {_ONE_SHOT_MARKER}" if downgraded else name
         mods.append({
-            "name": name,
+            "name": exported_name,
             # "hint", not "description": a real etaHEN file
             # (PS5_Cheats json/CUSA00004_01.07.json) uses
             # {name, hint, type, memory} and GoldHEN's equivalent uses
@@ -10036,10 +10391,13 @@ def _clear_scan_state(stop_freezes: bool = True) -> None:
     if stop_freezes:
         _stop_freeze_worker()
     _close_turbo_session()
-    # Bookmarks are raw addresses with no chain behind them, so they mean
-    # nothing once the scan state they were taken alongside is gone.
-    state["bookmarks"]      = []
+    # A bookmark with no chain is a raw address and means nothing once the
+    # scan state it was taken alongside is gone. One that carries a verified
+    # module-rooted chain rebases against the new maps, so it is kept.
+    state["bookmarks"]      = [b for b in state.get("bookmarks", [])
+                               if b.get("chain")]
     state["structures"]     = {}
+    _invalidate_klass_names()
     scan.clear()
     state["scan_history"]   = deque(maxlen=5)
     with _map_cache_lock:
@@ -13726,20 +14084,29 @@ def do_type_scan(stdscr) -> None:
         safe_addstr(stdscr, 2, 3,
                     "Enter open instances   S structure view   Q back",
                     color(C_NORM))
-        visible = max(1, h - 7)
+        named_count = sum(1 for g in groups if g.get("class_name"))
+        if named_count:
+            safe_addstr(stdscr, 3, 3,
+                        f"{named_count} of {len(groups)} named from live "
+                        f"class data", color(C_OK))
+        visible = max(1, h - 8)
         sel = max(0, min(sel, len(groups) - 1))
         start = max(0, sel - visible // 2)
         for i, group in enumerate(groups[start:start + visible]):
             idx = start + i
             attr = (color(C_SEL) | curses.A_BOLD if idx == sel
+                    else color(C_ACC) if group.get("class_name")
                     else color(C_NORM))
             module = group.get("module_name") or "?"
             rel = group.get("module_relative_offset")
             where = (f"{module}+{rel:#x}" if rel is not None else module)
+            # The class name is the useful column when it resolved; the raw
+            # pointer stays visible when it did not, rather than a blank.
+            label = group.get("class_name") or hex(group["type_ptr"])
             line = (f"{'>' if idx == sel else ' '} "
                     f"{group['count']:>7,} x  "
-                    f"{hex(group['type_ptr']):<18} {where}")
-            safe_addstr(stdscr, 4 + i, 2, line[:w - 4].ljust(w - 4), attr)
+                    f"{label:<30.30} {where}")
+            safe_addstr(stdscr, 5 + i, 2, line[:w - 4].ljust(w - 4), attr)
         draw_statusbar(stdscr, [("↑↓ / jk", C_NORM),
                                 ("Enter instances", C_OK),
                                 ("S structure", C_ACC), ("Esc/Q back", C_NORM)])
@@ -13840,6 +14207,12 @@ def do_bookmarks(stdscr) -> None:
             safe_addstr(stdscr, 6, 3,
                         "keep an address here without creating a cheat.",
                         color(C_NORM))
+            safe_addstr(stdscr, 8, 3,
+                        "Attach a pointer chain with P and the bookmark",
+                        color(C_ACC))
+            safe_addstr(stdscr, 9, 3,
+                        "survives a reload instead of going stale.",
+                        color(C_ACC))
             draw_statusbar(stdscr, [("Esc/Q back", C_NORM)])
             stdscr.refresh()
             if stdscr.getch() in (ord('q'), ord('Q'), 27):
@@ -13848,25 +14221,34 @@ def do_bookmarks(stdscr) -> None:
 
         sel = max(0, min(sel, len(bookmarks) - 1))
         safe_addstr(stdscr, 2, 3,
-                    "Enter inspect   C promote to cheat   D delete   Q back",
+                    "Enter inspect   C cheat   P attach chain   D delete   Q back",
                     color(C_NORM))
         visible = max(1, h - 7)
         start = max(0, sel - visible // 2)
         for i, bookmark in enumerate(bookmarks[start:start + visible]):
             idx = start + i
+            chained = bool(bookmark.get("chain"))
             stale = not _bookmark_is_current(bookmark)
             attr = (color(C_SEL) | curses.A_BOLD if idx == sel
-                    else color(C_ERR) if stale else color(C_NORM))
+                    else color(C_ERR) if stale
+                    else color(C_ACC) if chained else color(C_NORM))
             note = bookmark.get("note", "")
-            flag = " STALE" if stale else ""
+            # A chained bookmark shows where it resolves *now*, which is the
+            # whole point of it having a chain.
+            shown = (_bookmark_live_address(bookmark) if chained and not stale
+                     else int(bookmark["address"]))
+            flag = (" STALE" if stale else " CHAIN" if chained else "")
             line = (f"{'>' if idx == sel else ' '} "
-                    f"{hex(int(bookmark['address'])):<18} "
+                    f"{hex(int(shown)):<18} "
                     f"{bookmark['value_type']:<6}{flag:<7} {note}")
             safe_addstr(stdscr, 4 + i, 2, line[:w - 4].ljust(w - 4), attr)
 
+        chained_n = sum(1 for b in bookmarks if b.get("chain"))
         draw_statusbar(stdscr, [("↑↓ / jk", C_NORM), ("Enter inspect", C_OK),
-                                ("C cheat", C_OK), ("D delete", C_ERR),
-                                ("Esc/Q back", C_NORM)])
+                                ("C cheat", C_OK), ("P chain", C_ACC),
+                                (f"{chained_n} chained" if chained_n else
+                                 "none chained", C_ACC if chained_n else C_NORM),
+                                ("D delete", C_ERR), ("Esc/Q back", C_NORM)])
         stdscr.refresh()
         key = stdscr.getch()
         if key == curses.KEY_RESIZE:
@@ -13888,14 +14270,32 @@ def do_bookmarks(stdscr) -> None:
                              "refers to the same thing. Delete it and scan again."],
                             "Stale Bookmark", C_ERR)
                 continue
-            _inspect_result(stdscr, int(bookmark["address"]))
+            _inspect_result(stdscr, _bookmark_live_address(bookmark))
         elif key in (ord('c'), ord('C')):
             bookmark = bookmarks[sel]
             if not _bookmark_is_current(bookmark):
                 message_box(stdscr, ["Stale bookmark — cannot become a cheat."],
                             "Stale Bookmark", C_ERR)
                 continue
-            _add_cheat_at(stdscr, int(bookmark["address"]))
+            _add_cheat_at(stdscr, _bookmark_live_address(bookmark))
+        elif key in (ord('p'), ord('P')):
+            bookmark = bookmarks[sel]
+            if bookmark.get("chain"):
+                message_box(stdscr,
+                            ["This bookmark already carries a chain.",
+                             "It rebases on every attach."],
+                            "Pointer Chain", C_OK)
+                continue
+            if not _bookmark_is_current(bookmark):
+                message_box(stdscr,
+                            ["Stale bookmark — its address no longer refers",
+                             "to the thing it was taken on, so a chain found",
+                             "for it now would be meaningless."],
+                            "Stale Bookmark", C_ERR)
+                continue
+            # Reuse the existing resolver wholesale; a chain good enough for
+            # a cheat is good enough for a bookmark.
+            do_resolve_permanent(stdscr, int(bookmark["address"]))
         elif key in (ord('d'), ord('D')):
             removed = _remove_bookmark(sel)
             if removed:
@@ -14235,6 +14635,129 @@ def _parse_int_field(value, field_name):
         raise ValueError(f"Invalid {field_name}: {value!r}")
 
 
+def _offer_salvaged_chains(stdscr, path, salvage: list) -> bool:
+    """Re-verify a mismatched trainer's chains against the running build.
+
+    Returns True when the user took something from it, so the caller can stop
+    rather than falling through to the mismatch error.
+
+    Nothing here is imported on the file's word. Every chain is walked
+    against the live memory map, and only the ones that resolve to a
+    currently-writable address are offered -- which is exactly the test a
+    saved cheat's chain has to pass before RDX will apply it.
+    """
+    if not confirm_box(
+            stdscr,
+            f"{Path(path).name} was made for a different build of this game,\n"
+            f"so its addresses are wrong.\n\n"
+            f"It carries {len(salvage)} pointer chain(s), and those usually\n"
+            f"survive a patch even when addresses do not.\n\n"
+            f"Re-verify them against the running build?",
+            "Different Game Build"):
+        return False
+
+    cancel_event = threading.Event()
+    progress = {"done": 0, "total": max(len(salvage), 1),
+                "results": None, "error": None}
+
+    def worker():
+        found = []
+        try:
+            for i, chain in enumerate(salvage):
+                if cancel_event.is_set():
+                    raise InterruptedError("cancelled")
+                resolved = _verify_salvaged_chain(chain)
+                if resolved is not None:
+                    found.append((chain, resolved))
+                progress["done"] = i + 1
+            progress["results"] = found
+        except InterruptedError:
+            progress["error"] = "cancelled"
+        except Exception as exc:
+            progress["error"] = str(exc)
+
+    if not _run_scan_with_progress(stdscr, worker, "Re-verifying chains",
+                                   cancel_event, progress):
+        return False
+    if progress["error"]:
+        if progress["error"] != "cancelled":
+            message_box(stdscr, [f"Chain re-verification failed: "
+                                 f"{progress['error']}"],
+                        "Salvage Failed", C_ERR)
+        return False
+
+    survivors = progress["results"] or []
+    if not survivors:
+        message_box(stdscr,
+                    [f"None of the {len(salvage)} chain(s) resolve against",
+                     "the running build.",
+                     "",
+                     "The layout changed too, not just the addresses."],
+                    "Nothing Salvaged", C_WARN)
+        return False
+
+    sel = 0
+    while True:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        draw_border(stdscr, f"SALVAGED CHAINS  ({len(survivors)} resolve)")
+        safe_addstr(stdscr, 2, 3,
+                    f"From {Path(path).name}, re-verified against this build:",
+                    color(C_NORM))
+        safe_addstr(stdscr, 3, 3,
+                    "B bookmark   C create cheat   A take all as bookmarks   Q back",
+                    color(C_NORM))
+        visible = max(1, h - 8)
+        sel = max(0, min(sel, len(survivors) - 1))
+        start = max(0, sel - visible // 2)
+        for i, (chain, resolved) in enumerate(survivors[start:start + visible]):
+            idx = start + i
+            attr = (color(C_SEL) | curses.A_BOLD if idx == sel
+                    else color(C_OK))
+            line = (f"{'>' if idx == sel else ' '} "
+                    f"{hex(resolved):<18} "
+                    f"{chain['module_name']}+{chain['module_relative_offset']:#x} "
+                    f"{chain['name'][:24]}")
+            safe_addstr(stdscr, 5 + i, 2, line[:w - 4].ljust(w - 4), attr)
+        draw_statusbar(stdscr, [("↑↓ / jk", C_NORM), ("B bookmark", C_OK),
+                                ("C cheat", C_OK), ("A all", C_ACC),
+                                ("Esc/Q back", C_NORM)])
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key == curses.KEY_RESIZE:
+            curses.update_lines_cols(); continue
+        if key in (curses.KEY_UP, ord('k')):
+            sel = max(0, sel - 1)
+        elif key in (curses.KEY_DOWN, ord('j')):
+            sel = min(len(survivors) - 1, sel + 1)
+        elif key in (ord('b'), ord('B')):
+            chain, resolved = survivors[sel]
+            add_log(_add_bookmark(resolved, _current_scan_type(),
+                                  f"salvaged: {chain['name']}"[:64],
+                                  chain=chain))
+        elif key in (ord('a'), ord('A')):
+            taken = 0
+            for chain, resolved in survivors:
+                _add_bookmark(resolved, _current_scan_type(),
+                              f"salvaged: {chain['name']}"[:64], chain=chain)
+                taken += 1
+            add_log(f"Salvaged {taken} chain(s) from {Path(path).name} "
+                    f"into bookmarks")
+            message_box(stdscr,
+                        [f"Added {taken} bookmark(s), each carrying its chain.",
+                         "",
+                         "They rebase on every attach, so they survive a",
+                         "reload. Verify the values look right before",
+                         "promoting any of them to a cheat."],
+                        "Salvaged", C_OK)
+            return True
+        elif key in (ord('c'), ord('C')):
+            _chain, resolved = survivors[sel]
+            _add_cheat_at(stdscr, resolved)
+        elif key in (ord('q'), ord('Q'), 27):
+            return bool(state.get("bookmarks") or state.get("cheats"))
+
+
 def _do_import_static_patch_mods(stdscr, path: Path, mods: list,
                                  kind_label: str, file_title_id: str,
                                  file_process: str = "") -> None:
@@ -14242,6 +14765,16 @@ def _do_import_static_patch_mods(stdscr, path: Path, mods: list,
     mods into RDX's cheat list, resolved against the currently attached
     process's live main module (never trusted from the file itself — see
     _mods_to_import_entries)."""
+    if len(mods) > MAX_IMPORT_CHEATS:
+        message_box(stdscr,
+            [f"{kind_label} holds {len(mods):,} entries, over the "
+             f"{MAX_IMPORT_CHEATS:,} limit.",
+             "",
+             "It is corrupt, or is not a hand-made trainer."],
+            "Import Failed", C_ERR)
+        add_log(f"Import refused: {kind_label} holds {len(mods):,} entries",
+                "error")
+        return
     attached_process = str(state.get("proc_name", "") or "")
     if file_process and attached_process and file_process != attached_process:
         message_box(stdscr,
@@ -14346,6 +14879,22 @@ def do_import(stdscr) -> None:
     if not path.exists() or not path.is_file():
         message_box(stdscr, [f"File not found: {path}"], "Import Failed", C_ERR)
         return
+    try:
+        file_bytes = path.stat().st_size
+    except OSError as exc:
+        message_box(stdscr, [f"Could not read {path}: {exc}"],
+                    "Import Failed", C_ERR)
+        return
+    if file_bytes > MAX_TRAINER_FILE_BYTES:
+        message_box(stdscr,
+            [f"{path.name} is {file_bytes / 1048576:.1f} MB.",
+             f"The limit is {MAX_TRAINER_FILE_BYTES / 1048576:.0f} MB.",
+             "",
+             "Real trainers are a few kilobytes. A file this large is",
+             "corrupt, or is not a trainer at all."],
+            "Import Failed", C_ERR)
+        add_log(f"Import refused: {path.name} is {file_bytes:,} bytes", "error")
+        return
 
     if path.suffix.lower() == ".mc4":
         _do_import_mc4(stdscr, path, encrypted=True)
@@ -14388,6 +14937,11 @@ def do_import(stdscr) -> None:
                 f"attached to '{state.get('proc_name', '')}'")
         items = data.get("cheatList", [])
         if not isinstance(items, list): raise ValueError("cheatList is not an array")
+        if len(items) > MAX_IMPORT_CHEATS:
+            raise ValueError(
+                f"trainer holds {len(items):,} entries, over the "
+                f"{MAX_IMPORT_CHEATS:,} limit — it is corrupt, or is not a "
+                f"hand-made trainer")
         trainer_identity = str(data.get("game_identity", "") or "")
         identities = {str(c.get("game_identity", trainer_identity) or "")
                       for c in items if isinstance(c, dict)
@@ -14397,6 +14951,12 @@ def do_import(stdscr) -> None:
             current_identity = _pointer_game_identity(
                 state.get("proc_name", ""), current_maps)
             if identities != {current_identity}:
+                # A mismatch means the addresses are wrong, not that the
+                # structure is. Offer whatever chains the file carries before
+                # giving up on it.
+                salvage = _salvageable_chains(items)
+                if salvage and _offer_salvaged_chains(stdscr, path, salvage):
+                    return
                 raise ValueError(
                     "trainer game-image fingerprint does not match the "
                     "currently attached title")
@@ -15437,6 +15997,13 @@ def do_resolve_permanent(stdscr, target_addr: int) -> None:
             c2 = dict(c)
             c2["module_name"] = module
             c2["module_relative_offset"] = int(c.get("module_relative_offset", 0))
+            # These candidates have already survived two relocation epochs,
+            # which is the same bar a saved cheat's chain has to clear. If a
+            # bookmark is sitting on this address, give it the chain: that is
+            # what stops it expiring on the next attach.
+            attached = _attach_chain_to_bookmark(target_addr, c2)
+            if attached:
+                add_log(attached)
             do_pointer_chain_verify(stdscr, c2, target_addr)
         elif key in (ord('q'), ord('Q'), 27):
             return

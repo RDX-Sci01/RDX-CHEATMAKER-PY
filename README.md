@@ -12,7 +12,7 @@ dependency.
 
 ```bash
 python3 -m pip install numpy
-python3 RDX-CHEATMAKER-UI.py
+python3 RDX-CHEATMAKER-UI-final.py
 ```
 
 ---
@@ -44,9 +44,37 @@ writes, and per-cheat editing. Simultaneous freezes collapse into a single
 bulk-write exchange per tick rather than one write per cheat.
 
 **Export / import** — native `.rdx.json` (the only format that carries pointer
-chains), GoldHEN/etaHEN checkbox JSON, and CheatRunner `.mc4`. Import accepts
-all three; addresses are always re-resolved against the live process, never
-trusted from the file.
+chains), GoldHEN/etaHEN checkbox JSON, CheatRunner `.mc4`, and the plaintext
+`.shn` twin of that `.mc4`. Import accepts all of them; addresses are always
+re-resolved against the live process, never trusted from the file.
+
+**Inspection** — a read-only hex viewer and a structure overlay that gives an
+address named, typed fields, auto-dissected against the live memory map. Both
+highlight bytes that changed since the last refresh, and pointer fields show
+where they point. Both refuse to write: RDX has three audited write paths
+already, and a fourth reachable by cursoring around a dump is how a running
+game gets corrupted by accident.
+
+**Finding objects, not just values** — Type Scan groups heap allocations by the
+type pointer at their base. For an IL2CPP title that pointer is the
+`Il2CppClass`, so each group is one class and its live instances. This finds
+state that never appears on screen as a number, which the scan/narrow loop
+cannot.
+
+**Symbols** — Type Scan resolves class names from live memory by following the
+object's own class pointer, so an IL2CPP title labels itself with no external
+tooling. For field names, load an Il2CppDumper `dump.cs` and the structure view
+uses real field names with their declared types instead of `field_0014`; RDX
+does not produce the dump.
+
+**Salvage** — a trainer written for a different build of the game is not a dead
+end. Its pointer chains are re-verified against the running build, and the ones
+that still resolve can be taken as bookmarks or cheats.
+
+**Bookmarks** — keep an address you are still investigating without turning it
+into a cheat. Attach a verified pointer chain and a bookmark rebases on every
+attach, surviving reloads; without one it is a raw address and is marked stale
+once the process or console session it was taken in is gone.
 
 For the full walkthrough — first scan to exported trainer, screen by screen —
 see **[`info/RDX-CHEATMAKER-PY_README.md`](info/RDX-CHEATMAKER-PY_README.md)**.
@@ -77,6 +105,24 @@ Everything else is standard library — including the AES and LZ4 implementation
 so no crypto or compression package is needed.
 
 ---
+## Settings
+
+`T` from the main menu. The pointer bounds and region filter rules used to be
+literals in the source; they are still the same defaults, now visible and
+editable, and every one is clamped on load so a hand-edited preferences file
+cannot request an unbounded pointer walk.
+
+| Setting | Default | What it does |
+|---|---|---|
+| Scan engine | Auto | Turbo → Console → Host, or force one |
+| Region exclude tokens | `.sprx,.prx,.so,…` | Substrings excluded from Recommended scope |
+| Min region size | 0 (off) | Skip mappings below this size |
+| Pointer max depth | 5 | Chain hops explored — matches PINCE's default |
+| Pointer direct window | 0x800 | First-pass holder radius — matches PINCE's default |
+| Pointer struct window | 0x4000 | Max \|offset\| per hop |
+| Module bases only | off | Keep only chains rooted in a named module |
+
+---
 
 ## Safety mechanisms
 
@@ -85,6 +131,13 @@ process map before every write, refuses writes into non-writable mappings, and
 fails closed when a cheat's process, session or game fingerprint does not match
 what is currently attached. Reversible previews restore the original bytes even
 when the operation fails partway.
+
+Hardware-watchpoint tracing also requires the **console to be able to reach
+this machine**: it is the console that opens the debug channel, outbound to the
+client on port 755. A VPN or overlay route (Tailscale and similar) lets you
+scan, read, write and freeze perfectly while making tracing impossible, so RDX
+checks the return path and refuses before attaching rather than stopping the
+game and hanging. Trace from a machine on the console's own network.
 
 Hardware-watchpoint tracing exists but is **disabled by default** — it attaches
 a debugger and stops the target process, and a failed teardown can leave the
@@ -119,7 +172,8 @@ PointerFinder authors · PS5-MemoryPeeker, ps5dbg, PINCE and Cheat Engine
 contributors · GoldHEN and etaHEN developers and cheat contributors · the PS5
 homebrew community.
 
+---
 ## License
 
-MIT.
-
+No licence is specified, so all rights are reserved by default. You are welcome
+to read the code and run it; if you want to reuse or redistribute it, ask.

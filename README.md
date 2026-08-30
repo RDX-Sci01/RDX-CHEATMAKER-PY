@@ -12,7 +12,7 @@ dependency.
 
 ```bash
 python3 -m pip install numpy
-python3 RDX-CHEATMAKER-UI-final.py
+python3 RDX-CHEATMAKER-UI.py
 ```
 
 ---

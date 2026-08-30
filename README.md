@@ -15,6 +15,7 @@ python3 -m pip install numpy
 python3 RDX-CHEATMAKER-UI.py
 ```
 
+
 ---
 
 ## What it does
@@ -33,6 +34,26 @@ you can't read off the screen.
 | TurboScan | on the console (ps5debug-NG) | **~0.8 s** |
 | Console | on the console (legacy) | payload-dependent |
 | Host | streams memory to your PC | ~140 s |
+
+**Find what writes an address** — put a hardware watchpoint on a value, do
+the thing that changes it, and RDX identifies the machine instruction that
+wrote it. It does not trust the address the console reports: that names the
+instruction *after* the store, so RDX decodes backwards and proves the
+candidate by recomputing its target from the captured registers. If that does
+not equal the address you watched, it keeps waiting rather than guessing.
+
+**Instruction anchors** — the writing instruction sits at a different address
+every launch, so RDX captures 32 bytes of surrounding code as a signature and
+re-finds it later. A signature that matches in more than one place, or in none,
+is refused rather than guessed at. Anchors are saved as portable artifacts, so
+one capture can be re-verified and applied in a later session without spending
+another debugger attach.
+
+**Verification before writing** — a matching signature is evidence, not
+permission. Before any patch RDX re-checks that the signature still relocates
+uniquely, that the bytes there are the instruction it captured, and that the
+memory is executable and not writable. Any failed check means nothing is
+written at all. The original bytes are kept so the patch can be undone.
 
 **Pointer chains** — a moving heap address is useless in a trainer. RDX walks
 backwards to a module-relative root, then refuses to call the chain permanent
@@ -98,6 +119,7 @@ For the full walkthrough — first scan to exported trainer, screen by screen �
 see **[`info/RDX-CHEATMAKER-PY_README.md`](info/RDX-CHEATMAKER-PY_README.md)**.
 
 ---
+
 
 
 ## Requirements

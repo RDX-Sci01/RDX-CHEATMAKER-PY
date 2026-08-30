@@ -20,7 +20,8 @@ python3 RDX-CHEATMAKER-UI.py
 ## What it does
 
 **Scanning** — exact-value and unknown-value scans across all ten numeric
-types (`u8 i8 u16 i16 u32 i32 u64 i64 f32 f64`), plus AOB/raw-byte patterns
+types, or **Auto**, which tries the types your value could be and settles on
+whichever finds matches (`u8 i8 u16 i16 u32 i32 u64 i64 f32 f64`), plus AOB/raw-byte patterns
 with `??` wildcards. Aligned or unaligned. Relational next-scans (changed,
 unchanged, increased, decreased, increased/decreased by N) for hunting values
 you can't read off the screen.
@@ -39,9 +40,26 @@ until it has survived **two real game reloads**. Same-session evidence is
 explicitly rejected, because a chain that resolves right now is often just
 this session's heap coincidence.
 
-**Cheats** — independent freeze toggles with live ON/OFF/ERR status, one-shot
-writes, and per-cheat editing. Simultaneous freezes collapse into a single
-bulk-write exchange per tick rather than one write per cheat.
+**Cheats** — independent freeze toggles with live ON/OFF/ERR/LOSE status,
+one-shot writes, and per-cheat editing. Simultaneous freezes collapse into a
+single bulk-write exchange per tick rather than one write per cheat.
+
+> **A freeze cannot hold a value the game rewrites every frame.** This is a
+> property of the link, not a tuning problem, and it is worth knowing before
+> you reach for the feature. Measured on a real PS5: the game rewrote an ammo
+> address every 8–20 ms, while one write round trip costs ~15.7 ms. The freeze
+> held the value in 31 of 657 samples (4.7%) at its 200 ms tick, and 47.9% even
+> in a tight loop with no delay at all.
+>
+> Freezing works exactly as advertised for values a game writes only when they
+> *change* — currency, item counts, unlock flags, totals. For ammo, health,
+> timers and anything else updated per frame, it will lose, and the cheat
+> indicator reports **LOSE** rather than pretending otherwise.
+>
+> The established fix is to patch the instruction that performs the write
+> rather than race it — which is what every cheat in the GoldHEN corpus does.
+> RDX cannot yet author those; see `info/UPSTREAM_AUDIT_PASS8.md` and
+> `PASS9.md`.
 
 **Export / import** — native `.rdx.json` (the only format that carries pointer
 chains), GoldHEN/etaHEN checkbox JSON, CheatRunner `.mc4`, and the plaintext
@@ -80,6 +98,7 @@ For the full walkthrough — first scan to exported trainer, screen by screen �
 see **[`info/RDX-CHEATMAKER-PY_README.md`](info/RDX-CHEATMAKER-PY_README.md)**.
 
 ---
+
 
 ## Requirements
 

@@ -1347,6 +1347,17 @@ MAX_TRAINER_FILE_BYTES = 8 * 1024 * 1024
 # survive the container. Short on purpose: it shares a line with the cheat's
 # own name in someone else's menu.
 _ONE_SHOT_MARKER = "[1-shot]"
+# A cheat whose on and off values are identical writes what is already there.
+# It cannot do anything, and in a manager it is indistinguishable from a
+# broken one. Observed for real on 2026-08-30: a CheatRunner trainer built
+# with deliberately inert values loaded correctly, did nothing when toggled,
+# and the reasonable question back was "what is this supposed to do?".
+#
+# The person who discovers an inert cheat is the person least able to diagnose
+# it -- they see a toggle that does not work, not an equal pair of byte
+# strings in a file they cannot read. Same reasoning as _ONE_SHOT_MARKER, and
+# the same mechanism: the name is the one field every manager displays.
+_INERT_MARKER = "[no-op]"
 
 _BOOKMARK_MAX = 256
 
@@ -10191,6 +10202,10 @@ def generate_etahen_json(cheats: list, game_id: str, game_ver: str,
             skipped.append((name, f"invalid scalar patch: {exc}"))
             continue
         description = "RDX module-relative scalar write."
+        inert = on_bytes == off_bytes
+        if inert:
+            description += (" On and off values are identical, so toggling "
+                            "this writes back what is already there.")
         downgraded = str(cheat.get("type", "")) == "freeze"
         if downgraded:
             description += " etaHEN applies it once per toggle; it is not a live freeze."
@@ -10211,7 +10226,11 @@ def generate_etahen_json(cheats: list, game_id: str, game_ver: str,
         # Marked only on the entries that are actually downgraded: a marker on
         # every row would be noise, and the name is what a player reads in a
         # menu.
-        exported_name = f"{name} {_ONE_SHOT_MARKER}" if downgraded else name
+        exported_name = name
+        if downgraded:
+            exported_name += f" {_ONE_SHOT_MARKER}"
+        if inert:
+            exported_name += f" {_INERT_MARKER}"
         mods.append({
             "name": exported_name,
             # "hint", not "description": a real etaHEN file

@@ -1597,25 +1597,31 @@ def _resolve_cheat_runtime_address(cheat: dict) -> int:
     return int(_runtime_scalar_address(cheat))
 
 
-def _freeze_manager_worker() -> None:
-    """Keep every enabled saved cheat active until individually disabled."""
+def _freeze_manager_worker(stop_event: threading.Event) -> None:
+    """Keep every enabled saved cheat active until individually disabled.
+
+    Takes its own stop event rather than reading the module-level one.
+    _stop_freeze_worker deliberately leaves that signal asserted when its
+    join times out, so that a worker still blocked in a write cannot
+    resume later -- which means the next worker cannot share it.
+    """
     global _freeze_thread
     try:
-        while not _freeze_stop.is_set():
+        while not stop_event.is_set():
             with _freeze_lock:
                 targets = list(_freeze_targets.items())
             if not targets:
                 # Keep one lightweight manager alive between toggle changes.
                 # Exiting here races with a new enable that sees the old
                 # thread as alive and therefore does not start a replacement.
-                _freeze_stop.wait(0.5)
+                stop_event.wait(0.5)
                 continue
             # Phase 1: resolve each target's live address + value. This is
             # inherently per-cheat (a pointer chain dereferences one hop at
             # a time), so it cannot be batched — only the final writes can.
             resolved = []   # [(runtime_id, address, data)]
             for runtime_id, cheat in targets:
-                if _freeze_stop.is_set():
+                if stop_event.is_set():
                     break
                 try:
                     address = _resolve_cheat_runtime_address(cheat)
@@ -1641,7 +1647,7 @@ def _freeze_manager_worker() -> None:
                     results = memdbg_write_multi(
                         state["ip"], state["pid"],
                         [(addr, data) for _rid, addr, data in resolved],
-                        cancel_event=_freeze_stop, timeout=2.0)
+                        cancel_event=stop_event, timeout=2.0)
                 except Exception as exc:
                     results = [False] * len(resolved)
                     add_log(f"MemDBG bulk freeze write failed: {exc}", "warn")
@@ -1655,7 +1661,7 @@ def _freeze_manager_worker() -> None:
                     results = ps5_write_multi(
                         state["ip"], state["pid"],
                         [(addr, data) for _rid, addr, data in resolved],
-                        cancel_event=_freeze_stop, timeout=2.0)
+                        cancel_event=stop_event, timeout=2.0)
                 except Exception as exc:
                     results = [False] * len(resolved)
                     add_log(f"Bulk freeze write failed: {exc}", "warn")
@@ -1666,12 +1672,12 @@ def _freeze_manager_worker() -> None:
                             else "error: payload rejected the write")
             else:
                 for runtime_id, address, data in resolved:
-                    if _freeze_stop.is_set():
+                    if stop_event.is_set():
                         break
                     try:
                         if not ps5_write(
                                 state["ip"], state["pid"], address, data,
-                                cancel_event=_freeze_stop, timeout=1.0):
+                                cancel_event=stop_event, timeout=1.0):
                             raise IOError("payload rejected the write")
                         with _freeze_lock:
                             _freeze_status[runtime_id] = f"active @ {hex(address)}"
@@ -1679,7 +1685,7 @@ def _freeze_manager_worker() -> None:
                         with _freeze_lock:
                             _freeze_status[runtime_id] = f"error: {exc}"
 
-            _freeze_stop.wait(0.2)
+            stop_event.wait(0.2)
     finally:
         with _freeze_lock:
             if threading.current_thread() is _freeze_thread:
@@ -1687,14 +1693,30 @@ def _freeze_manager_worker() -> None:
 
 
 def _ensure_freeze_worker() -> None:
-    global _freeze_thread
+    """Guarantee a running worker for the currently enabled freezes.
+
+    The alive check alone was not enough. _stop_freeze_worker keeps the stop
+    signal asserted when its join times out -- a worker blocked in a slow
+    write -- and retains the thread reference. Enabling a freeze during that
+    window found a live thread and returned, leaving the signal asserted; the
+    old worker then exited and cleared the reference, so the cheat sat at
+    "starting @ ..." with no worker and no way back short of toggling it
+    again. Reachable whenever a write outlives the 2 s join, which a degraded
+    console makes easy, and silent when it happens.
+
+    Clearing the shared event instead would resume the outgoing worker, which
+    is exactly what _stop_freeze_worker is preventing. So a new worker gets a
+    new event and the two cannot interfere.
+    """
+    global _freeze_thread, _freeze_stop
     with _freeze_lock:
-        if _freeze_thread and _freeze_thread.is_alive():
+        if (_freeze_thread and _freeze_thread.is_alive()
+                and not _freeze_stop.is_set()):
             return
-        _freeze_stop.clear()
+        _freeze_stop = threading.Event()
         _freeze_thread = threading.Thread(
-            target=_freeze_manager_worker, name="rdx-freeze-manager",
-            daemon=True)
+            target=_freeze_manager_worker, args=(_freeze_stop,),
+            name="rdx-freeze-manager", daemon=True)
         _freeze_thread.start()
 
 

@@ -12,6 +12,7 @@ RDX_VERSION = "1.0.0"
 import array as _array
 import base64
 import bisect
+import contextlib
 import curses
 import gc
 import hashlib
@@ -28,6 +29,7 @@ import threading
 import tempfile
 import time
 import unicodedata
+import warnings
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -1102,6 +1104,10 @@ class ScanState:
         self._check()
 
 
+# Defined before the preference loader that reads it.
+_GUIDE_PREF_KEY = "guide_seen"
+
+
 def _load_preferences(path: Optional[Path] = None) -> dict:
     """Load small, non-sensitive UI preferences; corrupt files fail closed."""
     src = Path(path or _PREFERENCES_FILE)
@@ -1114,6 +1120,8 @@ def _load_preferences(path: Optional[Path] = None) -> dict:
             value = data.get(key)
             if isinstance(value, str) and len(value) <= 1024:
                 out[key] = value
+        if data.get(_GUIDE_PREF_KEY):
+            out[_GUIDE_PREF_KEY] = True
         # Tunables are bounded on the way in: a hand-edited file must not be
         # able to set an unbounded pointer depth or a zero-size scan window.
         for key in _SETTING_SPECS:
@@ -1133,6 +1141,8 @@ def _save_preferences(updates: Optional[dict] = None,
     for key, value in (updates or {}).items():
         if key in {"last_ip", "last_process", "export_dir"}:
             payload[key] = str(value or "")[:1024]
+        elif key == _GUIDE_PREF_KEY:
+            payload[key] = bool(value)
         elif key in _SETTING_SPECS:
             payload[key] = _coerce_setting(key, value)
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1914,6 +1924,39 @@ _memdbg_maps_v2_supported: dict = {}   # ip -> bool, learned once per host
 _console_scan_lock = threading.Lock()
 _console_scan_supported: dict = {}     # ip -> bool, learned once per host
 
+# Same idea for TurboScan, and for the same reason. ps5_scan_exact_turbo runs
+# ps5_auth_scanner then ps5_turboscan_caps, both over port 744 with
+# ps5_connect's 15 s default. MemDBG *accepts* connections on 744 but never
+# answers those commands, so the probe does not fail fast -- it times out.
+# Nothing remembered that, so every scan of every kind re-probed and paid the
+# timeout again: measured on a live PS5 (MemDBG 0.2.0-nightly.153), every
+# first scan logged "TurboScan unavailable (timed out)" before starting real
+# work. The console-scan path two branches below already learns this per host
+# ("not retrying it on this console"); TurboScan simply never did.
+_turbo_supported: dict = {}            # ip -> bool, learned once per host
+_turbo_lock = threading.Lock()
+
+
+def _turbo_worth_probing(ip: str) -> bool:
+    """False once this host has shown it has no TurboScan at all."""
+    with _turbo_lock:
+        return _turbo_supported.get(ip) is not False
+
+
+def _note_turbo_outcome(ip: str, ok: bool) -> None:
+    """Record whether the TurboScan capability probe succeeded on this host.
+
+    Only call this where the failure really is evidence about the payload.
+    A resident-rescan failure is not: "no matching resident session" happens
+    routinely on consoles whose TurboScan works perfectly.
+    """
+    with _turbo_lock:
+        first = ip not in _turbo_supported
+        _turbo_supported[ip] = bool(ok)
+    if not ok and first:
+        add_log("TurboScan is unavailable on this console; not probing for "
+                "it again this session", "warn")
+
 
 def _memdbg_unframe_memory(raw: bytes) -> bytes:
     """Decode MemDBG's command-local raw/LZ4 response frame (used for both
@@ -2198,16 +2241,125 @@ class _MemDBGClient:
         return found[:max_results]
 
 
-def memdbg_probe(ip: str, timeout: float = 1.5) -> Optional[dict]:
-    """Return native MemDBG HELLO information, or None when unavailable."""
-    client = _MemDBGClient(ip, timeout)
+# ── one shared native connection ──────────────────────────────────────────────
+# MemDBG's native listener accepts a small fixed number of connections and
+# leaves closed ones lingering in FIN-WAIT-2, so the connection-per-call
+# pattern these helpers used to follow exhausted it almost immediately.
+# Measured against MemDBG 0.2.0-nightly.153 on a live PS5 running CUSA01659:
+#
+#     connect-read-close, repeated  ->  7 cycles, then "PS5 disconnected"
+#                                       for ~60 s, at 0/200/500 ms pacing
+#                                       alike, and with explicit shutdown()
+#     one connection, 200 reads     ->  200/200 OK at 4.1 ms/read
+#
+# Pacing made no difference, so this is a count of live connections, not a
+# rate limit, and the compatibility listener on 744 does not share it
+# (40/40 connect-per-read cycles fine).  Once exhausted, every ps5_read spent
+# its whole native retry budget -- three connect attempts plus 0.3 s of
+# backoff -- before falling back to 744: 279 ms per read against 5 ms, a 53x
+# penalty.  _note_memdbg_fallback reports that once per session, so after one
+# log line the slowdown was silent; over a 4.18 GiB scan at 64 KiB per read it
+# is about five hours of pure backoff.
+#
+# Sharing one connection keeps RDX inside the console's budget and makes the
+# native path the fast path it was meant to be.  The scan reader already kept
+# its own long-lived client, which is why scanning never hit this.
+_memdbg_shared = None
+_memdbg_shared_lock = threading.RLock()
+_memdbg_native_failures = 0
+
+# Consecutive whole-operation failures (every retry exhausted) after which the
+# native path is abandoned for the session.  A payload that answers HELLO but
+# cannot serve reads -- exactly what an exhausted listener looks like -- would
+# otherwise be retried, at full retry cost, for every operation forever.
+_MEMDBG_NATIVE_FAILURE_LIMIT = 3
+
+
+def memdbg_native_ready() -> bool:
+    """False once the native path has failed enough times to abandon it."""
+    return _memdbg_native_failures < _MEMDBG_NATIVE_FAILURE_LIMIT
+
+
+def _memdbg_note_native_outcome(ok: bool) -> None:
+    """Record one whole-operation outcome and latch the path off on repeats."""
+    global _memdbg_native_failures
+    if ok:
+        _memdbg_native_failures = 0
+        return
+    _memdbg_native_failures += 1
+    if _memdbg_native_failures == _MEMDBG_NATIVE_FAILURE_LIMIT:
+        add_log(f"MemDBG native I/O failed {_MEMDBG_NATIVE_FAILURE_LIMIT} times "
+                "in a row; using the compatibility port for the rest of this "
+                "session", "warn")
+
+
+@contextlib.contextmanager
+def memdbg_session(ip: str, timeout: float = 5.0):
+    """Yield the process-wide native client, connecting or reconnecting.
+
+    Serialised on purpose: one connection cannot carry two overlapping
+    exchanges, and the console's connection budget is far too small to give
+    every caller its own.  Reads cost about 4 ms, so the queue is cheap.
+    """
+    global _memdbg_shared
+    with _memdbg_shared_lock:
+        client = _memdbg_shared
+        if client is not None and (client.sock is None or client.ip != ip):
+            client.close()
+            client = _memdbg_shared = None
+        if client is None:
+            client = _MemDBGClient(ip, timeout)
+            client.connect()
+            _memdbg_shared = client
+        client.timeout = float(timeout)
+        if client.sock is not None:
+            try:
+                client.sock.settimeout(float(timeout))
+            except OSError:
+                pass
+        try:
+            yield client
+        except BaseException:
+            # A failed exchange may have left unread bytes in the stream; the
+            # next caller must not inherit a desynchronised connection.
+            #
+            # BaseException, not Exception: a cancelled scan, a Ctrl-C or a
+            # closed generator abandons the exchange exactly as a socket error
+            # does, and patch117 caught only Exception -- so an interrupt kept
+            # the client cached with a half-read stream and handed it straight
+            # to the next caller. Verified: after KeyboardInterrupt the shared
+            # client survived with its socket open and was reused.
+            client.close()
+            _memdbg_shared = None
+            raise
+
+
+def memdbg_reset_session() -> None:
+    """Drop the shared connection and re-arm the native path.
+
+    Called by Reconnect: after a payload restart the old connection is dead
+    and the failure latch, if it tripped, describes a console that no longer
+    exists.
+    """
+    global _memdbg_shared, _memdbg_native_failures
+    with _memdbg_shared_lock:
+        if _memdbg_shared is not None:
+            _memdbg_shared.close()
+            _memdbg_shared = None
+        _memdbg_native_failures = 0
+
+
+def memdbg_probe(ip: str, timeout: float = 1.5):
+    """Return native MemDBG HELLO information, or None when unavailable.
+
+    Borrows the shared session, so the connection opened to identify the
+    payload is the same one the first read uses rather than a spent slot.
+    """
     try:
-        client.connect()
-        return dict(client.hello or {})
+        with memdbg_session(ip, timeout) as client:
+            return dict(client.hello or {})
     except Exception:
         return None
-    finally:
-        client.close()
 
 def check_ok(s: socket.socket) -> bool:
     return struct.unpack("<I", recv_exact(s, 4))[0] == STATUS_SUCCESS
@@ -2987,16 +3139,16 @@ def ps5_scan_relational_turbo(ip: str, pid: int, width: int,
 # All helpers use sendall() and try/finally so the socket is always closed.
 
 def ps5_proc_list(ip: str) -> list:
-    if state.get("backend") == "memdbg-experimental":
-        client = _MemDBGClient(ip)
+    if state.get("backend") == "memdbg-experimental" and memdbg_native_ready():
         try:
-            client.connect()
-            return client.process_list()
+            with memdbg_session(ip) as client:
+                procs = client.process_list()
+            _memdbg_note_native_outcome(True)
+            return procs
         except Exception as exc:
+            _memdbg_note_native_outcome(False)
             add_log(f"MemDBG process list failed; using compatibility port: {exc}",
                     "warn")
-        finally:
-            client.close()
     s = ps5_connect(ip)
     try:
         s.sendall(cmd_header(CMD_PROC_LIST))
@@ -3017,15 +3169,15 @@ def ps5_proc_list(ip: str) -> list:
         s.close()
 
 def ps5_maps(ip: str, pid: int) -> list:
-    if state.get("backend") == "memdbg-experimental":
-        client = _MemDBGClient(ip)
+    if state.get("backend") == "memdbg-experimental" and memdbg_native_ready():
         try:
-            client.connect()
-            return client.process_maps(pid)
+            with memdbg_session(ip) as client:
+                entries = client.process_maps(pid)
+            _memdbg_note_native_outcome(True)
+            return entries
         except Exception as exc:
+            _memdbg_note_native_outcome(False)
             add_log(f"MemDBG maps failed; using compatibility port: {exc}", "warn")
-        finally:
-            client.close()
     s = ps5_connect(ip)
     try:
         body = struct.pack("<I", pid)
@@ -3214,7 +3366,15 @@ def current_target(ip: Optional[str] = None) -> Target:
 
 
 def _memdbg_has(capability: int) -> bool:
+    """Whether the native path both advertises `capability` and still works.
+
+    The advertised bitmap is cached from the HELLO taken at connect time, so
+    on its own it keeps claiming a capability long after the listener stopped
+    serving it -- and one real payload advertises 0xFFFFFFFF, every bit set,
+    which makes the bitmap alone worthless as a health signal.
+    """
     return (state.get("backend") == "memdbg-experimental" and
+            memdbg_native_ready() and
             bool(int((state.get("memdbg") or {}).get("capabilities", 0)) &
                  int(capability)))
 
@@ -3233,16 +3393,16 @@ def ps5_read(ip: str, pid: int, addr: int, length: int) -> bytes:
     last_exc: Exception = RuntimeError("no attempts")
     if _memdbg_has(MEMDBG_CAP_MEMORY_READ):
         for attempt in range(_UI_MAX_RETRIES):
-            client = _MemDBGClient(ip)
             try:
-                client.connect()
-                return client.memory_read(pid, addr, length)
+                with memdbg_session(ip) as client:
+                    data = client.memory_read(pid, addr, length)
+                _memdbg_note_native_outcome(True)
+                return data
             except Exception as exc:
                 last_exc = exc
                 if attempt < _UI_MAX_RETRIES - 1:
                     time.sleep(0.1 * (attempt + 1))
-            finally:
-                client.close()
+        _memdbg_note_native_outcome(False)
         _note_memdbg_fallback("read", last_exc)
     for attempt in range(_UI_MAX_RETRIES):
         s = None
@@ -3272,10 +3432,11 @@ def ps5_write(ip: str, pid: int, addr: int, data: bytes,
         for attempt in range(_UI_MAX_RETRIES):
             if cancel_event and cancel_event.is_set():
                 return False
-            client = _MemDBGClient(ip, timeout=timeout)
             try:
-                client.connect()
-                return client.memory_write(pid, addr, data)
+                with memdbg_session(ip, timeout=timeout) as client:
+                    written = client.memory_write(pid, addr, data)
+                _memdbg_note_native_outcome(True)
+                return written
             except Exception as exc:
                 native_exc = exc
                 if attempt < _UI_MAX_RETRIES - 1:
@@ -3285,8 +3446,7 @@ def ps5_write(ip: str, pid: int, addr: int, data: bytes,
                             return False
                     else:
                         time.sleep(delay)
-            finally:
-                client.close()
+        _memdbg_note_native_outcome(False)
         _note_memdbg_fallback("write", native_exc)
     for attempt in range(_UI_MAX_RETRIES):
         if cancel_event and cancel_event.is_set():
@@ -3387,20 +3547,20 @@ def memdbg_write_multi(ip: str, pid: int, entries: list,
     for attempt in range(_UI_MAX_RETRIES):
         if cancel_event and cancel_event.is_set():
             return [False] * len(entries)
-        client = _MemDBGClient(ip, timeout=timeout)
         try:
-            client.connect()
-            # One BATCH_WRITE exchange is capped at
-            # MEMDBG_BATCH_WRITE_MAX_ITEMS entries.  Split a larger freeze
-            # tick across several exchanges on the same connection: passing
-            # the whole list straight through raised ValueError, which this
-            # loop then treated as a transient network fault, so a user with
-            # 65+ simultaneous freezes got nothing written at all, every
-            # tick, with no fall-through to the per-write path.
-            results = []
-            for start in range(0, len(entries), MEMDBG_BATCH_WRITE_MAX_ITEMS):
-                results.extend(client.memory_write_multi(
-                    pid, entries[start:start + MEMDBG_BATCH_WRITE_MAX_ITEMS]))
+            with memdbg_session(ip, timeout=timeout) as client:
+                # One BATCH_WRITE exchange is capped at
+                # MEMDBG_BATCH_WRITE_MAX_ITEMS entries.  Split a larger freeze
+                # tick across several exchanges on the same connection: passing
+                # the whole list straight through raised ValueError, which this
+                # loop then treated as a transient network fault, so a user with
+                # 65+ simultaneous freezes got nothing written at all, every
+                # tick, with no fall-through to the per-write path.
+                results = []
+                for start in range(0, len(entries), MEMDBG_BATCH_WRITE_MAX_ITEMS):
+                    results.extend(client.memory_write_multi(
+                        pid, entries[start:start + MEMDBG_BATCH_WRITE_MAX_ITEMS]))
+            _memdbg_note_native_outcome(True)
             return results
         except Exception as exc:
             native_exc = exc
@@ -3411,8 +3571,7 @@ def memdbg_write_multi(ip: str, pid: int, entries: list,
                         return [False] * len(entries)
                 else:
                     time.sleep(delay)
-        finally:
-            client.close()
+    _memdbg_note_native_outcome(False)
     raise native_exc
 
 
@@ -5225,6 +5384,76 @@ def _recommended_game_scan_region(region: dict, process: str = "") -> bool:
     return bool(main_image or heap_named or (prot & 0x2))
 
 
+# ── measured fallback for payloads with no region classifier ──────────────────
+# ps5debug-NG answers "is this mapping worth scanning?" with its read-throughput
+# classifier.  MemDBG has no equivalent, and the fallback that stood in for it --
+# skip any region larger than MAX_REGION -- is exactly the blunt size heuristic
+# the classifier was introduced to replace.  scan_first's own comment says so:
+#
+#     A blanket size cap is the wrong instrument for excluding GPU/VRAM, and on
+#     a real title it is actively harmful: retail games commonly place the whole
+#     managed heap in one multi-GiB cached mapping, so the cap silently skipped
+#     the only memory worth scanning.
+#
+# Measured against MemDBG 0.2.0-nightly.153 on a PS5 running CUSA01659, the cap
+# excluded 4.000 GiB of the 4.180 GiB of writable memory -- 95.7% of the game --
+# in two 2 GiB mappings named "[device]".  Both read at 86 MiB/s, *faster* than
+# the "[default]" regions that were kept (34 MiB/s), and both held thousands of
+# occurrences of the value being searched for.  A first scan therefore looked at
+# 4.4% of the game and reported its 53 matches as though that were the answer.
+#
+# So do what the classifier does: read a little, and time it.
+_OVERSIZE_PROBE_BYTES = 0x40000        # 256 KiB -- one round trip, not a scan
+_OVERSIZE_MIN_RATE    = 4.0            # MiB/s; normal mappings measure 30-90
+_oversize_probe_cache: dict = {}
+_oversize_probe_lock = threading.Lock()
+
+
+def _oversize_region_is_scannable(ip: str, pid: int, region: dict) -> bool:
+    """Whether an oversized region reads fast enough to be worth scanning.
+
+    Cached per (host, pid, region), so a scan pays at most one extra round
+    trip per oversized mapping and repeat scans pay none.  An unreadable
+    region is excluded: it cannot be scanned regardless of its size.
+    """
+    start, end = int(region.get("start", 0)), int(region.get("end", 0))
+    key = (ip, int(pid), start, end)
+    with _oversize_probe_lock:
+        if key in _oversize_probe_cache:
+            return _oversize_probe_cache[key]
+    span = min(_OVERSIZE_PROBE_BYTES, max(end - start, 0))
+    verdict = False
+    rate = 0.0
+    if span > 0:
+        # Read from inside the mapping rather than its first page, which is a
+        # guard page often enough to make the probe answer the wrong question.
+        offset = min(span, (end - start) // 2)
+        try:
+            began = time.monotonic()
+            data = ps5_read(ip, pid, start + offset, span)
+            elapsed = max(time.monotonic() - began, 1e-9)
+            rate = (len(data) / (1024.0 * 1024.0)) / elapsed
+            verdict = rate >= _OVERSIZE_MIN_RATE
+        except Exception as exc:
+            add_log(f"Region {start:#x} probe failed, excluding it: {exc}",
+                    "warn")
+            verdict = False
+    with _oversize_probe_lock:
+        if len(_oversize_probe_cache) >= 256:
+            _oversize_probe_cache.clear()
+        _oversize_probe_cache[key] = verdict
+    add_log(f"Region {start:#x}-{end:#x} "
+            f"({(end - start) / (1024 ** 3):.2f} GiB) probed at {rate:.1f} MiB/s "
+            f"— {'scanning it' if verdict else 'excluded as too slow'}")
+    return verdict
+
+
+def _invalidate_oversize_probes() -> None:
+    """Region layout is process-scoped; drop verdicts when it changes."""
+    with _oversize_probe_lock:
+        _oversize_probe_cache.clear()
+
+
 def scan_first(ip: str, pid: int, value, width: int = 4,
                aligned: bool = True, progress_cb=None,
                cancel_event=None,
@@ -5317,8 +5546,11 @@ def scan_first(ip: str, pid: int, value, width: int = 4,
             if _classifier_ok:
                 if _region_is_uncached(r, _uncached, _uncached_starts):
                     continue
-            elif (r['end'] - r['start']) > MAX_REGION:
-                continue   # no classifier on this payload: keep the old guard
+            elif ((r['end'] - r['start']) > MAX_REGION and
+                  not _oversize_region_is_scannable(ip, pid, r)):
+                # No classifier on this payload: measure the region rather
+                # than assuming a big mapping is GPU memory.
+                continue
             out.append(r)
         return out
 
@@ -5364,17 +5596,20 @@ def scan_first(ip: str, pid: int, value, width: int = 4,
     selected_ranges = sorted((r['start'], r['end']) for r in scannable)
     payload_exact_ok = VALUE_TYPES[type_key]["kind"] in {"uint", "sint", "float"}
     if (payload_exact_ok and engine in ("auto", "turbo") and
-            os.environ.get("RDX_TURBO_SCAN", "1") != "0"):
+            os.environ.get("RDX_TURBO_SCAN", "1") != "0" and
+            (_turbo_worth_probing(ip) or engine == "turbo")):
         try:
             result = ps5_scan_exact_turbo(ip, pid, value, width,
                                           selected_ranges, aligned,
                                           cancel_event, progress_cb,
                                           value_type=type_key)
+            _note_turbo_outcome(ip, True)
             add_log(f"Turbo first scan completed in {max(time.monotonic()-started,1e-9):.2f}s")
             return result
         except InterruptedError:
             raise
         except Exception as exc:
+            _note_turbo_outcome(ip, False)
             add_log(f"TurboScan unavailable ({exc})", "warn")
             if engine == "turbo":
                 raise
@@ -6002,7 +6237,8 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
             if _classifier_ok:
                 if _region_is_uncached(r, _uncached, _uncached_starts):
                     continue
-            elif (r['end'] - r['start']) > MAX_REGION:
+            elif ((r['end'] - r['start']) > MAX_REGION and
+                  not _oversize_region_is_scannable(ip, pid, r)):
                 continue
             out.append(r)
         return out
@@ -6045,18 +6281,21 @@ def scan_first_unknown(ip: str, pid: int, width: int = 4,
     # unavailable, etc.), same as scan_first's own turbo fallback.
     engine = state.get("scan_engine", "auto")
     if (engine in ("auto", "turbo") and
-            os.environ.get("RDX_TURBO_SCAN", "1") != "0"):
+            os.environ.get("RDX_TURBO_SCAN", "1") != "0" and
+            (_turbo_worth_probing(ip) or engine == "turbo")):
         try:
             selected_ranges = sorted((r['start'], r['end']) for r in scannable)
             addrs, vals = ps5_scan_unknown_turbo(
                 ip, pid, width, selected_ranges, aligned,
                 cancel_event, progress_cb, value_type=type_key)
+            _note_turbo_outcome(ip, True)
             add_log("Turbo unknown-value scan completed in "
                     f"{max(time.monotonic() - started, 1e-9):.2f}s")
             return addrs, vals
         except InterruptedError:
             raise
         except Exception as exc:
+            _note_turbo_outcome(ip, False)
             add_log(f"TurboScan snapshot unavailable ({exc})", "warn")
             if engine == "turbo":
                 raise
@@ -6345,7 +6584,10 @@ def _wrapped_delta(prev_values: np.ndarray, delta, width: int,
     """
     step = np.uint64(int(delta) & 0xFFFF_FFFF_FFFF_FFFF)
     wide = prev_values.astype(np.uint64)
-    wide = (wide + step) if sign > 0 else (wide - step)
+    # Wrapping here is the entire point of the function, so it must not be
+    # reported as an error once install_warning_router() makes overflow warn.
+    with np.errstate(over="ignore"):
+        wide = (wide + step) if sign > 0 else (wide - step)
     masked = wide & np.uint64(WIDTH_MAX[width])
     return masked.astype(np.dtype(f"<u{width}")).view(dtype)
 
@@ -6406,7 +6648,9 @@ def scan_next_relational(ip: str, pid: int, width: int,
     # `prev_addrs`/`prev_values` ran on the host path) or any other failure.
     if (mode in _SNAPSHOT_COMPARE_TYPE and
             not (kind == "float" and float(tolerance) > 0) and
-            state.get("scan_engine", "auto") in ("auto", "turbo")):
+            state.get("scan_engine", "auto") in ("auto", "turbo") and
+            (_turbo_worth_probing(ip) or
+             state.get("scan_engine") == "turbo")):
         try:
             return ps5_scan_relational_turbo(
                 ip, pid, width, mode, delta, cancel_event, progress_cb,
@@ -6911,22 +7155,22 @@ def _fast_direct_pointer_hits(ip: str, pid: int, target: int, maps: list,
     # a seed only; RDX remains responsible for offsets, recursion, module roots
     # and verification.  This avoids trusting MemDBG's presently-unused depth
     # field as if it represented a complete chain.
-    if state.get("backend") == "memdbg-experimental":
-        client = _MemDBGClient(ip, timeout=10.0)
+    if state.get("backend") == "memdbg-experimental" and memdbg_native_ready():
         try:
-            client.connect()
-            region_starts, region_rows = _build_region_lookup(maps)
-            for holder in client.pointer_holders(pid, target, readable, max_hits):
-                region = _region_for_addr(holder, region_starts, region_rows)
-                if region is not None and _is_static_region(region):
-                    hits.append((int(holder), 0, region))
+            with memdbg_session(ip, timeout=10.0) as client:
+                region_starts, region_rows = _build_region_lookup(maps)
+                for holder in client.pointer_holders(pid, target, readable,
+                                                     max_hits):
+                    region = _region_for_addr(holder, region_starts, region_rows)
+                    if region is not None and _is_static_region(region):
+                        hits.append((int(holder), 0, region))
+            _memdbg_note_native_outcome(True)
             if hits:
                 add_log(f"MemDBG native pointer seed: {len(hits)} exact static holder(s)")
                 return hits[:max_hits]
         except Exception as exc:
+            _memdbg_note_native_outcome(False)
             add_log(f"MemDBG pointer seed unavailable; using RDX scan: {exc}", "warn")
-        finally:
-            client.close()
     # Gather beyond the returned cap so ranking, not scan order, decides which
     # holders survive; see _PTR_FAST_DIRECT_POOL.
     pool_limit = max(int(max_hits), 1) * _PTR_FAST_DIRECT_POOL
@@ -9931,6 +10175,72 @@ def add_log(msg: str, level: str = "info") -> None:
 
 _COLORS_OK = False
 
+# ── warning routing ───────────────────────────────────────────────────────────
+# Python writes warnings to sys.stderr, and curses does not redirect stderr --
+# it takes over the terminal display. So during a session a RuntimeWarning
+# lands on the terminal *underneath* the TUI: it either corrupts the drawn
+# screen until the next full refresh, or is lost entirely when the program
+# restores the terminal on exit. Neither puts it in front of the user, and
+# neither puts it in the log they can save and send.
+#
+# That matters for this program specifically. RDX does heavy NumPy arithmetic
+# on scan data, and _wrapped_delta's docstring records what that class of
+# failure looks like here: "the sum never wraps and a legitimate match is
+# silently dropped". That case is handled and tested. The point is that if a
+# future change reintroduces one, the warning announcing it is currently
+# invisible.
+#
+# Routing warnings into add_log puts them where the user already looks, and
+# into the saved log, without anyone having to reproduce the problem under a
+# terminal they can read.
+_warning_seen: set = set()
+_warning_lock = threading.Lock()
+_WARNING_DEDUP_MAX = 256
+_original_showwarning = None
+
+
+def _log_warning(message, category, filename, lineno, file=None, line=None):
+    """Route a Python/NumPy warning into the in-app log.
+
+    Deduplicated by origin: NumPy can raise the same warning once per element
+    in a hot loop, and 500 identical lines would push every other diagnostic
+    out of a log that holds 500 entries.
+    """
+    key = (getattr(category, "__name__", str(category)),
+           str(filename), int(lineno))
+    with _warning_lock:
+        if key in _warning_seen:
+            return
+        if len(_warning_seen) >= _WARNING_DEDUP_MAX:
+            _warning_seen.clear()
+        _warning_seen.add(key)
+    try:
+        where = str(filename).rsplit("/", 1)[-1]
+        add_log(f"{key[0]}: {message} ({where}:{lineno})", "warn")
+    except Exception:
+        # A logging failure must never turn into a second warning, which
+        # would recurse straight back into here.
+        pass
+
+
+def install_warning_router() -> None:
+    """Send warnings to the log instead of to a terminal curses is using.
+
+    NumPy's error policy is set alongside it: without this, an overflow or an
+    invalid float operation is silent by default, so there is nothing for the
+    router to carry. Underflow stays ignored -- it is normal and harmless in
+    float scanning, and warning about it would be noise.
+
+    Sites that wrap on purpose (see _wrapped_delta) opt out locally with
+    np.errstate, so deliberate behaviour does not report itself as a fault.
+    """
+    global _original_showwarning
+    if _original_showwarning is None:
+        _original_showwarning = warnings.showwarning
+    warnings.showwarning = _log_warning
+    np.seterr(over="warn", divide="warn", invalid="warn", under="ignore")
+
+
 def init_colors() -> None:
     global _COLORS_OK
     try:
@@ -10382,8 +10692,13 @@ def _reset_learned_payload_support() -> None:
     """
     with _console_scan_lock:
         _console_scan_supported.clear()
+    with _turbo_lock:
+        _turbo_supported.clear()
     with _memdbg_maps_v2_lock:
         _memdbg_maps_v2_supported.clear()
+    # The shared native connection points at the old payload instance, and a
+    # tripped failure latch describes a console that no longer exists.
+    memdbg_reset_session()
 
 
 def _clear_scan_state(stop_freezes: bool = True) -> None:
@@ -10402,6 +10717,7 @@ def _clear_scan_state(stop_freezes: bool = True) -> None:
     state["scan_history"]   = deque(maxlen=5)
     with _map_cache_lock:
         _map_cache.clear()
+    _invalidate_oversize_probes()
     # NOTE: learned command-support caches are deliberately NOT cleared here.
     # _clear_scan_state also runs on a plain "Clear Results" and on a process
     # change, and forgetting there means the next scan pays the 15 s stall to
@@ -10791,6 +11107,15 @@ def _build_command_registry() -> dict:
                 menu_key="C", color=C_NORM),
         Command("scan_settings", "Settings", do_scan_settings,
                 menu_key="T", color=C_ACC),
+        # The workflow menu is deliberately small, but "small" stopped
+        # meaning "most of the program" some time ago: 16 of 22 commands
+        # were reachable only by typing their name into the palette, and a
+        # palette is a recall tool -- it cannot help someone who does not
+        # know the thing exists. This entry is the doorway; the ALSO
+        # AVAILABLE column beside it is the sign on the door.
+        Command("more_tools", "More Tools", do_command_palette,
+                menu_key="M", color=C_ACC, in_palette=False),
+        Command("guide", "Getting Started", do_guide),
         Command("bookmarks", "Bookmarks", do_bookmarks),
         Command("hex_view", "Hex View", _dispatch_hex_view,
                 requires_process=True),
@@ -10838,6 +11163,98 @@ def _command_available(name) -> bool:
     return _command_unavailable_reason(name) is None
 
 
+# ── first-run guidance ────────────────────────────────────────────────────────
+# There was no onboarding of any kind: zero occurrences of tutorial, first_run
+# or walkthrough in the whole program, and the teaching material was a README
+# that lives outside it.
+#
+# Cheat Engine ships a nine-step interactive tutorial under Help, and it is the
+# single most-recommended starting point in every third-party guide to that
+# tool. It exists because the obstacles are structural, and the same three
+# apply here: too many results, refinement being non-obvious, and pointer
+# scanning looking daunting.
+#
+# A full interactive tutorial is a large build and probably the wrong first
+# step. This is the smaller thing that covers the loop every other feature in
+# RDX sits on top of -- shown once, dismissable forever, and never in the way
+# of somebody who already knows what they are doing.
+
+
+
+def _guide_seen() -> bool:
+    return bool(_preferences.get(_GUIDE_PREF_KEY))
+
+
+def first_run_guide_lines() -> list:
+    """The one screen a first-time user gets, in the order they need it."""
+    return [
+        "RDX finds a value in a running game, then lets you change it.",
+        "",
+        "THE LOOP — this is the whole tool:",
+        "",
+        "  1. Note a number you can see in the game (ammo, gold, health).",
+        "  2. First Scan for it. You will get thousands of matches.",
+        "  3. Change it in the game — fire a shot, spend a coin.",
+        "  4. Next Scan for the new number. Most matches disappear.",
+        "  5. Repeat 3 and 4 until a handful are left.",
+        "",
+        "That narrowing is the point. One scan can never find an address;",
+        "two or three almost always can.",
+        "",
+        "IF THE FIRST SCAN FINDS NOTHING",
+        "  The value type is usually wrong. Unity games keep health, ammo",
+        "  and timers in floats — try f32 rather than the u32 default.",
+        "",
+        "WHEN YOU HAVE A FEW ADDRESSES",
+        "  Enter inspects one. C makes it a cheat. R searches for a",
+        "  permanent pointer so it survives a reload — that part needs two",
+        "  real game reloads and RDX will not skip them.",
+        "",
+        "There are more tools than the menu shows: press M, or / to search",
+        "them, or ? for every key.",
+    ]
+
+
+def maybe_show_first_run_guide(stdscr) -> None:
+    """Show the guide once, then never again unless asked.
+
+    Silent for anyone whose preferences file already records having seen it,
+    so it cannot become something a returning user dismisses every session.
+    Failing to persist that is not worth an error: the worst case is seeing
+    a help screen twice.
+    """
+    if _guide_seen():
+        return
+    message_box(stdscr, first_run_guide_lines(), "Getting Started", C_ACC)
+    try:
+        _preferences[_GUIDE_PREF_KEY] = True
+        _save_preferences({_GUIDE_PREF_KEY: True})
+    except Exception:
+        pass
+
+
+def do_guide(stdscr) -> None:
+    """The same screen, on demand, from the palette."""
+    message_box(stdscr, first_run_guide_lines(), "Getting Started", C_ACC)
+
+
+def _menu_only_labels() -> list:
+    """Labels of commands that exist but are not on the main menu.
+
+    Shown so the front door advertises the building. Ordered by how likely a
+    user is to want them rather than by registry order.
+    """
+    preferred = ["Type Scan (find objects)", "Hex View", "Structure View",
+                 "Bookmarks", "Find Permanent Pointer", "Export Trainers",
+                 "Import Trainer", "Load Symbols (Il2CppDumper)",
+                 "Freeze Address", "Write Address", "Logs"]
+    available = {c.label for c in _commands().values()
+                 if c.in_palette and not c.menu_key}
+    ordered = [label for label in preferred if label in available]
+    ordered += sorted(available - set(ordered))
+    return ordered
+
+
 def _main_menu_entries():
     """The deliberately small primary workflow menu, from the registry.
 
@@ -10868,6 +11285,8 @@ def screen_main(stdscr):
     """Compact primary navigation: workflow first, advanced tools elsewhere."""
     menu = _main_menu_entries()
     sel = 0
+    # Once, on the first main menu a new install ever draws.
+    maybe_show_first_run_guide(stdscr)
     state["pointer_project_summary"] = _pointer_project_summary(
         state.get("proc_name", ""))
     stdscr.timeout(100)
@@ -10879,10 +11298,15 @@ def screen_main(stdscr):
 
         # The primary workflow is intentionally linear and small.  Do not
         # expose low-frequency destructive/debug utilities here.
+        # Derived from the menu's own length rather than hardcoded counts.
+        # Adding "More Tools" pushed Quit to index 7, past the end of a
+        # hardcoded SETUP(5, 2) -- so it silently stopped being drawn in
+        # wide mode. Letting the last section absorb whatever remains means
+        # the next menu addition cannot repeat that.
         sections = [
             ("SCAN", 0, 4),
             ("CHEATS", 4, 1),
-            ("SETUP", 5, 2),
+            ("SETUP", 5, max(1, len(menu) - 5)),
         ]
         if w >= 78:
             col_x = [3, max(25, w // 3), max(50, (2 * w) // 3)]
@@ -10910,10 +11334,33 @@ def screen_main(stdscr):
                 safe_addstr(stdscr, 7 + i, 3,
                             f"[{key}] {label}"[:max(w - 6, 0)], attr)
 
+        # Named below the menu rather than in a fourth column. As a column it
+        # needed a terminal 160 columns wide before it drew at all -- the
+        # three existing columns already reach 2/3 of the width -- so on the
+        # 80-to-120-column terminals people actually use, the thing built to
+        # fix discoverability was itself invisible. Under the menu it fits at
+        # every width, wrapping to however many rows are free.
+        extras = _menu_only_labels()
+        row = 7 + max(4, len(menu) - 4) + 1
+        if extras and row + 2 < h - 3:
+            safe_addstr(stdscr, row, 3, "ALSO AVAILABLE",
+                        color(C_TITLE) | curses.A_BOLD)
+            for j, line in enumerate(_wrap_help(" · ".join(extras),
+                                                max(w - 8, 20))):
+                if row + 1 + j >= h - 3:
+                    break
+                safe_addstr(stdscr, row + 1 + j, 3, line,
+                            color(C_NORM) | curses.A_DIM)
+        hidden = len(extras)
+        if hidden:
+            safe_addstr(stdscr, h - 4, 3,
+                        f"{hidden} more tools — press M, or / to search them"
+                        f"   ? for the full key list",
+                        color(C_ACC))
         _draw_toast(stdscr)
         draw_statusbar(stdscr, [
-            ("↑↓", C_NORM), ("Enter", C_OK), ("/ Commands", C_ACC),
-            ("? Help", C_ACC), ("Q Quit", C_ERR)
+            ("↑↓", C_NORM), ("Enter", C_OK), ("M more", C_ACC),
+            ("/ Commands", C_ACC), ("? Help", C_ACC), ("Q Quit", C_ERR)
         ])
         stdscr.refresh()
         key = stdscr.getch()
@@ -10968,7 +11415,8 @@ def screen_main(stdscr):
 def do_help(stdscr) -> None:
     lines = [
         "Navigation   ↑↓ or j/k   g/G top/bottom   Enter Run   Esc Back",
-        "Global       / Command Palette   ? Help",
+        "Global       / Command Palette   ? Help   M More Tools",
+        "New here     / then \"Getting Started\" for the scan loop",
         "Scanning     S First Scan   N Next Scan   R Results",
         "Pointers     P Pointer Project (persisted 2-reload workflow)",
         "Results      A Apply   C Cheat   R Find permanent   N Refine",
@@ -11328,6 +11776,120 @@ def _wrap_help(text: str, width: int) -> list:
     return lines
 
 
+# ── automatic value type ──────────────────────────────────────────────────────
+# GameGuardian offers a data type called Auto alongside its explicit ones,
+# and it exists because value-type confusion is the documented first obstacle
+# for newcomers -- Cheat Engine's own material names it. RDX has more
+# configuration than Cheat Engine, not less, and defaults to u32 while its one
+# hardware-validated title is Unity/IL2CPP, where health and ammo are floats.
+#
+# patch110 made a zero-result scan explain that. This removes the decision
+# instead of explaining it, for the user who does not yet know enough to make
+# it. The cost is real -- one pass per candidate type -- so it is an explicit
+# choice rather than the default, and it stops at the first type that finds
+# anything rather than scanning all of them.
+_AUTO_TYPE_ORDER = ("u32", "f32", "i32", "u64", "f64", "u16", "u8")
+# Each attempt is a *full* scan. Seven of them on a 2 GiB title over the host
+# path is roughly sixteen minutes for a value that was never there, which is
+# not an automatic mode, it is a hang. Three covers the overwhelming majority
+# -- an unsigned integer, a float, and a signed integer -- and the types that
+# get dropped are named in the log so the choice is visible rather than
+# silent.
+_AUTO_MAX_ATTEMPTS = 3
+
+
+def _auto_candidate_types(value_text: str) -> list:
+    """Types worth trying for this text, most likely first.
+
+    Only types the value actually parses as: scanning u8 for 70000 would be
+    a guaranteed-empty pass, and three of those in a row is how an automatic
+    mode earns a reputation for being slow and useless.
+    """
+    text = str(value_text or "").strip()
+    if not text:
+        return []
+    candidates = []
+    for key in _AUTO_TYPE_ORDER:
+        spec = VALUE_TYPES.get(key)
+        if not spec:
+            continue
+        try:
+            _parse_value_text(text, key, spec["width"])
+        except Exception:
+            continue
+        candidates.append(key)
+    return candidates
+
+
+def _zero_result_advice(value_text: str, type_key: str, scope: str,
+                        aligned: bool) -> list:
+    """Why a scan probably found nothing, likeliest cause first.
+
+    A scan that matches nothing used to log one line and return to the main
+    menu, which is what a beginner's first attempt most often produces -- and
+    a UI that does nothing at all reads as a bug rather than a result.
+
+    Every fact below is already known at the call site; none of it was being
+    said. The float case leads because it is both the most common mistake and
+    the one most specific to what RDX is used on: the default type is u32,
+    and Unity/IL2CPP titles -- the only kind this project has validated
+    against hardware -- keep health, ammo, position, speed and timers in
+    floats. Cheat Engine's own documentation names value-type confusion as
+    beginner obstacle number one.
+    """
+    lines = ["The scan completed and matched nothing.", ""]
+    spec = VALUE_TYPES.get(type_key, {})
+    kind = spec.get("kind", "")
+    text = str(value_text or "").strip()
+
+    # float() alone is too generous -- it accepts "1_000", "nan" and "inf",
+    # none of which mean "the user typed a decimal". Require a decimal point
+    # or an exponent before claiming the value looks like a float, so the
+    # headline is only shown when it is actually true.
+    float_parseable = False
+    if text and kind in ("uint", "sint"):
+        try:
+            parsed = float(text)
+            float_parseable = (parsed == parsed              # not NaN
+                               and parsed not in (float("inf"), float("-inf")))
+        except ValueError:
+            float_parseable = False
+
+    if float_parseable:
+        lines += [
+            f"Most likely: the value is a float, not {type_key}.",
+            "",
+            "Unity games keep health, ammo, position, speed and timers",
+            "in floats. Run First Scan again and pick f32.",
+            "",
+        ]
+    lines.append("Other things to check:")
+    # Only worth raising when a float actually IS the alternative. Telling
+    # someone already scanning f32 that the value is "usually f32" is noise,
+    # and advice that is obviously wrong once teaches the reader to skip the
+    # rest of it.
+    if not float_parseable and kind in ("uint", "sint"):
+        lines.append(f"  • Wrong value type — you scanned {type_key}. Health and")
+        lines.append("    similar values in Unity titles are usually f32.")
+    elif kind == "float":
+        lines.append(f"  • Float precision — an exact {type_key} match is strict.")
+        lines.append("    Set a tolerance on the First Scan screen, or scan")
+        lines.append("    for an unknown value and narrow by 'changed'.")
+    lines.append("  • The value on screen is not the value in memory")
+    lines.append("    (a bar may be a percentage; ammo may be capped).")
+    if str(scope or "") == "recommended":
+        lines.append("  • Scope is Recommended, which skips libraries and")
+        lines.append("    payloads. Try Writable in Settings if the value")
+        lines.append("    might live outside the game's own mappings.")
+    if not _region_settings_are_default():
+        lines.append("  • Your region settings are not at their defaults and")
+        lines.append("    may be excluding the mapping that holds it.")
+    if aligned:
+        lines.append("  • Aligned scanning is on. A packed structure can hold")
+        lines.append("    a value at an unaligned offset.")
+    return lines
+
+
 def _current_scan_type() -> str:
     """Return the active scan type, including legacy width-only sessions."""
     return _normalise_value_type(state.get("scan_type"),
@@ -11348,7 +11910,8 @@ def do_scan_first(stdscr) -> None:
         color(C_WARN))
     stdscr.refresh()
 
-    labels = [VALUE_TYPES[key]["label"] for key in VALUE_TYPE_ORDER]
+    auto_label = "Auto (try likely types)"
+    labels = [auto_label] + [VALUE_TYPES[key]["label"] for key in VALUE_TYPE_ORDER]
     current_type = _current_scan_type()
     type_label = cycle_input(
         stdscr, "Value type      : ", 4, 3, labels,
@@ -11356,8 +11919,15 @@ def do_scan_first(stdscr) -> None:
     if type_label is None:
         add_log("First scan setup cancelled")
         return
-    type_key = (VALUE_TYPE_ORDER[labels.index(type_label)]
-                if type_label in labels else _normalise_value_type(type_label))
+    auto_mode = type_label == auto_label
+    if auto_mode:
+        # Resolved once the value is known; u32 is only a placeholder so the
+        # prompts below behave normally.
+        type_key = "u32"
+    else:
+        type_key = (VALUE_TYPE_ORDER[labels.index(type_label) - 1]
+                    if type_label in labels else
+                    _normalise_value_type(type_label))
 
     if type_key == "bytes":
         value_prompt = "Pattern (AA BB ?? CC): "
@@ -11371,6 +11941,31 @@ def do_scan_first(stdscr) -> None:
         add_log("First scan setup cancelled")
         return
     unknown_mode = type_key != "bytes" and not val_s.strip()
+
+    auto_candidates = []
+    if auto_mode:
+        if unknown_mode:
+            # An unknown-value scan snapshots memory; there is no value to
+            # infer a type from, so Auto has nothing to decide.
+            message_box(stdscr,
+                        ["Auto needs a value to work from.",
+                         "",
+                         "For an unknown-value scan, pick the type you expect",
+                         "— u32 for counters, f32 for health and timers."],
+                        "Auto Needs a Value", C_WARN)
+            return
+        all_candidates = _auto_candidate_types(val_s)
+        if not all_candidates:
+            message_box(stdscr, [f"{val_s!r} does not parse as any scannable type."],
+                        "Invalid Value", C_ERR)
+            return
+        auto_candidates = all_candidates[:_AUTO_MAX_ATTEMPTS]
+        dropped = all_candidates[_AUTO_MAX_ATTEMPTS:]
+        type_key = auto_candidates[0]
+        add_log(f"Auto: trying {', '.join(auto_candidates)} in order until "
+                f"one finds matches"
+                + (f" (not trying {', '.join(dropped)} — pick one explicitly "
+                   f"if you need it)" if dropped else ""))
 
     if type_key == "bytes":
         try:
@@ -11486,13 +12081,40 @@ def do_scan_first(stdscr) -> None:
     else:
         def run():
             try:
-                res = scan_first(
-                    state["ip"], state["pid"], val, width, aligned,
-                    lambda d, t: progress.update(done=d, total=max(t, 1)),
-                    cancel_event,
-                    writable_only=writable_only, value_type=type_key,
-                    region_scope=region_scope)
+                # In Auto mode this walks the candidate types in likelihood
+                # order and stops at the first that finds anything, so the
+                # user makes no type decision at all. A single pass for an
+                # explicit type is the same loop with one entry.
+                attempts = auto_candidates or [type_key]
+                res = _make_addr_array()
+                chosen = type_key
+                for candidate in attempts:
+                    if cancel_event.is_set():
+                        break
+                    spec = VALUE_TYPES[candidate]
+                    try:
+                        candidate_val = _parse_value_text(
+                            val_s, candidate, spec["width"])
+                    except Exception:
+                        continue
+                    if len(attempts) > 1:
+                        # _run_scan_with_progress takes its caption as an
+                        # argument, not from this dict, so writing a label
+                        # here did nothing. The log is the channel that
+                        # actually reaches the user.
+                        add_log(f"Auto: scanning as {candidate}…")
+                    res = scan_first(
+                        state["ip"], state["pid"], candidate_val,
+                        spec["width"], aligned,
+                        lambda d, t: progress.update(done=d, total=max(t, 1)),
+                        cancel_event,
+                        writable_only=writable_only, value_type=candidate,
+                        region_scope=region_scope)
+                    chosen = candidate
+                    if len(res):
+                        break
                 progress["results"]   = res
+                progress["chosen_type"] = chosen
                 progress["truncated"] = getattr(cancel_event, "truncated", False)
             except Exception as exc:
                 progress["error"] = str(exc)
@@ -11516,6 +12138,15 @@ def do_scan_first(stdscr) -> None:
     scan.clear()
     state["scan_history"]  = deque(maxlen=5)
     gc.collect()
+    # Auto may have settled on a different type than the one it started
+    # with; everything downstream (Results, Next Scan, cheats) must agree.
+    chosen_type = progress.get("chosen_type") or type_key
+    if chosen_type != type_key:
+        add_log(f"Auto: {chosen_type} is the type that matched", "info")
+    type_key = chosen_type
+    width = _value_width(type_key) or width
+    state["scan_type"] = type_key
+    state["scan_width"] = width
     scan.replace(results, progress.get("values"),
                  unknown=unknown_mode,
                  truncated=progress.get("truncated", False),
@@ -11528,6 +12159,22 @@ def do_scan_first(stdscr) -> None:
     if unknown_mode:
         add_log(f"Snapshot complete — {len(results):,} candidates", "warn" if progress["truncated"] else "info")
         do_show_results(stdscr)
+    elif len(results) == 0:
+        # do_show_results returns immediately on an empty set, so without
+        # this the user is dropped back on the main menu with one status
+        # line and no idea what happened.
+        add_log("First scan complete — 0 candidates", "warn")
+        advice = _zero_result_advice(val_s, type_key,
+                                     state.get("scan_scope", ""), aligned)
+        if auto_candidates:
+            # Auto already ruled these out, so repeating "try f32" would be
+            # advice the user has provably already followed.
+            advice = ([f"Auto tried {', '.join(auto_candidates)} and none",
+                       "matched.", ""]
+                      + [l for l in advice[1:] if "Most likely" not in l
+                         and "f32" not in l and "Unity games keep" not in l
+                         and "in floats. Run First Scan" not in l])
+        message_box(stdscr, advice, "No Matches", C_WARN)
     else:
         add_log(f"First scan complete — {len(results):,} candidates", "warn" if progress["truncated"] else "info")
         # Results is the primary workflow: go there immediately after a scan.
@@ -14020,6 +14667,25 @@ def _inspect_cheat(stdscr, idx: int) -> None:
                 return
 
 
+def _filter_type_groups(groups: list, query: str) -> list:
+    """Groups whose class name or type pointer matches `query`.
+
+    Matches the class name case-insensitively, and also a hex pointer, so a
+    pointer copied out of an earlier session or a dump still finds its row.
+    """
+    text = str(query or "").strip().lower()
+    if not text:
+        return list(groups)
+    out = []
+    for group in groups:
+        name = str(group.get("class_name", "") or "").lower()
+        pointer = hex(int(group.get("type_ptr", 0))).lower()
+        module = str(group.get("module_name", "") or "").lower()
+        if text in name or text in pointer or text in module:
+            out.append(group)
+    return out
+
+
 def do_type_scan(stdscr) -> None:
     """Find live objects grouped by the type pointer at their base."""
     if state.get("pid") is None:
@@ -14077,22 +14743,32 @@ def do_type_scan(stdscr) -> None:
         return
 
     sel = 0
+    # Type Scan answers "what objects are in this heap?". Once its rows carry
+    # class names (patch107) the next question is the inverse -- "take me to
+    # PlayerController" -- which is what Il2CppGG's class search does. Both
+    # halves already existed here; this is the filter that joins them.
+    query = ""
     while True:
+        visible_groups = _filter_type_groups(groups, query)
         stdscr.clear()
         h, w = stdscr.getmaxyx()
-        draw_border(stdscr, f"TYPES  ({len(groups)} found)")
+        draw_border(stdscr, f"TYPES  ({len(visible_groups)}/{len(groups)})"
+                            if query else f"TYPES  ({len(groups)} found)")
         safe_addstr(stdscr, 2, 3,
-                    "Enter open instances   S structure view   Q back",
+                    "Enter instances  Tab structure  type to filter  Esc back",
                     color(C_NORM))
-        named_count = sum(1 for g in groups if g.get("class_name"))
+        if query:
+            safe_addstr(stdscr, 2, max(3, w - 34),
+                        f"filter: {query}_"[:30], color(C_ACC) | curses.A_BOLD)
+        named_count = sum(1 for g in visible_groups if g.get("class_name"))
         if named_count:
             safe_addstr(stdscr, 3, 3,
                         f"{named_count} of {len(groups)} named from live "
                         f"class data", color(C_OK))
         visible = max(1, h - 8)
-        sel = max(0, min(sel, len(groups) - 1))
+        sel = max(0, min(sel, max(0, len(visible_groups) - 1)))
         start = max(0, sel - visible // 2)
-        for i, group in enumerate(groups[start:start + visible]):
+        for i, group in enumerate(visible_groups[start:start + visible]):
             idx = start + i
             attr = (color(C_SEL) | curses.A_BOLD if idx == sel
                     else color(C_ACC) if group.get("class_name")
@@ -14107,27 +14783,48 @@ def do_type_scan(stdscr) -> None:
                     f"{group['count']:>7,} x  "
                     f"{label:<30.30} {where}")
             safe_addstr(stdscr, 5 + i, 2, line[:w - 4].ljust(w - 4), attr)
-        draw_statusbar(stdscr, [("↑↓ / jk", C_NORM),
+        draw_statusbar(stdscr, [("↑↓", C_NORM),
                                 ("Enter instances", C_OK),
-                                ("S structure", C_ACC), ("Esc/Q back", C_NORM)])
+                                ("Tab structure", C_ACC),
+                                ("type to filter", C_WARN),
+                                ("Esc back", C_NORM)])
         stdscr.refresh()
         key = stdscr.getch()
         if key == curses.KEY_RESIZE:
             curses.update_lines_cols(); continue
-        if key in (curses.KEY_UP, ord('k')):
+        # This screen now has a live typeahead filter, so printable
+        # characters are query text. That is the same rule
+        # screen_proc_select and the command palette document, and it is why
+        # 'q' cannot mean quit here: a class name may well start with one.
+        # Esc is unambiguous. Navigation moves to the arrow keys only.
+        if key == 27:
+            if query:
+                query = ""; sel = 0
+                continue
+            return
+        if key == curses.KEY_UP:
             sel = max(0, sel - 1)
-        elif key in (curses.KEY_DOWN, ord('j')):
-            sel = min(len(groups) - 1, sel + 1)
-        elif key == ord('g'):
-            sel = 0
-        elif key == ord('G'):
-            sel = len(groups) - 1
-        elif key in (ord('s'), ord('S')):
-            instances = groups[sel]["instances"]
+        elif key == curses.KEY_DOWN:
+            sel = min(max(0, len(visible_groups) - 1), sel + 1)
+        elif key == curses.KEY_PPAGE:
+            sel = max(0, sel - visible)
+        elif key == curses.KEY_NPAGE:
+            sel = min(max(0, len(visible_groups) - 1), sel + visible)
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            query = query[:-1]; sel = 0
+        elif key == ord('\t') and visible_groups:
+            # Tab, not 'S'. Every printable character is filter text on this
+            # screen, and the letter branch ran first -- so a capital S was
+            # swallowed and "System", "Slot" and "Sprite" could not be typed
+            # at all, in a filter whose whole purpose is finding a class by
+            # name. Tab is unambiguous and matches the process picker.
+            instances = visible_groups[sel]["instances"]
             if len(instances):
                 do_structure_view(stdscr, int(instances[0]))
-        elif key in (curses.KEY_ENTER, 10, 13):
-            group = groups[sel]
+        elif 32 <= key <= 126:
+            query += chr(key); sel = 0
+        elif key in (curses.KEY_ENTER, 10, 13) and visible_groups:
+            group = visible_groups[sel]
             instances = _make_addr_array(int(a) for a in group["instances"])
             if not len(instances):
                 continue
@@ -14149,11 +14846,10 @@ def do_type_scan(stdscr) -> None:
             state["scan_width"] = 8
             scan.replace(instances, None)
             add_log(f"Type scan: loaded {len(instances):,} instance(s) of "
-                    f"{hex(group['type_ptr'])} into Results; display type set "
-                    f"to u64 so each row shows its type pointer")
+                    f"{group.get('class_name') or hex(group['type_ptr'])} "
+                    f"into Results; display type set to u64 so each row "
+                    f"shows its type pointer")
             do_show_results(stdscr)
-            return
-        elif key in (ord('q'), ord('Q'), 27):
             return
 
 
@@ -16745,6 +17441,9 @@ def _install_signal_teardown() -> None:
 
 
 if __name__ == '__main__':
+    # Before curses takes the terminal, so nothing can be written to a
+    # display the user cannot read.
+    install_warning_router()
     _install_signal_teardown()
     _swept = _sweep_orphaned_disk_indexes()
     if _swept:

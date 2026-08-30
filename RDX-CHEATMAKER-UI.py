@@ -267,6 +267,35 @@ MEMDBG_CAP_MEMORY_READ = 1 << 2
 MEMDBG_CAP_MEMORY_WRITE = 1 << 3
 MEMDBG_CAP_BATCH_WRITE = 1 << 16
 MEMDBG_CAP_SCAN_POINTER = 1 << 10
+# Bits RDX had no name for. The console reported capabilities = 0xFFFFFFFF on
+# 2026-08-30 and that was recorded as uninformative -- correctly, since every
+# bit including undefined ones was set. What went unremarked is that bit 20 was
+# among them: the payload was announcing a debugger in the same handshake, and
+# RDX could not read most of what the bitmap said.
+MEMDBG_CAP_DEBUGGER = 1 << 20
+MEMDBG_CAP_TRACER = 1 << 21
+
+# ── MemDBG debugger: the write-watchpoint path ────────────────────────────────
+# Wire format taken from MemDBG's published protocol header (GPL-3.0-or-later,
+# seregonwar/MemDBG). Implementing a documented protocol for interoperability
+# is not a derived work; no source is copied here.
+#
+# Only the commands the AOB anchor method needs are implemented. RDX is not
+# growing a general debugger: the goal is "which instruction writes this
+# address", and nothing more.
+MEMDBG_CMD_DEBUG_GET_THREADS = 0x0605
+MEMDBG_CMD_DEBUG_GET_REGS = 0x0606
+MEMDBG_CMD_DEBUG_SET_WATCHPOINT = 0x060C
+MEMDBG_CMD_DEBUG_CLEAR_WATCHPOINT = 0x060D
+MEMDBG_CMD_DEBUG_POLL_EVENTS = 0x0610
+
+_MEMDBG_WP_WRITE = 1                 # 0=exec 1=write 2=read 3=read-write
+_MEMDBG_WP_LENGTHS = (1, 2, 4, 8)
+_MEMDBG_REGS_SIZE = 176
+# Offset computed from the header's field order, not assumed from the textbook
+# FreeBSD layout -- the two disagree. r_rip follows r_ds at 134 + 2.
+_MEMDBG_REGS_RIP_OFFSET = 136
+_MEMDBG_POLL_SIZE = 8
 MEMDBG_MAX_MEMORY_READ = 1024 * 1024
 MEMDBG_MAX_WRITE_DATA = 1024 * 1024 - 16  # request body includes 16-byte header
 MEMDBG_BATCH_WRITE_MAX_ITEMS = 64
@@ -2523,6 +2552,143 @@ def memdbg_session(ip: str, timeout: float = 5.0):
             raise
 
 
+def memdbg_debugger_attached(ip: str) -> Optional[list]:
+    """Thread list if a debug session is live, else None. Read-only, no attach.
+
+    This is the cheap question that must precede the expensive one. Two
+    attaches through ps5debug-NG on 2026-08-30 froze the game before anything
+    established that its debugger answered at all; asking for threads costs one
+    round trip and cannot stop a process.
+    """
+    try:
+        with memdbg_session(ip) as client:
+            raw = client.request(MEMDBG_CMD_DEBUG_GET_THREADS)
+    except Exception:
+        return None
+    if len(raw) < 4:
+        return None
+    count = struct.unpack_from("<I", raw, 0)[0]
+    if count > MAX_PROC_ENTRIES:
+        return None
+    return [count, len(raw)]
+
+
+def memdbg_debug_set_watchpoint(ip: str, address: int, length: int,
+                                wp_type: int = _MEMDBG_WP_WRITE) -> None:
+    """Arm a hardware watchpoint. Raises on refusal."""
+    if int(length) not in _MEMDBG_WP_LENGTHS:
+        raise ValueError(f"watchpoint length must be 1, 2, 4 or 8, not {length}")
+    body = struct.pack("<QII", int(address), int(length), int(wp_type))
+    with memdbg_session(ip) as client:
+        client.request(MEMDBG_CMD_DEBUG_SET_WATCHPOINT, body)
+
+
+def memdbg_debug_clear_watchpoint(ip: str, address: int, length: int,
+                                  wp_type: int = _MEMDBG_WP_WRITE) -> bool:
+    """Disarm a watchpoint. Never raises: this runs on the cleanup path."""
+    try:
+        body = struct.pack("<QII", int(address), int(length), int(wp_type))
+        with memdbg_session(ip) as client:
+            client.request(MEMDBG_CMD_DEBUG_CLEAR_WATCHPOINT, body)
+        return True
+    except Exception as exc:
+        add_log(f"Watchpoint at {int(address):#x} could not be cleared: {exc}",
+                "warn")
+        return False
+
+
+def memdbg_debug_poll(ip: str) -> tuple:
+    """(stopped, stop_lwp) for the active debug session."""
+    with memdbg_session(ip) as client:
+        raw = client.request(MEMDBG_CMD_DEBUG_POLL_EVENTS)
+    if len(raw) < _MEMDBG_POLL_SIZE:
+        raise RuntimeError(f"short debug poll response: {len(raw)} bytes")
+    stopped, lwp = struct.unpack_from("<ii", raw, 0)
+    return bool(stopped), int(lwp)
+
+
+def memdbg_debug_rip(ip: str, pid: int, lwp: int) -> int:
+    """Instruction pointer of a stopped thread.
+
+    POLL_EVENTS reports only that the process stopped and on which thread; it
+    carries no event record naming the trapping instruction. The instruction
+    address therefore has to come from the register block, which makes
+    GET_REGS required rather than optional for this workflow.
+    """
+    body = struct.pack("<ii", int(pid), int(lwp))
+    with memdbg_session(ip) as client:
+        raw = client.request(MEMDBG_CMD_DEBUG_GET_REGS, body)
+    if len(raw) < _MEMDBG_REGS_SIZE:
+        raise RuntimeError(f"short register block: {len(raw)} bytes")
+    return int(struct.unpack_from("<q", raw, _MEMDBG_REGS_RIP_OFFSET)[0])
+
+
+def trace_writer_instruction(ip: str, pid: int, address: int, width: int = 4,
+                             timeout: float = 20.0,
+                             poll_interval: float = 0.2,
+                             cancel_event=None) -> dict:
+    """Which instruction writes `address`, via a MemDBG write watchpoint.
+
+    Requires a debug session to already exist. It will not attach: attaching is
+    what froze the game twice on 2026-08-30, and keeping it out of this path
+    isolates the new capability from that instability. If nothing is attached,
+    this says so and does nothing.
+
+    The watchpoint is always removed, including on timeout, cancellation and
+    error. A watchpoint left armed on a live game is worse than no answer.
+
+    Returns a dict with `stage`; `instruction` is present only when found.
+    """
+    result = {"stage": "no-debug-session", "instruction": None,
+              "lwp": None, "target": int(address), "width": int(width)}
+    if int(width) not in _MEMDBG_WP_LENGTHS:
+        result["stage"] = "bad-width"
+        return result
+    if memdbg_debugger_attached(ip) is None:
+        result["note"] = ("no active MemDBG debug session; attach before "
+                          "tracing (RDX will not attach for you)")
+        return result
+
+    armed = False
+    try:
+        memdbg_debug_set_watchpoint(ip, address, width, _MEMDBG_WP_WRITE)
+        armed = True
+    except Exception as exc:
+        result["stage"] = "watchpoint-refused"
+        result["note"] = str(exc)
+        return result
+
+    try:
+        deadline = time.monotonic() + max(float(timeout), 0.0)
+        while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                result["stage"] = "cancelled"
+                return result
+            try:
+                stopped, lwp = memdbg_debug_poll(ip)
+            except Exception as exc:
+                result["stage"] = "poll-failed"
+                result["note"] = str(exc)
+                return result
+            if stopped:
+                result["lwp"] = lwp
+                try:
+                    result["instruction"] = memdbg_debug_rip(ip, pid, lwp)
+                    result["stage"] = "found"
+                except Exception as exc:
+                    result["stage"] = "regs-unreadable"
+                    result["note"] = str(exc)
+                return result
+            time.sleep(max(float(poll_interval), 0.01))
+        result["stage"] = "no-write-observed"
+        result["note"] = (f"nothing wrote {int(address):#x} within "
+                          f"{timeout:.0f}s")
+        return result
+    finally:
+        if armed:
+            memdbg_debug_clear_watchpoint(ip, address, width, _MEMDBG_WP_WRITE)
+
+
 def memdbg_reset_session() -> None:
     """Drop the shared connection and re-arm the native path.
 
@@ -4423,6 +4589,31 @@ def _debug_disasm(s: socket.socket, pid: int, address: int,
         })
     return out
 
+def _decoded_effective_address(insn: dict, regs: dict):
+    """Effective address of a decoded instruction's memory operand.
+
+    Returns ``(effective, base_name, base_value, index_name, index_value)``.
+    A RIP-relative operand resolves against the *end* of the instruction, which
+    is what the architecture defines and what makes such an operand a stable
+    code reference rather than an object pointer.
+    """
+    base_reg_id = int(insn["mem_base_reg"])
+    index_reg_id = int(insn["mem_index_reg"])
+    base_name = _ZYDIS_GPR64.get(base_reg_id)
+    index_name = _ZYDIS_GPR64.get(index_reg_id)
+    index_val = int(regs.get(index_name, 0)) if index_name else 0
+    if base_reg_id == _ZYDIS_RIP:
+        base_val = int(insn["addr"]) + int(insn["length"])
+        base_name = "rip"
+    elif base_name:
+        base_val = int(regs[base_name])
+    else:
+        base_val = 0
+    effective = (base_val + index_val * int(insn["mem_scale"] or 1)
+                 + int(insn["mem_disp"]))
+    return effective, base_name, base_val, index_name, index_val
+
+
 def _trace_temporary_access(ip: str, pid: int, target_addr: int,
                             width: int, timeout: float = _DEBUG_TRACE_TIMEOUT,
                             experimental: bool = False,
@@ -4672,14 +4863,21 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
             target_stopped = True
             _update_debug_session(stopped=True)
             dr6 = int(candidate["dbregs"][6])
-            if not (dr6 & (1 << int(wp_index))):
+            # DR6 is a hint here, not a gate.  ps5debug-NG clears DR6 while it
+            # handles the trap, so a genuine hit arrives with DR6 == 0 —
+            # confirmed on firmware 10.01 with payload v1.3.0, where DR7 still
+            # showed the watchpoint armed (L3/G3 set, R/W3=write, LEN3=4).
+            # Requiring our slot's bit discarded every real event and made the
+            # trace time out every time.  A *non-zero* DR6 naming some other
+            # slot genuinely is another watchpoint's event; DR6 == 0 means the
+            # payload consumed it, and the decoded operand below decides.
+            if dr6 and not (dr6 & (1 << int(wp_index))):
                 # Every debug event stops the target.  Ignoring an unrelated
                 # event without resuming leaves the game visibly frozen.
                 _debug_continue(cmd, 0)
                 target_stopped = False
                 _update_debug_session(stopped=False)
                 continue
-            hits += 1
             regs = candidate["regs"]
             rip = int(regs["rip"])
             try:
@@ -4702,6 +4900,24 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
                 target_stopped = False
                 _update_debug_session(stopped=False)
                 continue
+            # With DR6 unusable as a discriminator, the decoded operand is what
+            # proves this event belongs to *this* watchpoint.  An accessor that
+            # resolves elsewhere is another trap, so it must not consume the
+            # hit budget -- keep waiting rather than aborting the trace.
+            try:
+                probe = _decoded_effective_address(decoded, regs)[0]
+            except Exception as exc:
+                probe = None
+                last_reason = f"effective address unavailable: {exc}"
+            if probe != int(target_addr):
+                if probe is not None:
+                    last_reason = (f"accessor resolved to {hex(probe)}, not the "
+                                   f"watched {hex(int(target_addr))}")
+                _debug_continue(cmd, 0)
+                target_stopped = False
+                _update_debug_session(stopped=False)
+                continue
+            hits += 1
             event = candidate
             insn = decoded
             break
@@ -4717,24 +4933,11 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
         regs = event["regs"]
         rip = int(regs["rip"])
 
-        base_reg_id = int(insn["mem_base_reg"])
-        index_reg_id = int(insn["mem_index_reg"])
-        base_name = _ZYDIS_GPR64.get(base_reg_id)
-        index_name = _ZYDIS_GPR64.get(index_reg_id)
-
         # Resolve the actual effective address represented by the decoded
         # operand.  RIP-relative accesses are stable code references, not object
         # pointers, so they are reported but not used as permanent pointer roots.
-        index_val = int(regs.get(index_name, 0)) if index_name else 0
-        if base_reg_id == _ZYDIS_RIP:
-            base_val = int(insn["addr"]) + int(insn["length"])
-            base_name = "rip"
-        elif base_name:
-            base_val = int(regs[base_name])
-        else:
-            base_val = 0
-
-        effective = base_val + (index_val * int(insn["mem_scale"] or 1)) + int(insn["mem_disp"])
+        (effective, base_name, base_val,
+         index_name, index_val) = _decoded_effective_address(insn, regs)
         if effective != target_addr:
             raise RuntimeError(
                 f"decoded accessor mismatch: {hex(effective)} != {hex(target_addr)}"
@@ -4750,7 +4953,12 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
         return {
             "success": True,
             "target": target_addr,
+            # `rip` is the raw trap RIP the payload reported.  x86 data
+            # breakpoints are trap-type, so it names the instruction *after*
+            # the access; `writer` is the instruction that actually performed
+            # it and is the address an AOB anchor must be captured at.
             "rip": rip,
+            "writer": int(insn["addr"]),
             "base_reg": base_name or f"reg#{base_reg_id}",
             "base_value": base_val,
             "index_reg": index_name,
@@ -4947,7 +5155,17 @@ def _pointer_candidates_from_trace(ip: str, pid: int, trace: dict,
         c2["offsets"] = list(c["offsets"])
         c2["terminal_offset"] = final_off
         c2["depth"] = len(c2["offsets"])
-        c2["trace_rip"] = int(trace["rip"])
+        # The raw trap RIP, kept for diagnostics only.  x86 data breakpoints
+        # are trap-type, so this is the instruction *after* the store; the
+        # instruction that performed it is `trace_writer`.  Never anchor or
+        # patch using this field.
+        c2["trace_trap_rip"] = int(trace["rip"])
+        # Diagnostic only, and optional: this path resolves pointer chains and
+        # never anchors on an instruction, so a trace without a resolved writer
+        # is still perfectly usable here.  The places that *do* anchor require
+        # the writer outright rather than falling back to the trap RIP.
+        if trace.get("writer") is not None:
+            c2["trace_writer"] = int(trace["writer"])
         c2["trace_base_reg"] = trace.get("base_reg")
         c2["trace_base_value"] = base_target
         c2["trace_final_offset"] = final_off
@@ -6203,6 +6421,515 @@ def _find_pattern_offsets(data: bytes, pattern: bytes, mask: bytes,
     return hits
 
 
+# ── AOB anchoring ─────────────────────────────────────────────────────────────
+# A cheat that names a raw address dies when the address moves. RDX's answer so
+# far has been the pointer chain, which reaches a *data* address and is the
+# more capable technique -- but the trainer formats cannot express one
+# (UPSTREAM_AUDIT_PASS8) and a chain does not survive a game update
+# (PASS7).
+#
+# The ecosystem's answer, and the default in mainstream tooling, is to anchor on
+# a unique array of bytes instead. From a published PS5 walkthrough
+# (info/reference/mw-guide.txt, ~12:20): after patching an instruction the tool
+# asks whether to find it in future by a unique array of bytes or by a static
+# address, and recommends AOB because the PS5 uses ASLR and because an AOB
+# anchor is likely to keep working on other versions of the game.
+#
+# The constraint that walkthrough leaves implicit is the important one: it is
+# anchoring an *instruction*. Code bytes are stable. Data bytes are not, and an
+# AOB captured over a writable mapping re-finds nothing the moment the value it
+# contains changes -- which for a cheat target is immediately, by definition.
+#
+# So capture is refused on writable memory rather than producing an anchor that
+# silently rots. A signature is only offered where it can actually hold.
+_AOB_SIGNATURE_BYTES = 32          # window captured around the anchor point
+_AOB_MIN_LITERAL_BYTES = 8         # below this a "unique" match is luck
+
+
+# ── instruction patching ──────────────────────────────────────────────────────
+# The one link the AOB anchor chain had no implementation for, and it is needed
+# twice: once after the watchpoint identifies the writing instruction, and again
+# after relocation in a later run.
+#
+# It cannot use _target_checked_write. That guard validates the address against
+# a *writable* mapping, which is exactly right for a value cheat and exactly
+# wrong here: instructions live in r-x memory, and patching them is a
+# deliberate write to non-writable pages. So this path validates the opposite
+# property -- the target must be executable -- rather than bypassing the check.
+#
+# The dangerous failure is patching the wrong instruction: a plausible-looking
+# anchor, a confident match, and a NOP written over something else. Every step
+# therefore refuses rather than guesses.
+_X86_NOP = 0x90
+
+
+def nop_bytes(length: int) -> bytes:
+    """`length` single-byte NOPs."""
+    if int(length) <= 0:
+        raise ValueError("patch length must be positive")
+    return bytes([_X86_NOP]) * int(length)
+
+
+def _instruction_region(ip: str, pid: int, address: int,
+                        length: int, maps: Optional[list] = None):
+    """The executable region wholly containing [address, address+length)."""
+    maps = maps if maps is not None else _get_maps_cached(ip, pid)
+    starts, rows = _build_region_lookup(maps)
+    region = _region_for_addr(int(address), starts, rows)
+    if not region:
+        return None, "address is not in any mapped region"
+    if not int(region.get("prot", 0)) & 0x4:
+        return None, "address is not in an executable region"
+    if int(address) + int(length) > int(region.get("end", 0)):
+        # Never let a patch run off the end of the code it belongs to.
+        return None, "patch would extend past the end of the region"
+    return region, None
+
+
+def patch_instruction(ip: str, pid: int, address: int, new_bytes: bytes,
+                      expected_original: bytes,
+                      maps: Optional[list] = None) -> dict:
+    """Overwrite an instruction, but only if it is still the expected one.
+
+    `expected_original` must be the exact bytes currently at `address`, and
+    `new_bytes` must be the same length: a patch that is shorter would leave
+    part of the old instruction behind, and one that is longer would run into
+    the next. Callers get the length from the disassembler; this function will
+    not infer an instruction boundary, because guessing one is how the wrong
+    thing gets overwritten.
+
+    An AOB match is not on its own proof that the site is correct, so the
+    original bytes are re-read and compared immediately before writing.
+    """
+    out = {"ok": False, "address": int(address), "stage": "", "note": ""}
+    expected_original = bytes(expected_original)
+    new_bytes = bytes(new_bytes)
+    if not expected_original or len(new_bytes) != len(expected_original):
+        out["stage"] = "length-mismatch"
+        out["note"] = (f"patch is {len(new_bytes)} bytes but the instruction "
+                       f"is {len(expected_original)}; refusing to partially "
+                       f"overwrite an instruction")
+        return out
+    region, why = _instruction_region(ip, pid, address, len(new_bytes), maps)
+    if region is None:
+        out["stage"] = "not-patchable"
+        out["note"] = why
+        return out
+    try:
+        live = ps5_read(ip, pid, int(address), len(expected_original))
+    except Exception as exc:
+        out["stage"] = "unreadable"
+        out["note"] = str(exc)
+        return out
+    if live != expected_original:
+        out["stage"] = "bytes-changed"
+        out["note"] = (f"expected {expected_original.hex().upper()} but found "
+                       f"{live.hex().upper()}; the instruction is not the one "
+                       f"this patch was made for")
+        return out
+    try:
+        # Deliberately not _target_checked_write: see the note above.
+        if not ps5_write(ip, pid, int(address), new_bytes):
+            out["stage"] = "write-rejected"
+            out["note"] = "the payload refused the write"
+            return out
+        readback = ps5_read(ip, pid, int(address), len(new_bytes))
+    except Exception as exc:
+        out["stage"] = "write-failed"
+        out["note"] = str(exc)
+        return out
+    if readback != new_bytes:
+        out["stage"] = "verify-failed"
+        out["note"] = (f"wrote {new_bytes.hex().upper()} but read back "
+                       f"{readback.hex().upper()}")
+        return out
+    out.update(ok=True, stage="patched", original=expected_original.hex().upper(),
+               applied=new_bytes.hex().upper(),
+               module=str(region.get("name", "") or ""))
+    add_log(f"Patched {int(address):#x}: {expected_original.hex().upper()} -> "
+            f"{new_bytes.hex().upper()}")
+    return out
+
+
+def restore_instruction(ip: str, pid: int, address: int,
+                        original_bytes: bytes, applied_bytes: bytes,
+                        maps: Optional[list] = None) -> dict:
+    """Put an instruction back. The inverse of patch_instruction.
+
+    `applied_bytes` is what the patch wrote and must still be present, so a
+    restore cannot clobber a change made by something else after the patch.
+    It is a required argument rather than an assumed run of NOPs: a caller
+    that applied a non-NOP patch would otherwise be unable to restore, and
+    defaulting to NOPs would make the guard pass for the wrong reason.
+    """
+    return patch_instruction(ip, pid, address, bytes(original_bytes),
+                             bytes(applied_bytes), maps)
+
+
+def capture_aob_signature(ip: str, pid: int, address: int,
+                          span: int = _AOB_SIGNATURE_BYTES,
+                          maps: Optional[list] = None) -> Optional[dict]:
+    """Capture a relocatable byte signature covering `address`, or None.
+
+    Returns {pattern, mask, lead} where `lead` is how far into the pattern the
+    anchor sits, so a later match can be converted back to an address.
+
+    None -- deliberately, not an exception -- when the site cannot support an
+    anchor: a writable mapping, an unmapped address, or a window too uniform
+    to identify anything.
+    """
+    maps = maps if maps is not None else _get_maps_cached(ip, pid)
+    starts, rows = _build_region_lookup(maps)
+    region = _region_for_addr(int(address), starts, rows)
+    if not region:
+        return None
+    if int(region.get("prot", 0)) & 0x2:
+        # Writable: the bytes around a live value are the live value. An
+        # anchor captured here stops matching as soon as the game writes.
+        return None
+    # The window must lie entirely inside the region. patch132 clamped only
+    # its lower edge, so an anchor near the end of a mapping read past it --
+    # measured: an anchor at 0x400038 in a region ending at 0x400040 issued a
+    # read of 0x400028..0x400048, eight bytes over, and returned a signature.
+    #
+    # That is not merely a bad read. The writability check above applies to the
+    # anchor's region; bytes pulled from the *neighbouring* mapping were never
+    # checked, and may be writable and volatile. A signature containing them
+    # stops matching for exactly the reason this function refuses writable
+    # memory in the first place.
+    region_start = int(region.get("start", 0))
+    region_end = int(region.get("end", 0))
+    address = int(address)
+    if not (region_start <= address < region_end):
+        return None
+    start = max(region_start, address - span // 2)
+    end = min(region_end, start + span)
+    start = max(region_start, end - span)   # pull back off the far edge
+    actual = end - start
+    if actual < _AOB_MIN_LITERAL_BYTES:
+        return None                          # region too small to anchor in
+    lead = address - start
+    if not 0 <= lead < actual:
+        return None
+    try:
+        window = ps5_read(ip, pid, start, actual)
+    except Exception:
+        return None
+    if len(window) != actual or len(set(window)) < 4:
+        # A run of identical bytes matches everywhere and anchors nothing.
+        return None
+    return {"pattern": window.hex().upper(),
+            "mask": "FF" * actual,
+            "lead": int(lead)}
+
+
+def aob_signature_matches(ip: str, pid: int, address: int,
+                          signature: dict) -> bool:
+    """Whether `signature` still describes the bytes at `address`."""
+    try:
+        pattern = bytes.fromhex(str(signature["pattern"]))
+        mask = bytes.fromhex(str(signature["mask"]))
+        lead = int(signature["lead"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if len(pattern) != len(mask) or not pattern:
+        return False
+    start = int(address) - lead
+    if start < 0:
+        return False
+    try:
+        live = ps5_read(ip, pid, start, len(pattern))
+    except Exception:
+        return False
+    return all(m == 0 or a == b
+               for a, b, m in zip(live, pattern, mask))
+
+
+def relocate_by_aob_signature(ip: str, pid: int, signature: dict,
+                              cancel_event=None) -> Optional[int]:
+    """Re-find an anchor's address after it moved, or None.
+
+    A signature that matches in more than one place is refused. The
+    walkthrough this follows is explicit that the array of bytes must be
+    *unique*; two matches means the anchor cannot say which site it meant, and
+    guessing would relocate a cheat onto the wrong instruction.
+    """
+    try:
+        pattern = bytes.fromhex(str(signature["pattern"]))
+        mask = bytes.fromhex(str(signature["mask"]))
+        lead = int(signature["lead"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if sum(1 for m in mask if m) < _AOB_MIN_LITERAL_BYTES:
+        add_log("AOB anchor has too few fixed bytes to be unique; not "
+                "relocating", "warn")
+        return None
+    hits = np.asarray(scan_first_pattern(ip, pid, pattern, mask,
+                                         cancel_event=cancel_event,
+                                         writable_only=False,
+                                         region_scope="executable"))
+    if hits.size == 0:
+        return None
+    if hits.size > 1:
+        add_log(f"AOB anchor matched {hits.size} sites; refusing to guess "
+                f"which one the cheat meant", "warn")
+        return None
+    return int(hits[0]) + lead
+
+
+# ── instruction anchors: trace -> AOB -> relocation -> patch ─────────────────
+#
+# The acquisition half of this pipeline needs a live debugger session; the
+# patching half does not.  Keeping them separable means an anchor captured once
+# can be re-verified and applied later without attaching again -- which matters
+# because a target process allows exactly one successful attach per lifetime.
+
+_ANCHOR_VERSION = 1
+
+
+def _instruction_anchor_contract(trace: dict, width: int = 4) -> dict:
+    """Canonical description of one traced write.
+
+    `writer` is *the* instruction address.  The raw trap RIP is carried as
+    `trap_rip` for diagnostics only: x86 data breakpoints are trap-type, so it
+    names the instruction after the store and is never the anchor.  A trace
+    without a resolved writer raises rather than degrading to the trap RIP.
+    """
+    if not isinstance(trace, dict):
+        raise TypeError("trace must be a dict")
+    writer = trace.get("writer")
+    if writer is None:
+        raise KeyError("trace has no resolved writer address")
+    insn = trace.get("instruction") or {}
+    base_value = int(trace.get("base_value", 0))
+    index_value = int(trace.get("index_value", 0))
+    scale = int(trace.get("scale", 1) or 1)
+    disp = int(trace.get("final_offset", 0))
+    return {
+        "version": _ANCHOR_VERSION,
+        "temporary_address": int(trace["target"]),
+        "writer": int(writer),
+        "trap_rip": int(trace.get("rip", 0)),
+        "instruction_length": int(insn.get("length", 0)),
+        "instruction_bytes": "",
+        "base_reg": trace.get("base_reg"),
+        "base_value": base_value,
+        "index_reg": trace.get("index_reg"),
+        "index_value": index_value,
+        "scale": scale,
+        "displacement": disp,
+        "effective_address": base_value + index_value * scale + disp,
+        "access_width": int(width),
+        "access_mode": str(trace.get("access_mode", "write")),
+        "lwpid": int(trace.get("lwpid", 0)),
+        "signature": None,
+        "relocated": None,
+        "verified": False,
+    }
+
+
+def capture_instruction_anchor(ip: str, pid: int, trace: dict, width: int = 4,
+                               cancel_event=None,
+                               maps: Optional[list] = None) -> dict:
+    """Turn a verified write trace into a relocatable instruction anchor.
+
+    Runs the two proven steps in order -- signature capture at the writer, then
+    a uniqueness-checked relocation that must land back on it.  Every failure
+    aborts; none of them falls back to the trap RIP or invents an anchor.
+    """
+    out = {"ok": False, "stage": "", "note": "", "anchor": None}
+    try:
+        anchor = _instruction_anchor_contract(trace, width)
+    except (KeyError, TypeError, ValueError) as exc:
+        out["stage"] = "no-writer"
+        out["note"] = (f"the trace carries no resolved writer ({exc}); the raw "
+                       f"trap RIP is not a substitute")
+        return out
+    if anchor["effective_address"] != anchor["temporary_address"]:
+        out["stage"] = "operand-mismatch"
+        out["note"] = (f"the decoded operand resolves to "
+                       f"{hex(anchor['effective_address'])}, not the watched "
+                       f"{hex(anchor['temporary_address'])}")
+        return out
+    length = int(anchor["instruction_length"])
+    if length <= 0:
+        out["stage"] = "unknown-length"
+        out["note"] = "the trace did not report an instruction length"
+        return out
+    maps = maps if maps is not None else _get_maps_cached(ip, pid)
+    try:
+        original = ps5_read(ip, pid, anchor["writer"], length)
+    except Exception as exc:
+        original = None
+        out["note"] = str(exc)
+    if not original or len(original) != length:
+        out["stage"] = "unreadable"
+        out["note"] = out["note"] or "could not read the writer instruction"
+        return out
+    anchor["instruction_bytes"] = original.hex().upper()
+
+    signature = capture_aob_signature(ip, pid, anchor["writer"], maps=maps)
+    if not signature:
+        out["stage"] = "capture-refused"
+        out["note"] = ("no signature could be captured there -- the window is "
+                       "writable, unmapped, or too uniform to be unique")
+        return out
+    anchor["signature"] = dict(signature)
+
+    relocated = relocate_by_aob_signature(ip, pid, signature,
+                                          cancel_event=cancel_event)
+    if relocated is None:
+        out["stage"] = "not-unique"
+        out["note"] = ("the signature did not match exactly once; an anchor "
+                       "that cannot say which site it meant is not usable")
+        return out
+    if int(relocated) != int(anchor["writer"]):
+        out["stage"] = "relocation-mismatch"
+        out["note"] = (f"the signature relocated to {hex(int(relocated))} but "
+                       f"was captured at {hex(anchor['writer'])}")
+        return out
+    anchor["relocated"] = int(relocated)
+    anchor["verified"] = True
+    out.update(ok=True, stage="anchored", anchor=anchor,
+               note=f"anchored at {hex(anchor['writer'])}")
+    return out
+
+
+def verify_instruction_anchor(ip: str, pid: int, anchor: dict,
+                              cancel_event=None,
+                              maps: Optional[list] = None) -> dict:
+    """Re-prove an anchor against the live process. No write happens without it.
+
+    Checked, in order: the signature still relocates to exactly one site; the
+    bytes there are the instruction that was captured; the mapping is
+    executable and not writable.  Returns the address only when all of them
+    hold, so a caller cannot accidentally patch on a partial result.
+    """
+    out = {"ok": False, "stage": "", "note": "", "address": None,
+           "match_count": None}
+    if not isinstance(anchor, dict) or not anchor.get("signature"):
+        out["stage"] = "no-signature"
+        out["note"] = "this anchor carries no captured signature"
+        return out
+    expected = str(anchor.get("instruction_bytes") or "")
+    if not expected:
+        out["stage"] = "no-instruction-bytes"
+        out["note"] = "this anchor recorded no original instruction bytes"
+        return out
+    try:
+        original = bytes.fromhex(expected)
+    except ValueError:
+        out["stage"] = "no-instruction-bytes"
+        out["note"] = "the recorded instruction bytes are not valid hex"
+        return out
+
+    address = relocate_by_aob_signature(ip, pid, anchor["signature"],
+                                        cancel_event=cancel_event)
+    if address is None:
+        out["stage"] = "not-unique"
+        out["note"] = ("the signature no longer matches exactly one site; "
+                       "refusing to guess which instruction was meant")
+        return out
+    out["match_count"] = 1
+
+    maps = maps if maps is not None else _get_maps_cached(ip, pid)
+    region = next((r for r in maps
+                   if int(r.get("start", 0)) <= address < int(r.get("end", 0))),
+                  None)
+    if region is None:
+        out["stage"] = "unmapped"
+        out["note"] = f"{hex(address)} is not in any mapping"
+        return out
+    prot = int(region.get("prot", 0))
+    if not prot & 0x4:
+        out["stage"] = "not-executable"
+        out["note"] = f"{hex(address)} is not in executable memory"
+        return out
+    if prot & 0x2:
+        out["stage"] = "writable-region"
+        out["note"] = (f"{hex(address)} is in writable memory, so the bytes "
+                       f"there are not a stable code anchor")
+        return out
+    try:
+        live = ps5_read(ip, pid, address, len(original))
+    except Exception as exc:
+        live = None
+        out["note"] = str(exc)
+    if not live or len(live) != len(original):
+        out["stage"] = "unreadable"
+        out["note"] = out["note"] or "could not read the relocated instruction"
+        return out
+    if live != original:
+        out["stage"] = "bytes-changed"
+        out["note"] = (f"expected {original.hex().upper()} at {hex(address)}, "
+                       f"found {live.hex().upper()}")
+        return out
+    out.update(ok=True, stage="verified", address=int(address),
+               note=f"verified at {hex(int(address))}")
+    return out
+
+
+def patch_instruction_anchor(ip: str, pid: int, anchor: dict,
+                             new_bytes: Optional[bytes] = None,
+                             cancel_event=None,
+                             maps: Optional[list] = None) -> dict:
+    """Patch the instruction an anchor names, and only after re-proving it.
+
+    A matching AOB on its own is not authority to write: the anchor is
+    re-verified against live memory first, and a failed check means no write at
+    all.  `new_bytes` defaults to NOPs of exactly the instruction's length.
+    """
+    verdict = verify_instruction_anchor(ip, pid, anchor,
+                                        cancel_event=cancel_event, maps=maps)
+    if not verdict["ok"]:
+        return {"ok": False, "stage": verdict["stage"], "address": None,
+                "note": f"not patched: {verdict['note']}",
+                "verification": verdict}
+    original = bytes.fromhex(str(anchor["instruction_bytes"]))
+    payload = nop_bytes(len(original)) if new_bytes is None else bytes(new_bytes)
+    result = patch_instruction(ip, pid, verdict["address"], payload, original,
+                               maps=maps)
+    result["verification"] = verdict
+    result["applied"] = payload.hex().upper()
+    return result
+
+
+def restore_instruction_anchor(ip: str, pid: int, anchor: dict,
+                               applied_bytes: bytes,
+                               maps: Optional[list] = None) -> dict:
+    """Undo a patch applied through `patch_instruction_anchor`."""
+    verdict = verify_instruction_anchor(ip, pid, anchor, maps=maps)
+    address = verdict.get("address")
+    if address is None:
+        # The signature cannot be re-found because the patch changed the very
+        # bytes it describes.  Fall back to the recorded site, which is where
+        # the patch was written.
+        address = anchor.get("relocated") or anchor.get("writer")
+    if address is None:
+        return {"ok": False, "stage": "no-address", "note": "nowhere to restore"}
+    original = bytes.fromhex(str(anchor["instruction_bytes"]))
+    return restore_instruction(ip, pid, int(address), original,
+                               bytes(applied_bytes), maps)
+
+
+def anchor_to_json(anchor: dict) -> str:
+    """Serialise an anchor so acquisition and patching can be separate runs."""
+    return json.dumps(anchor, indent=2, sort_keys=True)
+
+
+def anchor_from_json(blob: str) -> dict:
+    """Load an anchor artifact, refusing one this build cannot interpret."""
+    data = json.loads(blob)
+    if not isinstance(data, dict):
+        raise ValueError("anchor artifact is not an object")
+    if int(data.get("version", 0)) != _ANCHOR_VERSION:
+        raise ValueError(f"unsupported anchor version {data.get('version')!r}")
+    for key in ("writer", "signature", "instruction_bytes"):
+        if not data.get(key):
+            raise ValueError(f"anchor artifact is missing {key!r}")
+    return data
+
+
 def scan_first_pattern(ip: str, pid: int, pattern: bytes, mask: bytes,
                        alignment: int = 1, progress_cb=None,
                        cancel_event=None,
@@ -6230,6 +6957,15 @@ def scan_first_pattern(ip: str, pid: int, pattern: bytes, mask: bytes,
                     int(r.get("end", 0)) - int(r.get("start", 0)) <= 0x40000000)
                and (int(r.get("prot", 0)) & 0x1)
                and (not writable_only or (int(r.get("prot", 0)) & 0x2))]
+    if str(region_scope or "") == "executable":
+        # An instruction anchor can only live in executable memory.  Measured
+        # on hardware: 47.0 MiB of r-x against 9,765 MiB readable, so 99.52%
+        # of the bytes read could never hold a match.  Narrowing here cannot
+        # lose the true site -- capture_aob_signature refuses writable memory,
+        # so every signature it produces was captured in an executable
+        # mapping -- and it drops incidental copies sitting in data buffers,
+        # which are not candidate writers.
+        regions = [r for r in regions if int(r.get("prot", 0)) & 0x4]
     if str(region_scope or "") == "recommended":
         _before = len(regions)
         regions = [r for r in regions if _recommended_game_scan_region(
@@ -8168,6 +8904,85 @@ def _verify_candidate_twice(ip: str, pid: int, candidate: dict, target_addr: int
     return verified
 
 
+def resolve_via_object_identity(ip: str, pid: int, target_addr: int,
+                                groups: list, width: int = 4,
+                                value_type: str = "u32",
+                                max_depth: Optional[int] = None,
+                                cancel_event=None,
+                                progress_cb=None) -> dict:
+    """Resolve a temporary address by first identifying the object that owns it.
+
+    The usual route asks the resolver for pointers to `target_addr` itself --
+    an address in the *middle* of an object. Very little code holds such a
+    pointer: what code holds is the object base, and reaches the field by a
+    constant displacement. So the search is aimed at the wrong thing, and the
+    chains that come back are dominated by whatever happens to land nearby.
+    Measured this session: 96 candidates for one live ammo address, with the
+    top-ranked ones pointing 271,648 bytes away -- the low bits of the target,
+    matched by coincidence.
+
+    Type Scan already knows which object owns an address and at what offset.
+    That is the same object-base-plus-field-offset the evidence-driven
+    literature obtains by trapping the writing instruction and reading a
+    register -- reached here without a debugger, which matters because this
+    payload's does not work.
+
+    So: identify the object, corroborate the field against sibling instances,
+    then resolve a chain to the **object base** and carry the field offset as
+    the chain's terminal. Fewer candidates, better ones, and each carries a
+    structural claim that can be checked rather than only a numeric score.
+
+    Returns a dict describing what was established, including the failure
+    stage when it could not be. Never raises for an ordinary miss: "no object
+    owns this address" is a normal answer for a value that is not a managed
+    object field, and the caller should fall back to the direct resolver.
+    """
+    finding = locate_field_in_type(int(target_addr), groups)
+    if finding is None:
+        return {"stage": "no-object", "finding": None, "corroboration": None,
+                "candidates": [],
+                "note": "no known object instance owns this address; "
+                        "use the direct resolver"}
+
+    corroboration = corroborate_field_across_instances(
+        ip, pid, finding, width=width, value_type=value_type,
+        cancel_event=cancel_event)
+
+    # A field no sibling shares is weak evidence that this is a field at all.
+    # Say so, and keep going -- the object may simply be the only live
+    # instance -- but do not present the result as corroborated.
+    read = int(corroboration.get("read", 0))
+    plausible = int(corroboration.get("plausible", 0))
+    corroborated = read > 0 and plausible * 2 >= read
+
+    add_log(
+        f"Object identity: {finding.get('class_name') or hex(finding['type_ptr'])}"
+        f" + {finding['field_offset']:#x}"
+        + (f"; {plausible}/{read} sibling instance(s) agree"
+           if read else "; no sibling instances readable"))
+
+    result = _resolve_permanent_candidates(
+        ip, pid, int(finding["instance_base"]), max_depth=max_depth,
+        cancel_event=cancel_event, progress_cb=progress_cb)
+
+    candidates = list(result.get("candidates", []) or [])
+    for candidate in candidates:
+        # The chain reaches the object; the field is a constant hop from it.
+        candidate["terminal_offset"] = int(finding["field_offset"])
+        candidate["object_type_ptr"] = int(finding["type_ptr"])
+        if finding.get("class_name"):
+            candidate["object_class_name"] = str(finding["class_name"])
+        candidate["field_corroborated"] = bool(corroborated)
+        candidate["sibling_agreement"] = f"{plausible}/{read}" if read else "0/0"
+
+    return {"stage": "resolved" if candidates else "no-chain-to-object",
+            "finding": finding, "corroboration": corroboration,
+            "corroborated": corroborated,
+            "candidates": candidates,
+            "method": result.get("method"),
+            "maps": result.get("maps")}
+
+
 def _resolve_permanent_candidates(ip: str, pid: int, target_addr: int,
                                    max_depth: Optional[int] = None,
                                    cancel_event=None,
@@ -9062,7 +9877,126 @@ def _group_counted_types(counts: dict, instances: dict,
     return groups[:_TYPE_SCAN_MAX_TYPES]
 
 
+# ── field corroboration across sibling instances ──────────────────────────────
+# A candidate address that follows the value through several scans is still
+# only correlated with it. RDX's existing answers to that are the causal test
+# (write it and watch the game) and the two-reload promotion rule -- both good,
+# both requiring either a risky write or a game restart.
+#
+# There is a third kind of evidence available for free once Type Scan works,
+# and it needs neither: if the address is a *field* of an object, every other
+# live instance of the same type has that field too. Reading the same offset
+# across siblings either corroborates the structural claim or refutes it.
+#
+# This is the "multiple observations" and "instance comparison" argument -- a
+# cluster of related fields, and a consistent offset across instances of one
+# type, make an accidental identification much less likely. It is a
+# falsification test in the proper sense: it can fail, and failing means the
+# address is probably not the field it looks like.
+#
+# Deliberately reports a distribution rather than a verdict. "17 of 20 siblings
+# hold a small integer here" is evidence a person can weigh; a boolean would
+# hide how thin the evidence sometimes is.
+_FIELD_SIBLING_SAMPLE = 24         # siblings read; enough to be evidence, cheap
+_FIELD_MAX_OBJECT_SPAN = 0x2000    # a candidate further than this from a base
+                                   # is not plausibly a field of that object
+
+
+def locate_field_in_type(address: int, groups: list,
+                         max_span: int = _FIELD_MAX_OBJECT_SPAN) -> Optional[dict]:
+    """Which type's instance contains `address`, and at what field offset.
+
+    Instances are object bases. The owning instance is the greatest base at or
+    below the address, provided the distance is small enough to be a field
+    rather than a coincidence of ordering.
+    """
+    address = int(address)
+    best = None
+    for group in groups or ():
+        instances = group.get("instances")
+        if instances is None or len(instances) == 0:
+            continue
+        arr = np.asarray(instances, dtype=np.uint64)
+        idx = int(np.searchsorted(arr, np.uint64(address), side="right")) - 1
+        if idx < 0:
+            continue
+        base = int(arr[idx])
+        offset = address - base
+        if not 0 <= offset < int(max_span):
+            continue
+        # Nearest owning base wins: a smaller offset is a more specific claim.
+        if best is None or offset < best["field_offset"]:
+            best = {"type_ptr": int(group.get("type_ptr", 0)),
+                    "class_name": group.get("class_name"),
+                    "instance_base": base,
+                    "field_offset": int(offset),
+                    "instances": arr}
+    return best
+
+
+def corroborate_field_across_instances(ip: str, pid: int, finding: dict,
+                                       width: int = 4,
+                                       value_type: str = "u32",
+                                       sample: int = _FIELD_SIBLING_SAMPLE,
+                                       cancel_event=None) -> dict:
+    """Read the same field offset in sibling instances of the same type.
+
+    Returns counts, never a verdict. `plausible` counts siblings whose value
+    at that offset shares the shape of the candidate's -- for an integer
+    field, the same order of magnitude; that is weak evidence individually and
+    meaningful in aggregate.
+    """
+    arr = finding.get("instances")
+    offset = int(finding.get("field_offset", 0))
+    base = int(finding.get("instance_base", 0))
+    out = {"read": 0, "plausible": 0, "sampled": 0, "values": []}
+    if arr is None or not len(arr):
+        return out
+    siblings = [int(a) for a in np.asarray(arr) if int(a) != base]
+    if not siblings:
+        return out
+    step = max(1, len(siblings) // max(1, int(sample)))
+    siblings = siblings[::step][:int(sample)]
+    try:
+        anchor_value = _unpack_typed_value(
+            ps5_read(ip, pid, base + offset, width), value_type, width)
+    except Exception:
+        return out
+    for addr in siblings:
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        out["sampled"] += 1
+        try:
+            raw = ps5_read(ip, pid, addr + offset, width)
+            value = _unpack_typed_value(raw, value_type, width)
+        except Exception:
+            continue
+        out["read"] += 1
+        out["values"].append(value)
+        if _same_magnitude(anchor_value, value):
+            out["plausible"] += 1
+    return out
+
+
+def _same_magnitude(a, b) -> bool:
+    """Whether two field values look like the same kind of quantity.
+
+    Intentionally crude. The claim being tested is structural -- "this offset
+    holds the same sort of thing in every instance" -- not that the values
+    match, which for per-object state they should not.
+    """
+    try:
+        a, b = abs(float(a)), abs(float(b))
+    except (TypeError, ValueError):
+        return False
+    if a == 0.0 or b == 0.0:
+        return a == b
+    ratio = a / b if a > b else b / a
+    return ratio <= 1000.0
+
+
 def scan_type_instances(ip: str, pid: int,
+
                         min_instances: int = _TYPE_SCAN_MIN_INSTANCES,
                         cancel_event=None, progress_cb=None) -> list:
     """Find live object instances grouped by the type pointer at their base.
@@ -12909,6 +13843,7 @@ def _results_more_menu(stdscr):
         ("Find a Nearby Item by Changing It", "nearby"),
         ("Preview Selected Value", "preview"),
         ("Trace Write → Find Pointer (experimental)", "trace_write"),
+        ("Trace Write → Instruction Anchor (experimental)", "trace_anchor"),
         ("Find Matching Nearby Item (Group Test)", "batch_preview"),
         ("Write Address", "write"),
         ("Verify Pointer", "ptr_verify"),
@@ -12960,6 +13895,8 @@ def _results_more_menu(stdscr):
                 return "preview"
             if action == "trace_write":
                 return "trace_write"
+            if action == "trace_anchor":
+                return "trace_anchor"
             if action == "batch_preview":
                 return "batch_preview"
             result = dispatch(stdscr, action)
@@ -13213,6 +14150,117 @@ def do_preview_candidate(stdscr, address: int) -> None:
                     "Candidate Rejected", C_NORM)
 
 
+def do_capture_instruction_anchor(stdscr, address: int) -> None:
+    """Capture a stable instruction anchor from one traced write.
+
+    Deliberately separate from "Trace Write -> Find Pointer": this path does
+    not scan for pointers at all.  It resolves the writing instruction, turns
+    it into an executable-memory AOB, and proves the AOB relocates uniquely
+    back to it.  Patching is a further explicit confirmation, because a
+    matching signature is evidence, not permission.
+    """
+    width = int(state.get("scan_width", 4))
+    if not state.get("connected") or not state.get("pid"):
+        message_box(stdscr, ["Connect to a console and select a process first."],
+                    "Not Connected", C_WARN)
+        return
+    if not confirm_box(stdscr,
+                       f"Trace writes to {hex(int(address))} with a hardware "
+                       f"watchpoint? This attaches the debugger to the game.",
+                       "Capture Instruction Anchor"):
+        return
+
+    message_box(stdscr, [
+        "Attaching and arming a write watchpoint.",
+        "Trigger the value now (fire, use the item, take damage...).",
+        "",
+        "This uses the one debugger attach the game allows.",
+    ], "Waiting For A Write", C_NORM)
+    try:
+        trace = _trace_temporary_access(
+            state["ip"], int(state["pid"]), int(address), width,
+            timeout=15.0, experimental=True)
+    except Exception as exc:
+        add_log(f"Instruction-anchor trace failed: {exc}", "warn")
+        message_box(stdscr, [
+            "No usable write event was captured.",
+            str(exc),
+            "The watchpoint was cleared and detach was requested.",
+        ], "Trace Finished", C_WARN)
+        return
+
+    state["last_access_trace"] = trace
+    result = capture_instruction_anchor(state["ip"], int(state["pid"]),
+                                        trace, width)
+    if not result["ok"]:
+        add_log(f"Instruction anchor refused ({result['stage']}): "
+                f"{result['note']}", "warn")
+        message_box(stdscr, [
+            "The write was traced, but no stable anchor could be made.",
+            f"Stage: {result['stage']}",
+            f"  {result['note']}",
+            "",
+            f"Trap RIP was {hex(int(trace.get('rip', 0)))}, which is never",
+            "used as the anchor: it names the instruction after the write.",
+        ], "No Stable Anchor", C_WARN)
+        return
+
+    anchor = result["anchor"]
+    state["last_instruction_anchor"] = anchor
+    add_log(f"Instruction anchor captured: writer={hex(anchor['writer'])} "
+            f"trap_rip={hex(anchor['trap_rip'])} "
+            f"aob={len(anchor['signature']['mask']) // 2}B unique")
+    message_box(stdscr, [
+        f"Temporary address : {hex(anchor['temporary_address'])}",
+        f"TRAP RIP          : {hex(anchor['trap_rip'])}   (not the writer)",
+        f"WRITER            : {hex(anchor['writer'])}",
+        f"  {anchor['base_reg']} = {hex(anchor['base_value'])} "
+        f"{anchor['displacement']:+#x}  ->  "
+        f"{hex(anchor['effective_address'])}",
+        f"Access            : {anchor['access_mode']}, "
+        f"{anchor['access_width']} bytes",
+        f"Instruction       : {anchor['instruction_bytes']} "
+        f"({anchor['instruction_length']} bytes)",
+        "",
+        f"AOB length        : {len(anchor['signature']['mask']) // 2} bytes",
+        f"Match count       : 1 (unique, executable memory only)",
+        f"STABLE ANCHOR     : {hex(anchor['relocated'])}",
+        f"Verification      : verified",
+    ], "Instruction Anchor Captured", C_OK)
+
+    if not confirm_box(stdscr,
+                       f"NOP the instruction at {hex(anchor['relocated'])}? "
+                       f"It will be re-verified against live memory first.",
+                       "Patch Instruction"):
+        message_box(stdscr, [
+            "Anchor kept, nothing patched.",
+            "It stays available for this session and can be applied later.",
+        ], "Anchor Saved", C_NORM)
+        return
+
+    patched = patch_instruction_anchor(state["ip"], int(state["pid"]), anchor)
+    if not patched.get("ok"):
+        add_log(f"Anchor patch refused ({patched.get('stage')}): "
+                f"{patched.get('note')}", "warn")
+        message_box(stdscr, [
+            "Nothing was written.",
+            f"Stage: {patched.get('stage')}",
+            f"  {patched.get('note')}",
+        ], "Patch Refused", C_WARN)
+        return
+    state["last_anchor_patch"] = patched
+    add_log(f"Anchor patched at {hex(int(patched['address']))}: "
+            f"{patched.get('original')} -> {patched.get('applied')}")
+    message_box(stdscr, [
+        f"Patched {hex(int(patched['address']))}.",
+        f"  was {patched.get('original')}",
+        f"  now {patched.get('applied')}",
+        "",
+        "The original bytes are recorded for this session so the patch",
+        "can be restored.",
+    ], "Instruction Patched", C_OK)
+
+
 def do_trace_item_write(stdscr, address: int) -> None:
     """Run one explicitly confirmed write-only hardware watchpoint trace."""
     width = int(state.get("scan_width", 4))
@@ -13274,7 +14322,11 @@ def do_trace_item_write(stdscr, address: int) -> None:
 
     state["last_access_trace"] = trace
     insn = trace.get("instruction") or {}
-    instruction_addr = int(insn.get("addr", trace.get("rip", 0)))
+    # The resolved writer, with no fallback.  The raw trap RIP names the
+    # instruction *after* the access, so substituting it would silently report
+    # -- and later anchor -- one instruction past the real writer.  A trace that
+    # reached here without a writer is a bug, and should fail loudly.
+    instruction_addr = int(trace["writer"])
     base_name = str(trace.get("base_reg") or "unknown")
     base_value = int(trace.get("base_value", 0))
     final_offset = int(trace.get("final_offset", 0))
@@ -13838,6 +14890,11 @@ def do_show_results(stdscr) -> None:
                 if more_result == "trace_write":
                     stdscr.nodelay(False)
                     do_trace_item_write(stdscr, int(results[sel]))
+                    stdscr.nodelay(True)
+                    results = state["scan_results"]
+                if more_result == "trace_anchor":
+                    stdscr.nodelay(False)
+                    do_capture_instruction_anchor(stdscr, int(results[sel]))
                     stdscr.nodelay(True)
                     results = state["scan_results"]
                 if more_result == "batch_preview":

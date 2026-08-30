@@ -868,7 +868,22 @@ def _candidate_field_offset_is_plausible(candidate: dict) -> bool:
     offsets = candidate.get("offsets") or []
     if not offsets:
         return True
-    return 0 <= int(offsets[-1]) <= _PTR_PLAUSIBLE_FIELD_MAX
+    # Magnitude, not sign. The rule is about *distance* from the object base:
+    # a displacement of hundreds of KiB is the coincidence shape. A negative
+    # displacement is ordinary -- a chain that lands inside a sub-object and
+    # reads a field earlier in its parent has a small negative final offset,
+    # and Cheat Engine has always allowed them.
+    #
+    # The `0 <=` form rejected every negative offset as implausible. Measured
+    # on CUSA01659 (ps5debug-NG, 2026-08-30) against a real ammo address: of
+    # the eight top-ranked chains, four ended in -0x60 -- 96 bytes, textbook
+    # field shape -- and all eight were judged implausible. With nothing
+    # separating them, the sort fell through to `depth`, which promoted the
+    # depth-1 holders at +0x42720 (271,648 bytes, the low bits of the target
+    # address) above the real chains. The guard was not merely absent, it was
+    # inverted in effect: it demoted the plausible candidates it exists to
+    # promote.
+    return abs(int(offsets[-1])) <= _PTR_PLAUSIBLE_FIELD_MAX
 
 
 def _rank_pointer_candidates(ip: str, pid: int, candidates: list,
@@ -1564,13 +1579,131 @@ def _is_cheat_frozen(cheat: dict) -> bool:
         return bool(runtime_id and runtime_id in _freeze_targets)
 
 
+# ── freeze contention ─────────────────────────────────────────────────────────
+# A freeze writes on a timer; the game writes whenever it likes. Measured on
+# CUSA01659 against a live ammo address:
+#
+#     game rewrites the address    every 8-20 ms (median 18)
+#     one ps5_write round trip     15.7 ms
+#     freeze at its 200 ms tick    held the value 31/657 samples -- 4.7%
+#     tight loop, no sleep         held 312/651 -- 47.9%
+#
+# A network round trip costs about as long as the game's whole write period,
+# so this is a race the tick rate cannot win. For values a game writes only on
+# change -- currency, item counts, unlock flags -- freezing works exactly as
+# advertised. For anything written per frame it does not, and RDX reported
+# "active @ 0x..." throughout while the value it claimed to be holding tracked
+# the game the entire time. A status that cannot fail is not a status.
+#
+# So every few ticks the freeze reads back what it wrote. Losing the race is
+# reported as contention, not as success. The write is still attempted -- a
+# partially-held value is occasionally what the user wants -- but the UI stops
+# claiming it worked.
+_FREEZE_VERIFY_EVERY = 5        # ticks between read-backs (~1 s at 0.2 s)
+_FREEZE_CONTESTED_AT = 0.5      # lost more than half the window -> contested
+_FREEZE_VERIFY_WINDOW = 10      # checks kept; bounds recovery as well as detection
+_FREEZE_VERIFY_MIN = 3          # below this, one unlucky read decides nothing
+
+# Contention is kept apart from _freeze_status on purpose. The write phase
+# rewrites that entry every tick, so a verdict stored there survives ~200 ms
+# and is invisible to anything sampling more slowly than the worker loops --
+# which is every caller. The first cut of this patch did exactly that and
+# reported "active" for a freeze holding 0% of its writes, on hardware, which
+# is the bug it was written to fix.
+_freeze_contested: dict = {}    # runtime_id -> human-readable verdict
+
+
+def _freeze_note_verification(state_map: dict, runtime_id: str,
+                              held: bool) -> Optional[str]:
+    """Record one read-back outcome; return a status when it is conclusive.
+
+    A sliding window, not a lifetime tally. The first version counted every
+    check ever taken, which bounded how fast contention was *detected* but
+    left recovery unbounded: a freeze contested for five minutes and then
+    holding perfectly needed five minutes of wins before the indicator caught
+    up, because the losses never aged out. Observed on hardware -- the
+    indicator sat on LOSE well after the game had stopped fighting the write.
+
+    With a window both directions cost at most _FREEZE_VERIFY_WINDOW checks,
+    so the badge tracks what is happening now rather than what happened when
+    the freeze was switched on.
+    """
+    window = state_map.get(runtime_id)
+    if window is None:
+        window = state_map[runtime_id] = deque(maxlen=_FREEZE_VERIFY_WINDOW)
+    window.append(bool(held))
+    if len(window) < _FREEZE_VERIFY_MIN:
+        return None
+    kept = sum(1 for x in window if x)
+    seen = len(window)
+    if (1.0 - (kept / float(seen))) > _FREEZE_CONTESTED_AT:
+        return (f"contested — the game is overwriting this "
+                f"({kept}/{seen} recent checks held)")
+    return None
+
+
+# How long a cheat's address stays meaningful. RDX has computed this for a
+# while -- _is_cross_reload_pointer, _is_module_relative_scalar -- and showed
+# it only on the detail screen, only for chain cheats, and never at export.
+# So a raw heap address and a twice-promoted module-rooted chain look
+# identical in the list, and a trainer can be exported without any indication
+# that half of it dies on the next launch. Both of the addresses found on
+# hardware this session were raw pointers into the managed heap; they would
+# have exported cleanly and been dead on the next boot.
+_DURABILITY_SESSION = ("SESSION", "current session only — a raw address")
+_DURABILITY_RELOAD = ("RELOAD", "survives a reload — module-rooted chain")
+_DURABILITY_STATIC = ("STATIC", "module-relative static patch")
+
+
+def cheat_durability(cheat: dict) -> tuple:
+    """(short, long) description of how long this cheat's address survives.
+
+    Deliberately three states rather than a guess at a fourth: nothing here
+    survives a *game update*, because RDX has no signature-rooted root yet
+    (UPSTREAM_AUDIT_PASS7). Claiming otherwise would be the kind of confident
+    label this session has spent its time removing.
+    """
+    if _is_module_relative_scalar(cheat):
+        return _DURABILITY_STATIC
+    if _is_cross_reload_pointer(cheat):
+        return _DURABILITY_RELOAD
+    return _DURABILITY_SESSION
+
+
+def summarise_durability(cheats: list) -> str:
+    """One line naming how many cheats of each durability are in a set."""
+    counts: dict = {}
+    for cheat in cheats:
+        short = cheat_durability(cheat)[0]
+        counts[short] = counts.get(short, 0) + 1
+    if not counts:
+        return "no cheats"
+    order = [_DURABILITY_STATIC[0], _DURABILITY_RELOAD[0],
+             _DURABILITY_SESSION[0]]
+    return ", ".join(f"{counts[k]} {k.lower()}"
+                     for k in order if k in counts)
+
+
 def _cheat_freeze_indicator(cheat: dict) -> str:
     runtime_id = str(cheat.get("_runtime_id", "") or "")
     with _freeze_lock:
         if not runtime_id or runtime_id not in _freeze_targets:
             return "OFF"
         status = str(_freeze_status.get(runtime_id, "") or "")
-    return "ERR" if status.startswith("error:") else "ON"
+        contested = runtime_id in _freeze_contested
+    if status.startswith("error:"):
+        return "ERR"
+    # Distinct from ON: the write is landing and being undone. Reporting this
+    # as ON is what let a freeze that held 4.7% of the time look like it was
+    # working.
+    return "LOSE" if contested else "ON"
+
+
+def freeze_contention_note(cheat: dict) -> Optional[str]:
+    """The contention verdict for a cheat, or None when it is holding."""
+    runtime_id = str(cheat.get("_runtime_id", "") or "")
+    with _freeze_lock:
+        return _freeze_contested.get(runtime_id)
 
 
 def _resolve_cheat_runtime_address(cheat: dict) -> int:
@@ -1606,6 +1739,8 @@ def _freeze_manager_worker(stop_event: threading.Event) -> None:
     resume later -- which means the next worker cannot share it.
     """
     global _freeze_thread
+    ticks = 0
+    verified: dict = {}          # runtime_id -> (checks, times it held)
     try:
         while not stop_event.is_set():
             with _freeze_lock:
@@ -1685,6 +1820,25 @@ def _freeze_manager_worker(stop_event: threading.Event) -> None:
                         with _freeze_lock:
                             _freeze_status[runtime_id] = f"error: {exc}"
 
+            # Every few ticks, check the writes are actually sticking.
+            ticks += 1
+            if resolved and ticks % _FREEZE_VERIFY_EVERY == 0:
+                for runtime_id, address, data in resolved:
+                    if stop_event.is_set():
+                        break
+                    try:
+                        live = ps5_read(state["ip"], state["pid"],
+                                        address, len(data))
+                    except Exception:
+                        continue
+                    verdict = _freeze_note_verification(
+                        verified, runtime_id, live == data)
+                    with _freeze_lock:
+                        if verdict is not None:
+                            _freeze_contested[runtime_id] = verdict
+                        else:
+                            _freeze_contested.pop(runtime_id, None)
+
             stop_event.wait(0.2)
     finally:
         with _freeze_lock:
@@ -1727,6 +1881,7 @@ def _toggle_cheat_freeze(cheat: dict) -> bool:
         if runtime_id in _freeze_targets:
             _freeze_targets.pop(runtime_id, None)
             _freeze_status.pop(runtime_id, None)
+            _freeze_contested.pop(runtime_id, None)
             cheat["enabled"] = False
             add_log(f"Disabled freeze '{cheat.get('name', 'Unnamed')}'")
             return False
@@ -1758,6 +1913,7 @@ def _stop_freeze_worker() -> None:
             cheat["enabled"] = False
         _freeze_targets.clear()
         _freeze_status.clear()
+        _freeze_contested.clear()
     if t and t.is_alive():
         t.join(timeout=2.0)
     with _freeze_lock:
@@ -3401,6 +3557,27 @@ def _memdbg_has(capability: int) -> bool:
                  int(capability)))
 
 
+# A scan opens more connections than MemDBG's native listener serves, so it
+# overflows to the compatibility listener by design. Measured: MemDBG accepts
+# exactly 6 concurrent native connections and refuses the 7th, with the
+# existing 6 unaffected; RDX's budget is 10.
+#
+# That overflow is not degradation. A/B on the console, same 4,280.8 MiB scan:
+#
+#     budget 10   1 overflow to port 744   168.5 s   25.4 MiB/s
+#     budget  5   0 overflows              213.1 s   20.1 MiB/s
+#
+# Constraining the workers to avoid it was written, tested and reverted: it
+# worked and cost 26% of throughput. Port 744 is fast, and the valve is doing
+# its job.
+#
+# The message, though, said "failed" at `warn` level, and this session's own
+# notes recorded it three times as a cost before the measurement showed it was
+# not one. A scan overflowing is routine and is logged as such; a one-off read
+# or write falling back is not routine and still warrants a warning.
+_MEMDBG_ROUTINE_FALLBACKS = frozenset({"scan read"})
+
+
 def _note_memdbg_fallback(operation: str, exc: Exception) -> None:
     """Log one native-to-compatibility fallback per operation and session."""
     key = (int(state.get("session", 0)), str(operation))
@@ -3408,7 +3585,13 @@ def _note_memdbg_fallback(operation: str, exc: Exception) -> None:
         if key in _memdbg_fallback_notes:
             return
         _memdbg_fallback_notes.add(key)
-    add_log(f"MemDBG native {operation} failed; trying port 744: {exc}", "warn")
+    if str(operation) in _MEMDBG_ROUTINE_FALLBACKS:
+        add_log(f"MemDBG native {operation}: connection budget reached, "
+                f"using port 744 for the overflow (expected; the compatibility "
+                f"listener is not slower)")
+    else:
+        add_log(f"MemDBG native {operation} failed; trying port 744: {exc}",
+                "warn")
 
 def ps5_read(ip: str, pid: int, addr: int, length: int) -> bytes:
     """Read with up to _UI_MAX_RETRIES retries on transient connection failures."""
@@ -4114,6 +4297,37 @@ def _debug_watchpoint_verdict(coverage: dict) -> tuple:
             "CMD_DEBUG_SETDBREGS per thread" + caveat)
 
 
+def _debug_watchpoint_preliminary(coverage: Optional[dict]) -> Optional[str]:
+    """What the pre-resume, single-thread read-back says on its own.
+
+    Deliberately NOT a coverage verdict. One thread cannot rule per-thread
+    application in or out, and saying it could is the overreach the
+    calibration note already records once.
+
+    This exists because the ordering lost a real measurement. patch102 takes
+    this read while the target is stopped, then resumes, then sweeps every
+    thread -- and only the sweep produced a verdict. On 2026-08-30 the resume
+    itself timed out (`CMD_DEBUG_CONTINUE`, 61 s), the exception unwound, and
+    the single-thread data already in hand was discarded. The attach cost a
+    stopped game, a wedged payload and a console restart, and answered
+    nothing.
+
+    A broken debugger lifecycle must not be able to destroy the diagnostic
+    whose job is to explain it, so whatever is known is reported before the
+    next thing that can hang.
+    """
+    if not coverage:
+        return None
+    checked = coverage.get("checked", 0)
+    if checked == 0:
+        return "debug registers could not be read back before the resume"
+    if len(coverage.get("armed", [])) == 0:
+        return ("the watchpoint is NOT set on the thread read while stopped — "
+                "the payload acknowledged the arm and did not keep it")
+    return ("the watchpoint IS set on the thread read while stopped; whether "
+            "other threads carry it is what the post-resume sweep answers")
+
+
 def _debug_free_watchpoint(s: socket.socket, lwpid: int) -> Optional[int]:
     """Single-thread free-slot probe. Retained for callers with one thread;
     _debug_free_watchpoint_all is what the trace path uses."""
@@ -4371,6 +4585,14 @@ def _trace_temporary_access(ip: str, pid: int, target_addr: int,
         except Exception as exc:
             stopped_check = None
             add_log(f"Watchpoint DR pre-resume check unavailable: {exc}", "warn")
+        # Report it NOW. Everything after this point can hang -- the resume
+        # did, for 61 s, on 2026-08-30 -- and an exception there used to take
+        # this measurement with it.
+        preliminary = _debug_watchpoint_preliminary(stopped_check)
+        if preliminary:
+            add_log(f"Watchpoint DR pre-resume (1 thread, slot {wp_index} @ "
+                    f"{hex(target_addr)}): {preliminary}",
+                    "warn" if "NOT set" in preliminary else "info")
         _debug_continue(cmd, 0)
         target_stopped = False
         _update_debug_session(stopped=False)
@@ -5426,17 +5648,45 @@ def _recommended_game_scan_region(region: dict, process: str = "") -> bool:
 #
 # So do what the classifier does: read a little, and time it.
 _OVERSIZE_PROBE_BYTES = 0x40000        # 256 KiB -- one round trip, not a scan
-_OVERSIZE_MIN_RATE    = 4.0            # MiB/s; normal mappings measure 30-90
+# A readability floor, NOT a cached/uncached discriminator.
+#
+# patch118 introduced this as the latter, on a single sample per region under
+# MemDBG where everything read at 30-90 MiB/s. Re-measured under ps5debug-NG
+# with seven samples per region, against the payload classifier as ground
+# truth, that reading does not survive:
+#
+#     0x200000000  classifier: cached     min 1.9  med 4.4  max 5.6
+#     0x280200000  classifier: UNCACHED   min 3.3  med 5.0  max 5.3
+#
+# The uncached mapping measures *faster* than the cached one on most samples.
+# Single-sample throughput varies by 3x within one region, so the earlier
+# "the probe agrees with the classifier" was two noisy samples landing either
+# side of a constant, not a signal.
+#
+# The payload classifier remains the only thing that actually distinguishes
+# these; where it exists it is used and this probe never runs. Where it does
+# not, throughput cannot substitute, so the fallback stops pretending and
+# errs the way the costs point: wrongly excluding a mapping means the user
+# cannot find their value at all (the patch118 bug -- 95.7% of the game), while
+# wrongly including one only makes the scan slower. So the floor is set low
+# enough to reject only mappings that are genuinely unusable.
+_OVERSIZE_MIN_RATE    = 0.5            # MiB/s
 _oversize_probe_cache: dict = {}
 _oversize_probe_lock = threading.Lock()
 
 
 def _oversize_region_is_scannable(ip: str, pid: int, region: dict) -> bool:
-    """Whether an oversized region reads fast enough to be worth scanning.
+    """Whether an oversized region is readable enough to be worth scanning.
 
     Cached per (host, pid, region), so a scan pays at most one extra round
     trip per oversized mapping and repeat scans pay none.  An unreadable
     region is excluded: it cannot be scanned regardless of its size.
+
+    This is a readability floor, not a GPU detector -- see
+    _OVERSIZE_MIN_RATE for the measurements that ruled the latter out.
+    Two samples are taken from different points because single-sample
+    throughput was measured varying threefold within one mapping, and the
+    faster is used: on an inconclusive read the cost asymmetry says include.
     """
     start, end = int(region.get("start", 0)), int(region.get("end", 0))
     key = (ip, int(pid), start, end)
@@ -5449,17 +5699,25 @@ def _oversize_region_is_scannable(ip: str, pid: int, region: dict) -> bool:
     if span > 0:
         # Read from inside the mapping rather than its first page, which is a
         # guard page often enough to make the probe answer the wrong question.
-        offset = min(span, (end - start) // 2)
-        try:
-            began = time.monotonic()
-            data = ps5_read(ip, pid, start + offset, span)
-            elapsed = max(time.monotonic() - began, 1e-9)
-            rate = (len(data) / (1024.0 * 1024.0)) / elapsed
-            verdict = rate >= _OVERSIZE_MIN_RATE
-        except Exception as exc:
-            add_log(f"Region {start:#x} probe failed, excluding it: {exc}",
-                    "warn")
+        # Two points, not one: throughput within a single mapping was
+        # measured varying from 1.9 to 5.6 MiB/s, so one sample decides
+        # nothing. Keep the faster -- an inconclusive probe should include.
+        errors = []
+        for fraction in (3, 5):
+            offset = min(span, (end - start) * fraction // 8)
+            try:
+                began = time.monotonic()
+                data = ps5_read(ip, pid, start + offset, span)
+                elapsed = max(time.monotonic() - began, 1e-9)
+                rate = max(rate, (len(data) / (1024.0 * 1024.0)) / elapsed)
+            except Exception as exc:
+                errors.append(exc)
+        if len(errors) == 2:
+            add_log(f"Region {start:#x} could not be read, excluding it: "
+                    f"{errors[0]}", "warn")
             verdict = False
+        else:
+            verdict = rate >= _OVERSIZE_MIN_RATE
     with _oversize_probe_lock:
         if len(_oversize_probe_cache) >= 256:
             _oversize_probe_cache.clear()
@@ -7930,7 +8188,7 @@ def _resolve_permanent_candidates(ip: str, pid: int, target_addr: int,
             fast_candidates.append(c)
     # Only a structurally plausible hit is worth short-circuiting on.
     plausible = [c for c in fast_candidates
-                 if 0 <= int(c["offsets"][0]) <= _PTR_PLAUSIBLE_FIELD_MAX]
+                 if abs(int(c["offsets"][0])) <= _PTR_PLAUSIBLE_FIELD_MAX]
     if plausible:
         plausible = _rank_pointer_candidates(ip, pid, plausible)
         return {"candidates": plausible, "index_built": False,
@@ -8686,6 +8944,10 @@ def pointer_chain_scan(ip: str, pid: int,
 #
 # Everything here is read-only.
 _TYPE_SCAN_MIN_INSTANCES = 8        # below this a repeat is not evidence of a type
+# Naming is the discriminator now that the target filter admits heap
+# memory, so it gets a real budget rather than a cosmetic one.
+_TYPE_SCAN_LABEL_LIMIT = 256
+_TYPE_SCAN_LABEL_BUDGET = 25.0
 _TYPE_SCAN_MAX_CANDIDATES = 8_000_000   # bounded collected slots (~128 MB peak)
 _TYPE_SCAN_MAX_TYPES = 512          # distinct types returned
 _TYPE_SCAN_MAX_INSTANCES = 4096     # instance addresses retained per type
@@ -8695,6 +8957,28 @@ _TYPE_SCAN_MAX_DISTINCT = 250_000   # distinct type pointers tallied
 # every read from the point it dies.
 _TYPE_SCAN_MAX_CONSECUTIVE_FAILS = 8
 _TYPE_SCAN_CHUNK = 0x1000000        # 16 MiB reads
+
+
+def _type_target_interval_arrays(maps: list) -> tuple:
+    """Coalesced (starts, ends) for addresses a type pointer may legitimately
+    target: any mapped, readable, non-executable range.
+
+    Not `_static_interval_arrays`. IL2CPP allocates class metadata on the
+    heap, so restricting targets to module/static memory excluded every real
+    type pointer and admitted the code pointers that dominate a heap sweep.
+    Executable ranges stay out because a class never lives in code, and that
+    is what the old filter was accidentally selecting for.
+    """
+    ranges = _coalesce_ranges([
+        (int(r.get("start", 0)), int(r.get("end", 0)))
+        for r in maps
+        if int(r.get("end", 0)) > int(r.get("start", 0))
+        and (int(r.get("prot", 0)) & 0x1)
+        and not (int(r.get("prot", 0)) & 0x4)])
+    if not ranges:
+        return (np.empty(0, dtype=np.uint64), np.empty(0, dtype=np.uint64))
+    return (np.asarray([a for a, _ in ranges], dtype=np.uint64),
+            np.asarray([b for _, b in ranges], dtype=np.uint64))
 
 
 def _static_interval_arrays(maps: list) -> tuple:
@@ -8772,17 +9056,40 @@ def scan_type_instances(ip: str, pid: int,
                         cancel_event=None, progress_cb=None) -> list:
     """Find live object instances grouped by the type pointer at their base.
 
-    Read-only. Streams heap regions, keeps only 8-aligned qwords whose value
-    lands in a static/module region, and groups the holders by that value.
+    Read-only. Streams heap regions, keeps 8-aligned qwords that point at a
+    mapped, non-executable address, groups the holders by that value, and
+    keeps only the groups whose pointer resolves to a class name.
+
+    The target filter used to require a *static/module* region, on the
+    assumption that a type identity lives in the image. Measured against
+    CUSA01659 on ps5debug-NG, that assumption is wrong for IL2CPP: every
+    `Il2CppClass` for this title is heap-allocated. The nine holders of the
+    "PlayerController" name string all sat at 0x2xxxxxxxx with prot=3 and
+    `_is_static_region` False, and the class itself resolved at
+    0x20362e560 -- heap, not module.
+
+    So every real type pointer was excluded, and what survived were the
+    pointers that *do* target the image: vtable and callback entries. The
+    top five groups of a 512-group scan disassembled as x86-64 prologues
+    (`55 48 89 e5 41 56 53` and friends), and `label_type_groups` named 0 of
+    40 because none of them were classes. `_read_klass_name` was never at
+    fault -- handed the real pointer it returns "PlayerController" from
+    offset +0x18 on the first try.
+
+    Frequency alone cannot replace the removed filter: without it every
+    repeated pointer is a candidate. The discriminator is that a type
+    pointer resolves to a plausible class name, which is a check this module
+    already had. Executable targets are excluded up front because a class
+    never lives in code, which removes the old dominant noise cheaply.
     """
     if cancel_event is None:
         cancel_event = threading.Event()
     maps = _get_maps_cached(ip, pid)
     if not maps:
         return []
-    starts, ends = _static_interval_arrays(maps)
+    starts, ends = _type_target_interval_arrays(maps)
     if not len(starts):
-        add_log("Type scan: no static regions to point into", "warn")
+        add_log("Type scan: no regions a type pointer could target", "warn")
         return []
 
     # Objects live in writable, non-static mappings. Excluding static regions
@@ -8924,12 +9231,25 @@ def scan_type_instances(ip: str, pid: int,
     # Follow each type pointer one more hop for its class name. Bounded and
     # entirely optional -- a title that does not use this layout simply shows
     # pointers, exactly as before.
+    #
+    # With the target filter widened to all readable non-executable memory,
+    # frequency alone no longer separates a type from any other repeated
+    # pointer. Resolving the class name is what does, so this pass is now
+    # load-bearing rather than cosmetic: named groups are known types and are
+    # ranked first. Unnamed ones are kept -- a title whose layout is unknown
+    # must still show its pointers, which is the behaviour this feature has
+    # always promised -- but they no longer bury the real answers.
+    groups.sort(key=lambda g: -int(g.get("count", 0)))
     try:
         named = label_type_groups(ip, pid, groups, maps,
+                                  limit=_TYPE_SCAN_LABEL_LIMIT,
+                                  time_budget=_TYPE_SCAN_LABEL_BUDGET,
                                   cancel_event=cancel_event)
         if named:
             add_log(f"Type scan: resolved {named} class name(s) from live "
                     f"memory (no dump.cs needed)")
+            groups.sort(key=lambda g: (not g.get("class_name"),
+                                       -int(g.get("count", 0))))
         elif groups:
             add_log("Type scan: no class names resolved — this title may not "
                     "use an IL2CPP layout, or its name offset is unknown",
@@ -8963,6 +9283,9 @@ _KLASS_NAME_OFFSETS = (0x10, 0x08, 0x18, 0x20, 0x28, 0x00)
 _KLASS_NAME_MAX_LEN = 128
 _KLASS_NAME_CACHE_MAX = 4096
 _klass_name_cache: dict = {}
+# klass pointer -> [(offset, name), ...] when more than one offset resolved.
+# Consulted by label_type_groups so a contested name is shown as contested.
+_klass_name_ambiguous: dict = {}
 _klass_name_lock = threading.Lock()
 # Enough C# identifier characters to accept generics, nested types and
 # namespaced names without accepting arbitrary binary that happens to be
@@ -9007,6 +9330,7 @@ def _read_klass_name(ip: str, pid: int, klass_ptr: int,
         # One read covers every candidate offset instead of one read each.
         span = max(_KLASS_NAME_OFFSETS) + 8
         header = ps5_read(ip, pid, key, span)
+        matches = []
         for offset in _KLASS_NAME_OFFSETS:
             if offset + 8 > len(header):
                 continue
@@ -9023,8 +9347,24 @@ def _read_klass_name(ip: str, pid: int, klass_ptr: int,
                 continue
             candidate = _plausible_class_name(raw)
             if candidate:
-                name = candidate
-                break
+                matches.append((offset, candidate))
+        if matches:
+            name = matches[0][1]
+        # Do not let a coin-flip look like a fact. Measured on CUSA01659:
+        # 8 of 40 type pointers had more than one offset yielding a plausible
+        # name, and the offset is not consistent even between real classes --
+        # PlayerController's name is at +0x18 with +0x10 empty, while String
+        # and Boolean carry theirs at +0x10 with the *namespace* at +0x18.
+        # One structure returned 'TargetPlayer' from +0x10 and
+        # 'PlayerController' from +0x18: a field name winning over a class
+        # name purely because of probe order.
+        #
+        # There is no rule here worth trusting yet, so the first hit is still
+        # what is reported -- unchanged behaviour -- but a contested read is
+        # recorded rather than presented as settled.
+        if len(matches) > 1:
+            with _klass_name_lock:
+                _klass_name_ambiguous[key] = list(matches)
     except Exception:
         name = None
     with _klass_name_lock:
@@ -9038,6 +9378,7 @@ def _invalidate_klass_names() -> None:
     """Class pointers are process-scoped; drop them when the process changes."""
     with _klass_name_lock:
         _klass_name_cache.clear()
+        _klass_name_ambiguous.clear()
 
 
 def label_type_groups(ip: str, pid: int, groups: list,
@@ -9062,6 +9403,16 @@ def label_type_groups(ip: str, pid: int, groups: list,
         name = _read_klass_name(ip, pid, int(group.get("type_ptr", 0)), maps)
         if name:
             group["class_name"] = name
+            with _klass_name_lock:
+                contested = _klass_name_ambiguous.get(
+                    int(group.get("type_ptr", 0)))
+            if contested:
+                group["class_name_ambiguous"] = [
+                    (int(o), str(v)) for o, v in contested]
+                add_log(
+                    f"Type {int(group.get('type_ptr', 0)):#x}: name is "
+                    + " / ".join(f"{v!r} at +{o:#x}" for o, v in contested)
+                    + f" — showing {name!r}", "warn")
             named += 1
     return named
 
@@ -14659,9 +15010,11 @@ def _inspect_cheat(stdscr, idx: int) -> None:
                          else "current session only")
             safe_addstr(stdscr, 10, 3, f"Lifetime  {lifecycle}",
                         color(C_OK) if _is_cross_reload_pointer(c) else color(C_WARN))
-        elif _is_module_relative_scalar(c):
-            safe_addstr(stdscr, 9, 3, "Lifetime  module-relative static patch",
-                        color(C_OK))
+        else:
+            short, long_text = cheat_durability(c)
+            safe_addstr(stdscr, 9, 3, f"Lifetime  {long_text}",
+                        color(C_OK) if short != _DURABILITY_SESSION[0]
+                        else color(C_WARN))
         frozen = _is_cheat_frozen(c)
         freeze_indicator = _cheat_freeze_indicator(c)
         safe_addstr(stdscr, 11, 3,
@@ -15105,7 +15458,9 @@ def do_cheat_list(stdscr) -> None:
                     line_base = (f"  {c['name']:<26}  {_disp_addr:<22}  "
                                  f"{set_val_str:<8}  ")
                     toggle = _cheat_freeze_indicator(c)
-                    live_part = f"{live_val:<10}  [{toggle}] {c['type']}"
+                    durability = cheat_durability(c)[0]
+                    live_part = (f"{live_val:<10}  [{toggle}] "
+                                 f"{c['type']:<8} {durability}")
                     if ri == sel:
                         safe_addstr(stdscr, 5 + i, 2,
                                     (line_base + live_part)[:w - 4].ljust(w - 4), attr)
@@ -15888,6 +16243,11 @@ def do_export(stdscr) -> None:
 
     export_cheats = [c for c in state["cheats"] if belongs_to_current_game(c)]
     excluded_count = len(state["cheats"]) - len(export_cheats)
+    # Say what is actually being shipped. A raw heap address exports exactly
+    # as cleanly as a validated chain and is dead on the next launch; that
+    # difference belongs in front of the user at the moment they export, not
+    # only on a detail screen they may never open.
+    add_log(f"Export durability: {summarise_durability(export_cheats)}")
     # belongs_to_current_game admits a cheat on either arm of an OR, and the
     # two arms mean different things once the file is written: a portable entry
     # survives a reload, a same-session one is a raw address that will point at

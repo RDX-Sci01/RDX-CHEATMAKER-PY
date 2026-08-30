@@ -11913,8 +11913,12 @@ def screen_connect(stdscr) -> str:
         safe_addstr(stdscr, 3 + i, 3, hint, color(C_NORM))
     stdscr.refresh()
 
+    # Prefill from this user's own last console (loaded into state["ip"] from
+    # the `last_ip` preference), and from nothing at all on a first run.  A
+    # literal address here would be one particular development console, which
+    # is not a sensible default for anyone else and reads as a real suggestion.
     ip = input_box(stdscr, "PS5 IP address : ", 6, 3, 40,
-                   state["ip"] or "192.168.0.88", allow_cancel=True,
+                   state["ip"] or "", allow_cancel=True,
                    cancel_with_q=False)
     if ip is None:
         return "quit"

@@ -1,0 +1,19 @@
+# RDX CheatMaker dependencies.
+#
+# Required. numpy carries every scan, comparison and pointer-index operation;
+# there is no pure-Python fallback for it.
+numpy>=1.21
+
+# Optional -- RDX runs correctly without either. Both are imported inside
+# try/except and fall back cleanly, so do NOT promote them to requirements.
+#
+#   numba>=0.57    JIT-compiles the relational comparison filter. Speed only;
+#                  identical results either way.
+#   psutil>=5.9    Host memory reporting for scan sizing. Without it RDX uses
+#                  a conservative default.
+#
+# Install them explicitly if you want them:
+#   pip install numba psutil
+#
+# Test-only (not needed to run RDX):
+#   pytest         the suite is unittest-based and also runs under pytest

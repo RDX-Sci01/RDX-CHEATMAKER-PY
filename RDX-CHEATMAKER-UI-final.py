@@ -4,7 +4,7 @@
 RDX CheatMaker Final Release with Terminal UI
 
 Usage:
-    python3 RDX-CHEATMAKER-UI.py
+    python3 RDX-CHEATMAKER-UI-final.py
 """
 
 RDX_VERSION = "1.0.0"
@@ -11902,6 +11902,14 @@ def _console_preflight(ip: str, timeout: float = 3.0) -> bool:
 
 
 def screen_connect(stdscr) -> str:
+    """Ask for the console's IP address. Returns the next screen name.
+
+    The field is prefilled from ``state["ip"]``, which is loaded from the
+    user's own ``last_ip`` preference and is empty on a first run. Do not
+    substitute a literal address here: any specific address is one particular
+    development console and reads to a new user as a real suggestion. A
+    regression test guards this.
+    """
     stdscr.clear()
     draw_border(stdscr, "CONNECT")
     draw_header_banner(stdscr)
@@ -12110,6 +12118,12 @@ def _identify_game_processes(ip: str, candidates: list, confirmed: dict,
 
 
 def screen_proc_select(stdscr, procs: list) -> str:
+    """Pick the target process. Returns the next screen name.
+
+    The game is normally ``eboot.bin``. Selecting a process only sets the scan
+    target; the guards that refuse to attach a debugger to jailbreak and system
+    infrastructure live in the trace path, not here.
+    """
     # Sort order: 'name' (default) or 'pid'.  Tab cycles between them.
     sort_by = "name"
     procs_orig = list(procs)
@@ -16695,8 +16709,18 @@ def _apply_cheat_once(stdscr, cheat: dict) -> None:
         try:
             addr = _runtime_scalar_address(cheat)
         except Exception as exc:
-            message_box(stdscr, [str(exc)],
-                        "Cheat Module Unavailable", C_ERR)
+            # The bare exception said only which module was missing, which is
+            # not something an ordinary user can act on. Say what it means.
+            message_box(stdscr, [
+                str(exc),
+                "",
+                "This cheat is anchored to a module that is not loaded",
+                "right now. Usually that means the game is not running,",
+                "or this is a different game or version than the cheat",
+                "was made for.",
+                "",
+                "Start the matching game, reconnect, and try again.",
+            ], "Cheat Module Unavailable", C_ERR)
             return
 
     map_err = _validate_addr_in_maps(state["ip"], state["pid"], addr, width)
@@ -18814,6 +18838,22 @@ def do_log(stdscr) -> None:
 # ── main loop ─────────────────────────────────────────────────────────────────
 
 def main(stdscr) -> None:
+    """Screen state machine, and the whole of the interactive application.
+
+    Three screens: ``connect`` (ask for the console address), ``proc`` (pick
+    the game process), then ``main`` (scan, edit, freeze, export). Each screen
+    function returns the name of the next screen, or ``"quit"``.
+
+    Every ``getch()`` uses a 100 ms blocking timeout rather than halfdelay, so
+    the header keeps refreshing while the user is idle; screens that need
+    non-blocking input set ``nodelay`` themselves and restore it afterwards.
+
+    Called through ``curses.wrapper`` from the ``__main__`` block at the foot
+    of this file, which is also what installs the debugger-teardown handlers.
+    Those matter: a leaked debug session can leave the game stopped with a live
+    hardware watchpoint, which is the one failure here that takes the console
+    down with it.
+    """
     _safe_curs_set(0)
     curses.noecho()
     curses.cbreak()          # ensure cbreak regardless of wrapper state
